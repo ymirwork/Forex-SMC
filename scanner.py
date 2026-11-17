@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Set
+from typing import Dict, List, Set
 
 from chart_generator import ChartGenerator
 from config import (
+    ENABLE_SMC_STRATEGY,
+    ENABLE_ZUMIKO_STRATEGY,
     HTF_TIMEFRAME,
     LOOKBACK_BARS,
     LTF_TIMEFRAME,
@@ -12,27 +14,46 @@ from config import (
     SCAN_INTERVAL_SECONDS,
     SWING_LENGTH,
     SYMBOLS,
+    ZUMIKO_FAST_EMA,
+    ZUMIKO_REQUIRE_H1,
+    ZUMIKO_SLOW_EMA,
+    ZUMIKO_SWING_LEN,
+    ZUMIKO_TREND_EMA,
 )
 from mt5_client import MT5Client
 from smc_detector import SMCDetector, TradeSetup
+from zumiko_detector import ZumikoDetector
 
 logger = logging.getLogger("ForexSMC.Scanner")
 
 
 class SMCScanner:
-    """Continuously monitors selected Forex and Gold pairs for high probability SMC setups."""
+    """
+    Multi-Strategy Market Scanner:
+    1. Smart Money Concepts (M15 CHoCH + Fibo OTE >= 61.8% + Asian Sweep)
+    2. Zumiko KillMLM Strategy (EMA 238 Trend + EMA 10/21 Cross + MTF Alignment)
+    3. Golden Combo (Co-incident alignment of both SMC & Zumiko in the same direction)
+    """
 
     def __init__(self, mt5_client: MT5Client, telegram_manager=None):
         self.mt5_client = mt5_client
         self.telegram = telegram_manager
-        self.detector = SMCDetector(
+        self.smc_detector = SMCDetector(
             swing_length=SWING_LENGTH,
             min_confluence_score=MIN_CONFLUENCE_SCORE,
             strict_htf_alignment=False,
         )
+        self.zumiko_detector = ZumikoDetector(
+            fast_ema_len=ZUMIKO_FAST_EMA,
+            slow_ema_len=ZUMIKO_SLOW_EMA,
+            trend_ema_len=ZUMIKO_TREND_EMA,
+            swing_len=ZUMIKO_SWING_LEN,
+            min_confluence_score=MIN_CONFLUENCE_SCORE,
+            require_h1_alignment=ZUMIKO_REQUIRE_H1,
+        )
         self.chart_gen = ChartGenerator()
         self.is_running = False
-        self.notified_setups: Dict[str, float] = {}  # key -> timestamp
+        self.notified_setups: Dict[str, float] = {}
 
     def _cleanup_old_notifications(self, max_age_hours: float = 6.0):
         """Clears old sent setup keys so memory does not leak."""
@@ -49,31 +70,78 @@ class SMCScanner:
 
         self._cleanup_old_notifications()
         found_count = 0
-        logger.info(f"Scanning {len(SYMBOLS)} symbols across {LTF_TIMEFRAME} with {HTF_TIMEFRAME} trend...")
+        logger.info(
+            f"Scanning {len(SYMBOLS)} symbols (SMC: {ENABLE_SMC_STRATEGY}, Zumiko: {ENABLE_ZUMIKO_STRATEGY})..."
+        )
 
         for sym in SYMBOLS:
             try:
-                df_ltf = self.mt5_client.fetch_ohlcv(sym, LTF_TIMEFRAME, LOOKBACK_BARS)
-                df_htf = self.mt5_client.fetch_ohlcv(sym, HTF_TIMEFRAME, LOOKBACK_BARS)
+                # Fetch multi-timeframe candles
+                df_m15 = self.mt5_client.fetch_ohlcv(sym, "M15", LOOKBACK_BARS)
+                df_h1 = self.mt5_client.fetch_ohlcv(sym, "H1", LOOKBACK_BARS)
+                df_h4 = self.mt5_client.fetch_ohlcv(sym, "H4", LOOKBACK_BARS)
 
-                if df_ltf is None or df_htf is None:
+                if df_m15 is None or df_h4 is None:
                     continue
 
-                setups = self.detector.scan_for_setups(sym, df_ltf, df_htf)
-                for setup in setups:
-                    # Create unique fingerprint for this specific setup zone
-                    setup_key = f"{setup.symbol}_{setup.direction}_{setup.setup_type}_{setup.zone_bottom:.2f}_{setup.zone_top:.2f}"
+                smc_setups: List[TradeSetup] = []
+                zumiko_setups: List[TradeSetup] = []
+
+                if ENABLE_SMC_STRATEGY:
+                    smc_setups = self.smc_detector.scan_for_setups(sym, df_m15, df_h4)
+
+                if ENABLE_ZUMIKO_STRATEGY:
+                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_m15, df_h1, df_h4)
+
+                final_setups: List[TradeSetup] = []
+
+                # Check for Golden Combo (Both SMC & Zumiko agreed on direction)
+                if smc_setups and zumiko_setups:
+                    for s_setup in smc_setups:
+                        matched_zumiko = next(
+                            (z for z in zumiko_setups if z.direction == s_setup.direction),
+                            None
+                        )
+                        if matched_zumiko:
+                            # Upgrade to Golden Combo
+                            s_setup.strategy_name = "GOLDEN_COMBO"
+                            s_setup.setup_type = "Złoty Setup (SMC Fibo OTE + Zumiko MTF Aligned)"
+                            s_setup.grade = "A+"
+                            s_setup.confluence_score = min(100, max(s_setup.confluence_score, matched_zumiko.confluence_score) + 10)
+                            s_setup.mtf_table = matched_zumiko.mtf_table
+                            s_setup.ema_fast = matched_zumiko.ema_fast
+                            s_setup.ema_slow = matched_zumiko.ema_slow
+                            s_setup.ema_238 = matched_zumiko.ema_238
+                            s_setup.swing_pattern = matched_zumiko.swing_pattern
+                            # Append Zumiko factors to breakdown
+                            s_setup.confluence_breakdown.extend(matched_zumiko.confluence_breakdown[:2])
+                            final_setups.append(s_setup)
+                            # Remove matched to avoid duplicate alert
+                            zumiko_setups.remove(matched_zumiko)
+                        else:
+                            final_setups.append(s_setup)
+                    # Add any remaining unmerged Zumiko setups
+                    final_setups.extend(zumiko_setups)
+                else:
+                    final_setups.extend(smc_setups)
+                    final_setups.extend(zumiko_setups)
+
+                # Process final alerts
+                for setup in final_setups:
+                    setup_key = f"{setup.symbol}_{setup.direction}_{setup.strategy_name}_{setup.entry_price:.2f}"
                     if setup_key in self.notified_setups:
-                        continue  # Already notified
+                        continue  # Already notified recently
 
                     found_count += 1
                     self.notified_setups[setup_key] = time.time()
-                    setup_id = f"{sym}_{int(time.time())}"
+                    setup_id = f"{sym}_{setup.strategy_name}_{int(time.time())}"
 
-                    logger.info(f"🔥 NEW SMC SETUP: {setup.symbol} {setup.direction} ({setup.setup_type})")
+                    logger.info(
+                        f"🔥 NEW SETUP: {setup.symbol} {setup.direction} [{setup.strategy_name}] ({setup.setup_type})"
+                    )
 
-                    # Generate visual chart
-                    chart_path = self.chart_gen.generate_setup_chart(df_ltf, setup)
+                    # Generate visual chart with Fibo or EMAs
+                    chart_path = self.chart_gen.generate_setup_chart(df_m15, setup)
 
                     # Send to Telegram
                     if self.telegram:
@@ -87,7 +155,7 @@ class SMCScanner:
     async def run_loop(self):
         """Main asynchronous scanner loop."""
         self.is_running = True
-        logger.info(f"SMC Scanner loop started. Interval: {SCAN_INTERVAL_SECONDS}s")
+        logger.info(f"SMC & Zumiko Multi-Strategy Scanner loop started. Interval: {SCAN_INTERVAL_SECONDS}s")
 
         while self.is_running:
             try:
@@ -99,4 +167,4 @@ class SMCScanner:
 
     def stop(self):
         self.is_running = False
-        logger.info("SMC Scanner stopped.")
+        logger.info("Scanner stopped.")

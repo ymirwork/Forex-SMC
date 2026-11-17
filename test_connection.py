@@ -51,20 +51,31 @@ async def test_all():
         else:
             print(f"   • {sym:7s} -> ❌ Nie znaleziono u brokera!")
 
-    # 3. SMC Detector Dry Run
-    print("\n[3/4] Test silnika SMC...")
+    # 3. SMC & Zumiko Detectors Dry Run
+    print("\n[3/5] Test silnika SMC...")
     detector = SMCDetector()
-    df_gold = client.fetch_ohlcv("XAUUSD", LTF_TIMEFRAME, 200)
-    df_gold_htf = client.fetch_ohlcv("XAUUSD", HTF_TIMEFRAME, 200)
+    df_gold = client.fetch_ohlcv("XAUUSD", LTF_TIMEFRAME, 300)
+    df_gold_htf = client.fetch_ohlcv("XAUUSD", HTF_TIMEFRAME, 300)
     if df_gold is not None and df_gold_htf is not None:
         trend = detector.determine_htf_trend(df_gold_htf)
         setups = detector.scan_for_setups("XAUUSD", df_gold, df_gold_htf)
         print(f"   • XAUUSD {HTF_TIMEFRAME} Trend: {trend}")
-        print(f"   • Wykryte setupy w tej chwili: {len(setups)}")
+        print(f"   • Wykryte setupy SMC: {len(setups)}")
         print("✅ Silnik Smart Money Concepts działa poprawnie!")
 
-    # 4. Telegram Bot Token Check
-    print("\n[4/4] Test konfiguracji Telegrama...")
+    print("\n[4/5] Test silnika Zumiko KillMLM (MTF)...")
+    from zumiko_detector import ZumikoDetector
+    z_detector = ZumikoDetector()
+    df_gold_h1 = client.fetch_ohlcv("XAUUSD", "H1", 300)
+    if df_gold is not None and df_gold_h1 is not None and df_gold_htf is not None:
+        z_mtf = z_detector.calculate_mtf_trend(df_gold, df_gold_h1, df_gold_htf)
+        z_setups = z_detector.scan_for_setups("XAUUSD", df_gold, df_gold_h1, df_gold_htf)
+        print(f"   • XAUUSD MTF Matrix: M15:({z_mtf.get('M15')}) | H1:({z_mtf.get('H1')}) | H4:({z_mtf.get('H4')})")
+        print(f"   • Wykryte setupy Zumiko: {len(z_setups)}")
+        print("✅ Silnik Zumiko KillMLM działa poprawnie!")
+
+    # 5. Telegram Bot Token Check
+    print("\n[5/5] Test konfiguracji Telegrama...")
     if not TELEGRAM_BOT_TOKEN:
         print("ℹ️ TELEGRAM_BOT_TOKEN nie jest jeszcze ustawiony w pliku .env")
         print("   (Uzupełnij .env tokenem od @BotFather, aby otrzymywać powiadomienia)")

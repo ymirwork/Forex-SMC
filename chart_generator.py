@@ -114,6 +114,20 @@ class ChartGenerator:
             ax.axhline(setup.choch_level, color="#ec4899", linestyle="--", linewidth=1.2, alpha=0.8)
             ax.text(2, setup.choch_level, f" M15 CHoCH Level ({setup.choch_level})", color="#ec4899", va="bottom", fontsize=8, fontweight="bold")
 
+        # Draw Zumiko EMAs (EMA 10, EMA 21, EMA 238)
+        if getattr(setup, "ema_238", 0.0) > 0 or getattr(setup, "strategy_name", "") in ("ZUMIKO", "GOLDEN_COMBO"):
+            e10_full = df["close"].ewm(span=10, adjust=False).mean()
+            e21_full = df["close"].ewm(span=21, adjust=False).mean()
+            e238_full = df["close"].ewm(span=238, adjust=False).mean()
+
+            e10_sub = e10_full.tail(bars_count).reset_index(drop=True)
+            e21_sub = e21_full.tail(bars_count).reset_index(drop=True)
+            e238_sub = e238_full.tail(bars_count).reset_index(drop=True)
+
+            ax.plot(e10_sub.index, e10_sub.values, color="#00e5ff", linewidth=1.2, label=f"EMA Fast (10): {setup.ema_fast}", alpha=0.9)
+            ax.plot(e21_sub.index, e21_sub.values, color="#f59e0b", linewidth=1.4, label=f"EMA Slow (21): {setup.ema_slow}", alpha=0.9)
+            ax.plot(e238_sub.index, e238_sub.values, color="#a855f7", linewidth=2.0, linestyle="-", label=f"EMA Trend (238): {setup.ema_238}", alpha=0.95)
+
         # Lines for Entry, SL, TP1, TP2
         ax.axhline(setup.entry_price, color="#2962ff", linestyle=":", linewidth=2.0, label=f"Entry: {setup.entry_price}")
         ax.axhline(setup.sl_price, color="#f23645", linestyle="--", linewidth=1.8, label=f"SL: {setup.sl_price}")
@@ -152,11 +166,18 @@ class ChartGenerator:
         ax.set_xlim(-1, len(plot_df) + 10)
 
         # Header Title
-        dir_tag = "[BUY]" if setup.direction == "BUY" else "[SELL]"
+        dir_tag = f"[{setup.direction}]"
+        strat_name = getattr(setup, "strategy_name", "SMC")
+        if strat_name == "GOLDEN_COMBO":
+            strat_header = "GOLDEN COMBO (SMC + ZUMIKO)"
+        elif strat_name == "ZUMIKO":
+            strat_header = "ZUMIKO KILLMLM"
+        else:
+            strat_header = "SMC"
         score_tag = f"Score: {setup.confluence_score}% [{setup.grade}]" if setup.confluence_score > 0 else ""
         title_text = (
-            f"{setup.symbol} [{setup.timeframe}] | {dir_tag} {setup.setup_type} | {score_tag}\n"
-            f"H4 Bias: {setup.htf_trend} | Risk/Reward: 1:{setup.rr_ratio} | Time: {setup.timestamp.strftime('%Y-%m-%d %H:%M')}"
+            f"{setup.symbol} [{setup.timeframe}] | {dir_tag} {strat_header} - {setup.setup_type} | {score_tag}\n"
+            f"Bias: {setup.htf_trend} | Risk/Reward: 1:{setup.rr_ratio} | Time: {setup.timestamp.strftime('%Y-%m-%d %H:%M')}"
         )
         ax.set_title(title_text, color="#ffffff", fontsize=11, fontweight="bold", loc="left", pad=12)
 

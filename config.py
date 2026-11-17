@@ -62,3 +62,14 @@ LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "300"))                  # Bars t
 MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE", "70"))    # Minimum score (>= 70%) to alert
 BLOCK_ON_HIGH_IMPACT_NEWS = os.getenv("BLOCK_ON_HIGH_IMPACT_NEWS", "False").lower() in ("true", "1")
 NEWS_WINDOW_MINUTES = int(os.getenv("NEWS_WINDOW_MINUTES", "45"))      # Check news +/- 45 mins
+
+# Strategy Toggles (Hybrid Mode: SMC + Zumiko KillMLM)
+ENABLE_SMC_STRATEGY = os.getenv("ENABLE_SMC_STRATEGY", "True").lower() in ("true", "1")
+ENABLE_ZUMIKO_STRATEGY = os.getenv("ENABLE_ZUMIKO_STRATEGY", "True").lower() in ("true", "1")
+
+# Zumiko KillMLM Strategy Settings
+ZUMIKO_FAST_EMA = int(os.getenv("ZUMIKO_FAST_EMA", "10"))
+ZUMIKO_SLOW_EMA = int(os.getenv("ZUMIKO_SLOW_EMA", "21"))
+ZUMIKO_TREND_EMA = int(os.getenv("ZUMIKO_TREND_EMA", "238"))
+ZUMIKO_SWING_LEN = int(os.getenv("ZUMIKO_SWING_LEN", "10"))
+ZUMIKO_REQUIRE_H1 = os.getenv("ZUMIKO_REQUIRE_H1", "True").lower() in ("true", "1")

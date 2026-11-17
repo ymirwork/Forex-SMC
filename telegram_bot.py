@@ -368,15 +368,52 @@ class TelegramBotManager:
         rr_badge = "🔥 [Zoptymalizowane Best RR]" if setup.is_optimal_rr else "⚙️ [Domyślne z .env]"
         rr_src = f"\n💡 **Źródło RR:** `{setup.rr_source_info}`" if setup.rr_source_info else ""
 
+        # Strategy title
+        strat_name = getattr(setup, "strategy_name", "SMC")
+        if strat_name == "GOLDEN_COMBO":
+            header_title = f"🔥 **ZŁOTY SETUP (SMC + ZUMIKO): {setup.symbol}**"
+        elif strat_name == "ZUMIKO":
+            header_title = f"⚡ **ZUMIKO KILLMLM SETUP: {setup.symbol}**"
+        else:
+            header_title = f"🔔 **SMC SETUP: {setup.symbol}**"
+
+        # Multi-timeframe trend table
+        mtf_text = ""
+        if getattr(setup, "mtf_table", None):
+            mtf_m15 = setup.mtf_table.get("M15", "NEUTRAL")
+            mtf_h1 = setup.mtf_table.get("H1", "NEUTRAL")
+            mtf_h4 = setup.mtf_table.get("H4", "NEUTRAL")
+            m15_icon = "🟢 (BUY)" if mtf_m15 == "BUY" else ("🔴 (SELL)" if mtf_m15 == "SELL" else "⚪ (NEUTRAL)")
+            h1_icon = "🟢 (BUY)" if mtf_h1 == "BUY" else ("🔴 (SELL)" if mtf_h1 == "SELL" else "⚪ (NEUTRAL)")
+            h4_icon = "🟢 (BUY)" if mtf_h4 == "BUY" else ("🔴 (SELL)" if mtf_h4 == "SELL" else "⚪ (NEUTRAL)")
+            mtf_text = (
+                f"📊 **Tabela Trendów Multi-Timeframe:**\n"
+                f"• M15: {m15_icon}\n"
+                f"• H1:  {h1_icon}\n"
+                f"• H4:  {h4_icon}\n\n"
+            )
+
+        # Zumiko indicators line
+        zumiko_text = ""
+        if getattr(setup, "ema_238", 0.0) > 0:
+            zumiko_text = (
+                f"📈 **Parametry Zumiko KillMLM:**\n"
+                f"• EMA Fast (10): `{setup.ema_fast:.{digits}f}` | Slow (21): `{setup.ema_slow:.{digits}f}`\n"
+                f"• 🌟 **EMA Trend (238):** `{setup.ema_238:.{digits}f}`\n"
+                f"• 🏛 **Struktura Rynku:** `{setup.swing_pattern}`\n\n"
+            )
+
         caption = (
-            f"🔔 **SMC SETUP: {setup.symbol}**\n"
+            f"{header_title}\n"
             f"🎯 **Ocena Koniunkcji:** `{setup.confluence_score}%` {grade_emoji}\n\n"
             f"{news_banner}"
             f"📊 **Kierunek:** {dir_emoji}\n"
             f"⏱ **Interwał:** `{setup.timeframe}` (H4 Trend: **{setup.htf_trend}**)\n"
             f"{session_badge}"
             f"🎯 **Strategia:** `{setup.setup_type}`\n\n"
+            f"{mtf_text}"
             f"{confluence_lines}"
+            f"{zumiko_text}"
             f"{fibo_text}"
             f"📍 **Wejście (Entry):** `{setup.entry_price:.{digits}f}`\n"
             f"🛑 **Stop Loss (SL):** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} pips)\n"

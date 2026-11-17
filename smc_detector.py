@@ -50,6 +50,12 @@ class TradeSetup:
     news_warning: Optional[str] = None
     is_optimal_rr: bool = False
     rr_source_info: str = ""
+    strategy_name: str = "SMC"  # "SMC", "ZUMIKO", or "GOLDEN_COMBO"
+    mtf_table: Dict[str, str] = field(default_factory=dict)
+    ema_fast: float = 0.0
+    ema_slow: float = 0.0
+    ema_238: float = 0.0
+    swing_pattern: str = ""
 
 
 class SMCDetector:

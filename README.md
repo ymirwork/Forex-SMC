@@ -4,23 +4,20 @@ Profesjonalny skaner i półautomat dla rynku **Forex oraz Złota (XAUUSD)** opa
 
 ---
 
-## 🎯 Twoja Strategia: H4 ➡️ M15 CHoCH ➡️ Fibo Pullback $\ge$ 61.8% (OTE) + Confluence Engine
+## 🎯 Obsługiwane Strategie Rynkowe (Tryb Hybrydowy)
 
-Bot wykorzystuje instytucjonalny system scoringowy oparty na **Wagach Koniunkcji (Confluence Weights)**:
-1. **Kontekst H4 (Wyższa Rama):** Wyznacza dominujący trend i strefy instytucjonalne na H4 (+20%).
-2. **Potwierdzenie na M15:** Czeka na **CHoCH (Change of Character)** – przełamanie lokalnej struktury na M15 (+20%).
-3. **Mierzenie siatki Fibonacciego:** Po wystąpieniu CHoCH bot automatycznie mierzy falę impulsu i wyznacza kluczowe poziomy:
-   * **50.0%** (Równowaga / Equilibrium)
-   * **61.8%** (Golden Pocket – minimalny wymagany pullback, +15%)
-   * **78.6%** (Deep Discount / OTE - Optimal Trade Entry, +20%)
-4. **Zbieżność z Order Blockiem / FVG:** Nakładanie strefy Fibo na unmitigated Order Block lub FVG (+15%).
-5. **Wybicie płynności (Liquidity Sweep):** Wybicie szczytu/dołka sesji azjatyckiej (Asian Range Sweep, +15%).
-6. **Odrzucenie świecowe (Wick Rejection):** Knot odrzucenia $\ge 30\%$ zakresu świecy w strefie OTE (+10%).
-7. **Filtr Jakości (Próg Punktowy):**
-   * 🔥 **Grade A+ (Score $\ge 85\%$):** Wybitny, wielowymiarowy setup o wysokim prawdopodobieństwie.
-   * ⭐ **Grade A (Score $70\% - 84\%$):** Bardzo mocny standardowy setup.
-   * 🚫 **Score $< 70\%$:** Odrzucany automatycznie, aby chronić Cię przed szumem i stratami.
-8. **Filtr Wiadomości Makroekonomicznych:** Automatycznie sprawdza kalendarz wydarzeń o dużym wpływie (Red Folder) i ostrzega przed publikacjami NFP, CPI czy decyzjami o stopach.
+### 1. Strategia Smart Money Concepts (SMC):
+* **Kontekst H4 ➡️ Wybicie M15 CHoCH ➡️ Pullback Fibo $\ge 61.8\%$ (Golden Pocket / OTE)**
+* Scoring koniunkcji (0-100%): Trend H4 (+20%), M15 CHoCH (+20%), Poziom Fibo (+20%), Order Block / FVG (+15%), Asian Range Liquidity Sweep (+15%), Knot odrzucenia świecy (+10%).
+
+### 2. Strategia Zumiko KillMLM (Multi-Timeframe):
+* **Filtr Trendu Bazowego:** `EMA 238` (Cena > EMA 238 = Tylko BUY | Cena < EMA 238 = Tylko SELL)
+* **Trigger / Momentum:** Przebicie lub odbicie od strefy `EMA Fast (10)` oraz `EMA Slow (21)`
+* **Struktura Rynku (Swings):** Potwierdzenie formowania wyższego dołka `HL (Higher Low)` dla BUY lub niższego szczytu `LH (Lower High)` dla SELL.
+* **Matryca Multi-Timeframe (MTF Alignment):** Rygorystyczna weryfikacja zgodności trendu na wyższych interwałach (`M15`, `H1`, `H4`). Setup generuje się tylko wtedy, gdy H1 potwierdza kierunek!
+
+### 3. 🔥 Złoty Setup (Golden Combo: SMC + Zumiko Aligned):
+Gdy na danym instrumencie w tym samym czasie wystąpi zbieżność obu strategii (np. M15 CHoCH + Fibo OTE w kierunku zgodnym z trendem EMA 238 i MTF), bot generuje priorytetowy alert z oceną **`Grade A+ (Score 95-100%)`** i rysuje na wykresie zarówno strefę Fibo OTE, jak i linie EMA Zumiko!
 * **Automatyczne generowanie wykresów:**
   * Każdy alert zawiera ciemny, czytelny wykres świecowy z zaznaczoną strefą Order Blocka, poziomem wejścia (Entry), Stop Lossem (SL) i Take Profitami (TP1 / TP2).
 * **Interaktywny Półautomat na Telegramie:**
