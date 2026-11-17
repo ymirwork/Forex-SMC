@@ -1,9 +1,9 @@
 @echo off
-title Forex & Gold SMC Scanner - Setup
+title Forex and Gold SMC Scanner - Setup
 cd /d "%~dp0"
 
 echo ============================================================
-echo      INSTALACJA I KONFIGURACJA FOREX & GOLD SMC SCANNER
+echo      INSTALACJA I KONFIGURACJA FOREX AND GOLD SMC SCANNER
 echo ============================================================
 echo.
 

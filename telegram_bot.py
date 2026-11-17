@@ -341,32 +341,28 @@ class TelegramBotManager:
 
         fibo_text = ""
         if setup.fibo_618 > 0:
-            fibo_text = (
-                f"📐 **Analiza Fibonacci (Impuls CHoCH):**\n"
-                f"• Zakres impulsu: `{setup.impulse_low:.{digits}f}` ➡️ `{setup.impulse_high:.{digits}f}`\n"
-                f"• Fibo 50.0%: `{setup.fibo_50:.{digits}f}`\n"
-                f"• 🌟 **Fibo 61.8% (Min Pullback):** `{setup.fibo_618:.{digits}f}`\n"
-                f"• 🎯 **Fibo 78.6% (Deep OTE):** `{setup.fibo_786:.{digits}f}`\n\n"
-            )
+            fibo_text = f"📐 **Fibo OTE:** 61.8%: `{setup.fibo_618:.{digits}f}` | 78.6%: `{setup.fibo_786:.{digits}f}`\n"
 
-        # Confluence Breakdown Formatting
+        # Confluence Breakdown Formatting (compact top items)
         confluence_lines = ""
         if setup.confluence_breakdown:
-            confluence_lines = "📋 **Zbieżność czynników (Confluence Breakdown):**\n"
-            for item in setup.confluence_breakdown:
-                icon = "✅" if item.achieved else "❌"
-                confluence_lines += f"{icon} `[+{item.weight if item.achieved else 0}%]` {item.factor}: {item.detail}\n"
+            confluence_lines = "📋 **Kluczowe koniunkcje:**\n"
+            achieved_items = [item for item in setup.confluence_breakdown if item.achieved][:4]
+            if not achieved_items:
+                achieved_items = setup.confluence_breakdown[:3]
+            for item in achieved_items:
+                confluence_lines += f"• ✅ `[+{item.weight}%]` {item.factor}\n"
             confluence_lines += "\n"
 
-        session_badge = f"🕒 **Sesja:** `{setup.session_name}`" + (" ⚡ (Killzone)" if setup.is_killzone else "") + "\n"
+        session_badge = f"🕒 **Sesja:** `{setup.session_name}`" + (" ⚡" if setup.is_killzone else "")
 
         news_banner = ""
         if setup.news_warning:
-            news_banner = f"{setup.news_warning}\n\n"
+            news_banner = f"⚠️ {setup.news_warning}\n\n"
 
         grade_emoji = "🔥 [Grade A+ Setup]" if setup.grade == "A+" else "⭐ [Grade A Setup]"
-        rr_badge = "🔥 [Zoptymalizowane Best RR]" if setup.is_optimal_rr else "⚙️ [Domyślne z .env]"
-        rr_src = f"\n💡 **Źródło RR:** `{setup.rr_source_info}`" if setup.rr_source_info else ""
+        rr_badge = "🔥 [Best RR]" if setup.is_optimal_rr else "⚙️ [Domyślne]"
+        rr_src = f"\n💡 `{setup.rr_source_info}`" if setup.rr_source_info else ""
 
         # Strategy title
         strat_name = getattr(setup, "strategy_name", "SMC")
@@ -377,48 +373,36 @@ class TelegramBotManager:
         else:
             header_title = f"🔔 **SMC SETUP: {setup.symbol}**"
 
-        # Multi-timeframe trend table
+        # Multi-timeframe trend table (single clean line)
         mtf_text = ""
         if getattr(setup, "mtf_table", None):
             mtf_m15 = setup.mtf_table.get("M15", "NEUTRAL")
             mtf_h1 = setup.mtf_table.get("H1", "NEUTRAL")
             mtf_h4 = setup.mtf_table.get("H4", "NEUTRAL")
-            m15_icon = "🟢 (BUY)" if mtf_m15 == "BUY" else ("🔴 (SELL)" if mtf_m15 == "SELL" else "⚪ (NEUTRAL)")
-            h1_icon = "🟢 (BUY)" if mtf_h1 == "BUY" else ("🔴 (SELL)" if mtf_h1 == "SELL" else "⚪ (NEUTRAL)")
-            h4_icon = "🟢 (BUY)" if mtf_h4 == "BUY" else ("🔴 (SELL)" if mtf_h4 == "SELL" else "⚪ (NEUTRAL)")
-            mtf_text = (
-                f"📊 **Tabela Trendów Multi-Timeframe:**\n"
-                f"• M15: {m15_icon}\n"
-                f"• H1:  {h1_icon}\n"
-                f"• H4:  {h4_icon}\n\n"
-            )
+            m15_i = "🟢" if mtf_m15 == "BUY" else ("🔴" if mtf_m15 == "SELL" else "⚪")
+            h1_i = "🟢" if mtf_h1 == "BUY" else ("🔴" if mtf_h1 == "SELL" else "⚪")
+            h4_i = "🟢" if mtf_h4 == "BUY" else ("🔴" if mtf_h4 == "SELL" else "⚪")
+            mtf_text = f"📊 **Trend MTF:** M15: {m15_i} ({mtf_m15}) | H1: {h1_i} ({mtf_h1}) | H4: {h4_i} ({mtf_h4})\n"
 
         # Zumiko indicators line
         zumiko_text = ""
         if getattr(setup, "ema_238", 0.0) > 0:
-            zumiko_text = (
-                f"📈 **Parametry Zumiko KillMLM:**\n"
-                f"• EMA Fast (10): `{setup.ema_fast:.{digits}f}` | Slow (21): `{setup.ema_slow:.{digits}f}`\n"
-                f"• 🌟 **EMA Trend (238):** `{setup.ema_238:.{digits}f}`\n"
-                f"• 🏛 **Struktura Rynku:** `{setup.swing_pattern}`\n\n"
-            )
+            zumiko_text = f"📈 **Zumiko:** EMA 10/21: `{setup.ema_fast:.{digits}f}/{setup.ema_slow:.{digits}f}` | 🌟 EMA 238: `{setup.ema_238:.{digits}f}` | {setup.swing_pattern}\n"
 
         caption = (
             f"{header_title}\n"
-            f"🎯 **Ocena Koniunkcji:** `{setup.confluence_score}%` {grade_emoji}\n\n"
+            f"🎯 **Ocena:** `{setup.confluence_score}%` {grade_emoji}\n\n"
             f"{news_banner}"
             f"📊 **Kierunek:** {dir_emoji}\n"
-            f"⏱ **Interwał:** `{setup.timeframe}` (H4 Trend: **{setup.htf_trend}**)\n"
-            f"{session_badge}"
+            f"⏱ **Interwał:** `{setup.timeframe}` (H4: **{setup.htf_trend}**) | {session_badge}\n"
             f"🎯 **Strategia:** `{setup.setup_type}`\n\n"
             f"{mtf_text}"
-            f"{confluence_lines}"
             f"{zumiko_text}"
             f"{fibo_text}"
-            f"📍 **Wejście (Entry):** `{setup.entry_price:.{digits}f}`\n"
-            f"🛑 **Stop Loss (SL):** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} pips)\n"
-            f"🎯 **Take Profit 1 (TP1):** `{setup.tp1_price:.{digits}f}` (Target 1:{setup.rr_ratio})\n"
-            f"🎯 **Take Profit 2 (TP2):** `{setup.tp2_price:.{digits}f}` (Strukturalny szczyt/dołek)\n"
+            f"{confluence_lines}"
+            f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} p)\n"
+            f"🎯 **TP1:** `{setup.tp1_price:.{digits}f}` (Target 1:{setup.rr_ratio})\n"
+            f"🎯 **TP2:** `{setup.tp2_price:.{digits}f}` (Strukturalny szczyt/dołek)\n"
             f"⚖️ **Risk / Reward:** `1 : {setup.rr_ratio}` {rr_badge}"
             f"{rr_src}"
         )
@@ -444,20 +428,46 @@ class TelegramBotManager:
             target_chat = self.alert_channel
             if chart_path and os.path.exists(chart_path):
                 with open(chart_path, "rb") as photo:
-                    await self.app.bot.send_photo(
+                    if len(caption) <= 1024:
+                        await self.app.bot.send_photo(
+                            chat_id=target_chat,
+                            photo=photo,
+                            caption=caption,
+                            parse_mode="Markdown",
+                            reply_markup=reply_markup,
+                        )
+                    else:
+                        # Truncate cleanly at 1000 characters to never exceed Telegram 1024 limit
+                        safe_caption = caption[:1000].rsplit("\n", 1)[0]
+                        msg = await self.app.bot.send_photo(
+                            chat_id=target_chat,
+                            photo=photo,
+                            caption=safe_caption,
+                            parse_mode="Markdown",
+                            reply_markup=reply_markup,
+                        )
+                        # Send full specification as follow-up reply
+                        await self.app.bot.send_message(
+                            chat_id=target_chat,
+                            text=f"📋 **Szczegóły setupu:**\n\n{caption}",
+                            parse_mode="Markdown",
+                            reply_to_message_id=msg.message_id,
+                        )
+            else:
+                if len(caption) <= 4096:
+                    await self.app.bot.send_message(
                         chat_id=target_chat,
-                        photo=photo,
-                        caption=caption,
+                        text=caption,
                         parse_mode="Markdown",
                         reply_markup=reply_markup,
                     )
-            else:
-                await self.app.bot.send_message(
-                    chat_id=target_chat,
-                    text=caption,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup,
-                )
+                else:
+                    await self.app.bot.send_message(
+                        chat_id=target_chat,
+                        text=caption[:4000],
+                        parse_mode="Markdown",
+                        reply_markup=reply_markup,
+                    )
             logger.info(f"Alert sent to Telegram for {setup.symbol} [{setup.direction}]")
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")

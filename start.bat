@@ -1,9 +1,9 @@
 @echo off
-title Forex & Gold SMC Scanner
+title Forex and Gold SMC Scanner
 cd /d "%~dp0"
 
 echo ============================================================
-echo        STARTING FOREX & GOLD SMC SCANNER (MT5 + TELEGRAM)
+echo        STARTING FOREX AND GOLD SMC SCANNER (MT5 + TELEGRAM)
 echo ============================================================
 echo.
 
