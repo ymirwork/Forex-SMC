@@ -239,12 +239,17 @@ class MT5Client:
         return final_lot
 
     def _determine_filling_mode(self, symbol_info) -> int:
-        """Determines supported filling mode for broker."""
-        filling_mode = symbol_info.filling_mode
-        if filling_mode & mt5.ORDER_FILLING_FOK:
-            return mt5.ORDER_FILLING_FOK
-        elif filling_mode & mt5.ORDER_FILLING_IOC:
+        """
+        Determines supported filling mode for broker based on symbol_info.filling_mode bitmask:
+        Bit 0 (1): SYMBOL_FILLING_FOK -> ORDER_FILLING_FOK (0)
+        Bit 1 (2): SYMBOL_FILLING_IOC -> ORDER_FILLING_IOC (1)
+        Default/Fallback: ORDER_FILLING_RETURN (2)
+        """
+        filling_mode = getattr(symbol_info, "filling_mode", 0)
+        if filling_mode & 2:
             return mt5.ORDER_FILLING_IOC
+        elif filling_mode & 1:
+            return mt5.ORDER_FILLING_FOK
         else:
             return mt5.ORDER_FILLING_RETURN
 
@@ -257,7 +262,7 @@ class MT5Client:
         tp: float,
         comment: str = "SMC SemiAuto",
     ) -> Tuple[bool, str, Optional[int]]:
-        """Executes a market order in MT5 with SL/TP."""
+        """Executes a market order in MT5 with SL/TP and automatic filling mode fallback."""
         if not self.ensure_connection():
             return False, "Not connected to MT5", None
 
@@ -289,10 +294,29 @@ class MT5Client:
             "magic": 777001,
             "comment": comment[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": self._determine_filling_mode(sym_info),
         }
 
-        result = mt5.order_send(request)
+        # Try candidate filling modes if broker rejects with retcode 10030
+        candidates = [
+            self._determine_filling_mode(sym_info),
+            mt5.ORDER_FILLING_IOC,
+            mt5.ORDER_FILLING_FOK,
+            mt5.ORDER_FILLING_RETURN,
+        ]
+        seen = set()
+        fill_modes = [f for f in candidates if not (f in seen or seen.add(f))]
+
+        result = None
+        for fill_mode in fill_modes:
+            request["type_filling"] = fill_mode
+            result = mt5.order_send(request)
+            if result is None:
+                continue
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                break
+            if result.retcode != 10030:
+                break
+
         if result is None:
             err = mt5.last_error()
             return False, f"order_send() returned None: {err}", None
@@ -315,7 +339,7 @@ class MT5Client:
         tp: float,
         comment: str = "SMC Limit",
     ) -> Tuple[bool, str, Optional[int]]:
-        """Places a pending limit order at the specified entry price."""
+        """Places a pending limit order at the specified entry price with filling fallback."""
         if not self.ensure_connection():
             return False, "Not connected to MT5", None
 
@@ -344,10 +368,28 @@ class MT5Client:
             "magic": 777002,
             "comment": comment[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": self._determine_filling_mode(sym_info),
         }
 
-        result = mt5.order_send(request)
+        candidates = [
+            self._determine_filling_mode(sym_info),
+            mt5.ORDER_FILLING_RETURN,
+            mt5.ORDER_FILLING_IOC,
+            mt5.ORDER_FILLING_FOK,
+        ]
+        seen = set()
+        fill_modes = [f for f in candidates if not (f in seen or seen.add(f))]
+
+        result = None
+        for fill_mode in fill_modes:
+            request["type_filling"] = fill_mode
+            result = mt5.order_send(request)
+            if result is None:
+                continue
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                break
+            if result.retcode != 10030:
+                break
+
         if result is None:
             err = mt5.last_error()
             return False, f"order_send() returned None: {err}", None
@@ -358,6 +400,7 @@ class MT5Client:
         logger.info(
             f"Limit {direction} placed on {resolved} at {price}! Ticket: {result.order}, Volume: {volume}"
         )
+        return True, f"Limit order #{result.order} placed at {price}", result.order
         return True, f"Success! Limit Order #{result.order} placed at {price}", result.order
 
     def get_open_positions(self) -> List[Dict]:
