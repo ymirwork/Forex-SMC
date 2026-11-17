@@ -85,7 +85,12 @@ class MT5Client:
 
     def resolve_symbol(self, base_symbol: str) -> Optional[str]:
         """
-        Resolves a symbol to the broker's exact instrument name (handles suffixes like EURUSD.f, XAUUSDp, etc.).
+        Dynamically resolves broker-specific symbol names:
+        - Detects suffixes (e.g., EURUSD.pro, XAUUSDp, GBPUSD.f, USDJPY_i)
+        - Detects prefixes (e.g., pro.EURUSD, m.XAUUSD, ecn_GBPUSD)
+        - Detects combined prefix + suffix (e.g., pro.EURUSD.raw)
+        - Prioritizes active, tradeable instruments over disabled archives
+        - Adds the resolved symbol to Market Watch automatically
         """
         if base_symbol in self._symbol_cache:
             return self._symbol_cache[base_symbol]
@@ -93,35 +98,42 @@ class MT5Client:
         if not self.ensure_connection():
             return None
 
-        # Direct check
+        # 1. Direct check
         info = mt5.symbol_info(base_symbol)
-        if info is not None:
+        if info is not None and info.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED:
             mt5.symbol_select(base_symbol, True)
             self._symbol_cache[base_symbol] = base_symbol
             return base_symbol
 
-        # Search matching symbols
+        # 2. Search matching symbols from broker list
         all_symbols = mt5.symbols_get()
         if not all_symbols:
             logger.error("Failed to retrieve symbol list from MT5.")
             return None
 
-        clean_base = base_symbol.upper().replace("/", "").replace("_", "").replace("-", "")
-        candidates = []
+        clean_base = base_symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(".", "")
+
+        exact_candidates = []
+        prefix_suffix_candidates = []
+
         for s in all_symbols:
-            s_clean = s.name.upper()
-            if s_clean.startswith(clean_base):
-                candidates.append(s.name)
+            name_upper = s.name.upper()
+            name_clean = name_upper.replace("/", "").replace("_", "").replace("-", "").replace(".", "")
+            is_tradeable = (s.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED)
 
-        if not candidates:
-            # Fallback: substring match
-            for s in all_symbols:
-                if clean_base in s.name.upper():
-                    candidates.append(s.name)
+            if name_clean == clean_base:
+                exact_candidates.append((s.name, is_tradeable, len(s.name)))
+            elif clean_base in name_clean:
+                # Avoid false positives like stock 'GOLDMANS' when searching for 'GOLD'
+                if clean_base == "GOLD" and "GOLDMAN" in name_upper:
+                    continue
+                prefix_suffix_candidates.append((s.name, is_tradeable, len(s.name)))
 
-        if candidates:
-            # Prefer shortest matching name (e.g., EURUSD.f over EURUSD_micro_spread)
-            best_match = min(candidates, key=len)
+        # Priority: Exact match first, then prefix/suffix. Always prefer tradeable instruments, then shortest name.
+        pool = exact_candidates if exact_candidates else prefix_suffix_candidates
+        if pool:
+            pool.sort(key=lambda x: (not x[1], x[2]))
+            best_match = pool[0][0]
             mt5.symbol_select(best_match, True)
             self._symbol_cache[base_symbol] = best_match
             logger.info(f"Resolved symbol '{base_symbol}' -> broker symbol '{best_match}'")
