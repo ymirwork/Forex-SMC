@@ -1,0 +1,76 @@
+# ==========================================
+# SECRETS & SENSITIVE CONFIGURATION (CRITICAL)
+# ==========================================
+.env
+.env*.local
+*.key
+*.pem
+
+# ==========================================
+# VIRTUAL ENVIRONMENTS
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+.uv/
+
+# ==========================================
+# PYTHON ARTIFACTS & BYTECODE
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# LOGS & DATABASES
+# ==========================================
+*.log
+bot.log
+*.sqlite
+*.sqlite3
+trades.db
+
+# ==========================================
+# GENERATED MEDIA (CHARTS)
+# ==========================================
+charts/*.png
+charts/*.jpg
+charts/*.jpeg
+!charts/.gitkeep
+
+# ==========================================
+# IDE & EDITOR SETTINGS
+# ==========================================
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+
+# ==========================================
+# OS GENERATED FILES
+# ==========================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini

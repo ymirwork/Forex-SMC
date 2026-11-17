@@ -1,0 +1,175 @@
+import os
+from typing import Optional
+import matplotlib
+matplotlib.use("Agg")  # Headless rendering
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import pandas as pd
+from smc_detector import TradeSetup
+
+
+class ChartGenerator:
+    """Generates professional dark-themed candlestick charts with SMC zone overlays and Fibonacci levels."""
+
+    def __init__(self, output_dir: str = "charts"):
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def generate_setup_chart(
+        self,
+        df: pd.DataFrame,
+        setup: TradeSetup,
+        bars_count: int = 60,
+    ) -> Optional[str]:
+        """
+        Plots candlestick chart with Fibonacci Retracement levels (50%, 61.8%, 78.6%),
+        CHoCH level, Entry, SL, and TP targets.
+        """
+        if df is None or len(df) < 20:
+            return None
+
+        plot_df = df.tail(bars_count).copy().reset_index(drop=True)
+        if plot_df.empty:
+            return None
+
+        # Dark theme style setup
+        plt.style.use("dark_background")
+        fig, ax = plt.subplots(figsize=(13, 7.0), dpi=150)
+        fig.patch.set_facecolor("#131722")
+        ax.set_facecolor("#131722")
+
+        # Plot candles
+        width = 0.6
+        up_color = "#089981"    # Green
+        down_color = "#f23645"  # Red
+
+        for i, row in plot_df.iterrows():
+            o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+            color = up_color if c >= o else down_color
+            ax.plot([i, i], [l, h], color=color, linewidth=1.2)
+            lower_body = min(o, c)
+            height = abs(c - o)
+            if height == 0:
+                height = 0.0001
+            rect = patches.Rectangle(
+                (i - width / 2, lower_body),
+                width,
+                height,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.5,
+            )
+            ax.add_patch(rect)
+
+        # Draw Fibonacci OTE Retracement (Golden Pocket: 61.8% - 78.6%)
+        if setup.fibo_618 > 0 and setup.fibo_786 > 0:
+            f_top = max(setup.fibo_618, setup.fibo_786)
+            f_bottom = min(setup.fibo_618, setup.fibo_786)
+            f_height = f_top - f_bottom
+
+            # Shaded Golden Pocket Zone
+            gp_rect = patches.Rectangle(
+                (0, f_bottom),
+                len(plot_df) + 8,
+                f_height,
+                facecolor="#f59e0b",
+                alpha=0.20,
+                edgecolor="#f59e0b",
+                linestyle="--",
+                linewidth=1.2,
+                label="OTE Zone (61.8% - 78.6%)",
+            )
+            ax.add_patch(gp_rect)
+
+            # Fibonacci horizontal lines
+            if setup.fibo_50 > 0:
+                ax.axhline(setup.fibo_50, color="#9ca3af", linestyle=":", linewidth=1.0, alpha=0.7)
+                ax.text(len(plot_df), setup.fibo_50, f" 50.0% ({setup.fibo_50})", color="#9ca3af", va="center", fontsize=8)
+
+            ax.axhline(setup.fibo_618, color="#f59e0b", linestyle="-.", linewidth=1.4)
+            ax.text(len(plot_df), setup.fibo_618, f" 61.8% ({setup.fibo_618})", color="#f59e0b", va="center", fontweight="bold", fontsize=8)
+
+            ax.axhline(setup.fibo_786, color="#d97706", linestyle="-.", linewidth=1.4)
+            ax.text(len(plot_df), setup.fibo_786, f" 78.6% ({setup.fibo_786})", color="#d97706", va="center", fontweight="bold", fontsize=8)
+
+        else:
+            # Fallback zone if generic Order Block
+            z_bottom = min(setup.zone_bottom, setup.zone_top)
+            z_top = max(setup.zone_bottom, setup.zone_top)
+            zone_color = "#089981" if setup.direction == "BUY" else "#f23645"
+            zone_rect = patches.Rectangle(
+                (0, z_bottom),
+                len(plot_df) + 8,
+                z_top - z_bottom,
+                facecolor=zone_color,
+                alpha=0.18,
+                edgecolor=zone_color,
+                linestyle="--",
+                linewidth=1.2,
+            )
+            ax.add_patch(zone_rect)
+
+        # Draw CHoCH line if present
+        if setup.choch_level > 0:
+            ax.axhline(setup.choch_level, color="#ec4899", linestyle="--", linewidth=1.2, alpha=0.8)
+            ax.text(2, setup.choch_level, f" M15 CHoCH Level ({setup.choch_level})", color="#ec4899", va="bottom", fontsize=8, fontweight="bold")
+
+        # Lines for Entry, SL, TP1, TP2
+        ax.axhline(setup.entry_price, color="#2962ff", linestyle=":", linewidth=2.0, label=f"Entry: {setup.entry_price}")
+        ax.axhline(setup.sl_price, color="#f23645", linestyle="--", linewidth=1.8, label=f"SL: {setup.sl_price}")
+        ax.axhline(setup.tp1_price, color="#089981", linestyle="--", linewidth=1.8, label=f"TP1: {setup.tp1_price}")
+
+        # Text labels on right
+        x_text = len(plot_df) + 3
+        ax.text(x_text, setup.entry_price, f" ENTRY {setup.entry_price}", color="#2962ff", va="center", fontweight="bold", fontsize=9)
+        ax.text(x_text, setup.sl_price, f" SL {setup.sl_price}", color="#f23645", va="center", fontweight="bold", fontsize=9)
+        ax.text(x_text, setup.tp1_price, f" TP1 {setup.tp1_price}", color="#089981", va="center", fontweight="bold", fontsize=9)
+
+        # X-axis time ticks
+        tick_step = max(1, len(plot_df) // 6)
+        tick_indices = list(range(0, len(plot_df), tick_step))
+        tick_labels = [plot_df.iloc[idx]["time"].strftime("%H:%M") for idx in tick_indices]
+        ax.set_xticks(tick_indices)
+        ax.set_xticklabels(tick_labels, color="#b2b5be", fontsize=9)
+
+        # Y-axis styling
+        ax.yaxis.tick_right()
+        ax.yaxis.set_label_position("right")
+        ax.tick_params(colors="#b2b5be", labelsize=9)
+        ax.grid(color="#2a2e39", linestyle=":", linewidth=0.5, alpha=0.7)
+
+        # Limits
+        all_y = [
+            plot_df["low"].min(), plot_df["high"].max(),
+            setup.sl_price, setup.tp1_price, setup.entry_price
+        ]
+        if setup.fibo_786 > 0:
+            all_y.extend([setup.fibo_618, setup.fibo_786])
+        y_min = min(all_y)
+        y_max = max(all_y)
+        y_margin = (y_max - y_min) * 0.08
+        ax.set_ylim(y_min - y_margin, y_max + y_margin)
+        ax.set_xlim(-1, len(plot_df) + 10)
+
+        # Header Title
+        dir_tag = "[BUY]" if setup.direction == "BUY" else "[SELL]"
+        score_tag = f"Score: {setup.confluence_score}% [{setup.grade}]" if setup.confluence_score > 0 else ""
+        title_text = (
+            f"{setup.symbol} [{setup.timeframe}] | {dir_tag} {setup.setup_type} | {score_tag}\n"
+            f"H4 Bias: {setup.htf_trend} | Risk/Reward: 1:{setup.rr_ratio} | Time: {setup.timestamp.strftime('%Y-%m-%d %H:%M')}"
+        )
+        ax.set_title(title_text, color="#ffffff", fontsize=11, fontweight="bold", loc="left", pad=12)
+
+        # Legend
+        ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363a45", fontsize=8)
+
+        # Save plot
+        safe_time = setup.timestamp.strftime("%Y%m%d_%H%M%S")
+        filename = f"{setup.symbol}_{setup.direction}_{safe_time}.png"
+        filepath = os.path.join(self.output_dir, filename)
+
+        plt.tight_layout()
+        plt.savefig(filepath, facecolor=fig.get_facecolor(), edgecolor="none", dpi=150)
+        plt.close(fig)
+
+        return filepath
