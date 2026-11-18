@@ -49,9 +49,6 @@ class TradeJournal:
                 pass  # column already exists
             conn.commit()
 
-        # Check if table is empty, seed initial sample trades if so
-        self._seed_initial_data_if_empty()
-
     def _seed_initial_data_if_empty(self):
         """Pre-seeds the initial 11 historical trades from user's trading sheet if database is fresh."""
         with self._get_connection() as conn:
