@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -12,15 +13,21 @@ from liquidity_detector import LiquidityDetector, LiquidityEvaluation
 from trade_journal import TradeJournal
 from config import (
     ADD_SPREAD_TO_SL,
+    BLOCK_ROLLOVER_SESSION,
     DEFAULT_RR_RATIO,
+    LIQUIDITY_SWEEP_LOOKBACK_BARS,
     LTF_TIMEFRAME,
+    MAX_SL_ATR_MULTIPLIER,
     MIN_TRADES_FOR_OPTIMAL_RR,
+    REQUIRE_STRUCTURAL_SPACE_FOR_RR,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
     SL_HYBRID_MIN_ATR_MULT,
     TIGHT_SL_MODE,
     USE_OPTIMAL_RR,
 )
+
+logger = logging.getLogger("ForexSMC.SMCDetector")
 
 
 def calculate_stop_loss(
@@ -248,22 +255,67 @@ class SMCDetector:
 
         return False, "Brak"
 
-    def _check_order_block_overlap(self, df: pd.DataFrame, swings: pd.DataFrame, z_bottom: float, z_top: float, direction: str) -> Tuple[bool, str]:
-        """Checks if an unmitigated Order Block or FVG aligns with the entry zone."""
+    def _check_ob_and_fvg_confluence(
+        self,
+        df: pd.DataFrame,
+        swings: pd.DataFrame,
+        leg_start_idx: int,
+        z_bottom: float,
+        z_top: float,
+        direction: str,
+    ) -> Tuple[bool, str]:
+        """
+        Checks if an unmitigated Order Block (OB) or Fair Value Gap (FVG)
+        originating in the impulse leg aligns with the entry zone [z_bottom, z_top].
+        """
+        target_val = 1.0 if direction == "BUY" else -1.0
+        current_bar = len(df) - 1
+        has_ob = False
+        ob_details = []
+        has_fvg = False
+        fvg_details = []
+
+        # 1. Check Order Blocks across the impulse leg
         try:
             ob_df = smc.ob(df, swings)
-            recent_obs = ob_df.tail(30)
-            target_val = 1 if direction == "BUY" else -1
+            obs_in_leg = ob_df.iloc[max(0, leg_start_idx - 5):]
+            for _, row in obs_in_leg.iterrows():
+                if row.get("OB") == target_val:
+                    mit = row.get("MitigatedIndex", 0.0)
+                    is_unmitigated = (mit == 0.0 or pd.isna(mit) or mit >= current_bar)
+                    if is_unmitigated:
+                        top, btm = float(row["Top"]), float(row["Bottom"])
+                        if not (btm > z_top or top < z_bottom):
+                            has_ob = True
+                            ob_details.append(f"OB [{btm:.4f} - {top:.4f}]")
+                            break
+        except Exception as e:
+            logger.debug(f"Error checking OB overlap: {e}")
 
-            for _, row in recent_obs.iterrows():
-                if row.get("OB") == target_val and row.get("MitigatedIndex", 0) == 0:
-                    ob_top, ob_bottom = row["Top"], row["Bottom"]
-                    # Check overlap
-                    if not (ob_bottom > z_top or ob_top < z_bottom):
-                        return True, f"Unmitigated {direction} OB [{ob_bottom:.2f} - {ob_top:.2f}]"
-        except Exception:
-            pass
-        return False, "Brak strefy OB w tym rejonie"
+        # 2. Check Fair Value Gaps (FVG) across the impulse leg
+        try:
+            fvg_df = smc.fvg(df)
+            fvgs_in_leg = fvg_df.iloc[max(0, leg_start_idx - 5):]
+            for _, row in fvgs_in_leg.iterrows():
+                if row.get("FVG") == target_val:
+                    mit = row.get("MitigatedIndex", 0.0)
+                    is_unmitigated = (mit == 0.0 or pd.isna(mit) or mit >= current_bar)
+                    if is_unmitigated:
+                        top, btm = float(row["Top"]), float(row["Bottom"])
+                        if not (btm > z_top or top < z_bottom):
+                            has_fvg = True
+                            fvg_details.append(f"FVG [{btm:.4f} - {top:.4f}]")
+                            break
+        except Exception as e:
+            logger.debug(f"Error checking FVG overlap: {e}")
+
+        if has_ob and has_fvg:
+            return True, f"Zbieżność {direction} {ob_details[0]} + {fvg_details[0]}"
+        elif has_ob:
+            return True, f"Strefa {direction} {ob_details[0]}"
+        elif has_fvg:
+            return True, f"Strefa {direction} {fvg_details[0]}"
+        return False, "Brak strefy OB/FVG w tym rejonie"
 
     def scan_for_setups(
         self,
@@ -281,7 +333,6 @@ class SMCDetector:
 
         htf_trend = self.determine_htf_trend(df_htf) if df_htf is not None else "NEUTRAL"
         current_candle = df_ltf.iloc[-1]
-        current_price = current_candle["close"]
         current_time = current_candle["time"]
 
         digits = 2 if "JPY" in symbol.upper() or "XAU" in symbol.upper() or "GOLD" in symbol.upper() else 4
@@ -291,58 +342,125 @@ class SMCDetector:
 
         # Session & News Context
         session_info = SessionManager.get_current_session(current_time)
+        if BLOCK_ROLLOVER_SESSION and "Rollover" in session_info.get("session_name", ""):
+            logger.info(f"🛡️ [FILTER] Pomijam {symbol}: Aktywna sesja {session_info.get('session_name')} (BLOCK_ROLLOVER_SESSION=True).")
+            return setups
+
         has_news, news_warn, _ = self.news_filter.check_news(symbol)
 
         # Dynamic / Adaptive Best RR Calculation
         target_rr, is_optimal_rr, rr_source = self.get_effective_rr()
 
-        # M15 Swings & CHoCH
+        # M15 Swings & CHoCH / BOS (Trend Reversals & Trend Continuations)
         try:
             swings_ltf = smc.swing_highs_lows(df_ltf, swing_length=self.swing_length)
             bos_choch_ltf = smc.bos_choch(df_ltf, swings_ltf)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error computing swings / bos_choch for {symbol}: {e}")
             return setups
 
-        choch_df = bos_choch_ltf[bos_choch_ltf["CHOCH"].notna() & (bos_choch_ltf["CHOCH"] != 0)]
-        if not choch_df.empty:
-            recent_choch = choch_df.tail(3)
-            for choch_bar_idx, choch_row in recent_choch.iterrows():
-                choch_dir = choch_row["CHOCH"]
-                broken_level = choch_row.get("Level", 0.0)
+        # Extract both CHoCH and BOS events
+        structure_events = bos_choch_ltf[bos_choch_ltf["CHOCH"].notna() | bos_choch_ltf["BOS"].notna()].copy()
+        if structure_events.empty:
+            return setups
 
-                leg_start_idx = max(0, choch_bar_idx - 20)
-                leg_df = df_ltf.iloc[leg_start_idx:]
+        structure_events["event_dir"] = structure_events["CHOCH"].fillna(structure_events["BOS"])
+        structure_events["event_name"] = np.where(structure_events["CHOCH"].notna(), "CHoCH", "BOS")
+        # Sort by BrokenIndex descending (newest breakout first)
+        structure_events = structure_events.sort_values(by="BrokenIndex", ascending=False)
 
-                dir_str = "BUY" if choch_dir == 1 else ("SELL" if choch_dir == -1 else None)
-                if not dir_str:
+        current_bar_idx = len(df_ltf) - 1
+        max_structure_age_bars = 30  # Max 30 bars (~7.5 hours on M15) for fresh structure
+
+        evaluated_directions = set()
+
+        for swing_bar_idx, ev_row in structure_events.iterrows():
+            broken_idx = int(ev_row.get("BrokenIndex", 0))
+            event_dir = int(ev_row["event_dir"])
+            event_name = str(ev_row["event_name"])
+            broken_level = float(ev_row.get("Level", 0.0))
+            swing_bar_idx = int(swing_bar_idx)
+
+            dir_str = "BUY" if event_dir == 1 else "SELL"
+
+            if dir_str in evaluated_directions:
+                continue
+            evaluated_directions.add(dir_str)
+
+            # Check 1: Freshness (Breakout must have occurred within max_structure_age_bars)
+            bars_since_break = current_bar_idx - broken_idx
+            if bars_since_break > max_structure_age_bars or bars_since_break < 0:
+                logger.debug(f"{symbol} {dir_str} {event_name} pominięty: zbyt stary ({bars_since_break} bars > {max_structure_age_bars}).")
+                continue
+
+            # Check 2: Invalidation (Ensure no opposing breakout occurred after this breakout)
+            has_opposing_break = any(
+                (int(r["event_dir"]) != event_dir and int(r.get("BrokenIndex", 0)) > broken_idx)
+                for _, r in structure_events.iterrows()
+            )
+            if has_opposing_break:
+                logger.debug(f"{symbol} {dir_str} {event_name} unieważniony przez nowsze przeciwne wyłamanie.")
+                continue
+
+            # Check 3: Determine accurate SMC impulse leg (dealing range)
+            if dir_str == "BUY":
+                win_start = max(0, min(swing_bar_idx - 5, broken_idx - 15))
+                search_win = df_ltf.iloc[win_start:broken_idx + 1]
+                if search_win.empty:
                     continue
+                min_low_rel_idx = int(search_win["low"].argmin())
+                impulse_low = float(search_win["low"].iloc[min_low_rel_idx])
 
-                setup = self._build_smc_setup(
-                    direction=dir_str,
-                    symbol=symbol,
-                    leg_df=leg_df,
-                    df_ltf=df_ltf,
-                    swings_ltf=swings_ltf,
-                    current_candle=current_candle,
-                    htf_trend=htf_trend,
-                    broken_level=broken_level,
-                    target_rr=target_rr,
-                    is_optimal_rr=is_optimal_rr,
-                    rr_source=rr_source,
-                    session_info=session_info,
-                    news_warn=news_warn,
-                    current_time=current_time,
-                    digits=digits,
-                    point_scale=point_scale,
-                    buffer=buffer,
-                    spread=spread,
-                    df_d1=df_d1,
-                    df_w1=df_w1,
-                    df_h1=df_h1,
-                )
-                if setup:
-                    setups.append(setup)
-                    break
+                post_break_win = df_ltf.iloc[broken_idx:]
+                if post_break_win.empty:
+                    continue
+                max_high_rel_idx = int(post_break_win["high"].argmax())
+                impulse_high = float(post_break_win["high"].iloc[max_high_rel_idx])
+                leg_start_idx = win_start + min_low_rel_idx
+            else:
+                win_start = max(0, min(swing_bar_idx - 5, broken_idx - 15))
+                search_win = df_ltf.iloc[win_start:broken_idx + 1]
+                if search_win.empty:
+                    continue
+                max_high_rel_idx = int(search_win["high"].argmax())
+                impulse_high = float(search_win["high"].iloc[max_high_rel_idx])
+
+                post_break_win = df_ltf.iloc[broken_idx:]
+                if post_break_win.empty:
+                    continue
+                min_low_rel_idx = int(post_break_win["low"].argmin())
+                impulse_low = float(post_break_win["low"].iloc[min_low_rel_idx])
+                leg_start_idx = win_start + max_high_rel_idx
+
+            setup = self._build_smc_setup(
+                direction=dir_str,
+                symbol=symbol,
+                impulse_low=impulse_low,
+                impulse_high=impulse_high,
+                leg_start_idx=leg_start_idx,
+                event_name=event_name,
+                df_ltf=df_ltf,
+                swings_ltf=swings_ltf,
+                current_candle=current_candle,
+                htf_trend=htf_trend,
+                broken_level=broken_level,
+                target_rr=target_rr,
+                is_optimal_rr=is_optimal_rr,
+                rr_source=rr_source,
+                session_info=session_info,
+                news_warn=news_warn,
+                current_time=current_time,
+                digits=digits,
+                point_scale=point_scale,
+                buffer=buffer,
+                spread=spread,
+                df_d1=df_d1,
+                df_w1=df_w1,
+                df_h1=df_h1,
+            )
+            if setup:
+                setups.append(setup)
+                break
 
         return setups
 
@@ -350,26 +468,41 @@ class SMCDetector:
         self,
         direction: str,
         symbol: str,
-        leg_df: pd.DataFrame,
-        df_ltf: pd.DataFrame,
-        swings_ltf: pd.DataFrame,
-        current_candle: pd.Series,
-        htf_trend: str,
-        broken_level: float,
-        target_rr: float,
-        is_optimal_rr: bool,
-        rr_source: str,
-        session_info: dict,
-        news_warn: Optional[str],
-        current_time: datetime,
-        digits: int,
-        point_scale: float,
-        buffer: float,
+        impulse_low: Optional[float] = None,
+        impulse_high: Optional[float] = None,
+        leg_start_idx: int = 0,
+        event_name: str = "CHoCH",
+        df_ltf: Optional[pd.DataFrame] = None,
+        swings_ltf: Optional[pd.DataFrame] = None,
+        current_candle: Optional[pd.Series] = None,
+        htf_trend: str = "NEUTRAL",
+        broken_level: float = 0.0,
+        target_rr: float = 2.0,
+        is_optimal_rr: bool = False,
+        rr_source: str = "Default",
+        session_info: Optional[dict] = None,
+        news_warn: Optional[str] = None,
+        current_time: Optional[datetime] = None,
+        digits: int = 4,
+        point_scale: float = 0.0001,
+        buffer: float = 0.0005,
         spread: float = 0.0,
         df_d1: Optional[pd.DataFrame] = None,
         df_w1: Optional[pd.DataFrame] = None,
         df_h1: Optional[pd.DataFrame] = None,
+        leg_df: Optional[pd.DataFrame] = None,
     ) -> Optional[TradeSetup]:
+        if leg_df is not None and (impulse_low is None or impulse_high is None):
+            impulse_low = float(leg_df["low"].min())
+            impulse_high = float(leg_df["high"].max())
+
+        if impulse_low is None or impulse_high is None or df_ltf is None or current_candle is None:
+            return None
+
+        if session_info is None:
+            session_info = {"session_name": "Standard", "is_killzone": False}
+        if current_time is None:
+            current_time = current_candle["time"] if "time" in current_candle else datetime.utcnow()
         is_buy = direction == "BUY"
         expected_htf = "BULLISH" if is_buy else "BEARISH"
         trend_ok = (not self.strict_htf_alignment) or (htf_trend in [expected_htf, "NEUTRAL"])
@@ -377,8 +510,6 @@ class SMCDetector:
             return None
 
         current_price = current_candle["close"]
-        impulse_low = leg_df["low"].min()
-        impulse_high = leg_df["high"].max()
         impulse_range = impulse_high - impulse_low
         if impulse_range <= (point_scale * 10):
             return None
@@ -387,11 +518,21 @@ class SMCDetector:
         effective_buffer = buffer + spread_buffer
         atr = (df_ltf["high"] - df_ltf["low"]).tail(14).mean()
 
+        # Pre-evaluate liquidity sweeps so Stop Loss can be protected beyond swept levels
+        liq_eval = self.liquidity_detector.evaluate_sweeps(
+            df_ltf=df_ltf,
+            direction=direction,
+            df_d1=df_d1,
+            df_w1=df_w1,
+            df_h1=df_h1,
+        )
+
         if is_buy:
             fibo_50 = impulse_high - (0.500 * impulse_range)
             fibo_618 = impulse_high - (0.618 * impulse_range)
             fibo_705 = impulse_high - (0.705 * impulse_range)
             fibo_786 = impulse_high - (0.786 * impulse_range)
+            # Price must be in discount (at or below 61.8% pullback) and not breaking below impulse low
             if not ((current_price <= fibo_618 + buffer) and (current_price >= impulse_low - buffer)):
                 return None
             entry = current_price
@@ -400,6 +541,13 @@ class SMCDetector:
                 structural_sl = min(fibo_786, recent_pullback_low) - effective_buffer
             else:
                 structural_sl = impulse_low - effective_buffer
+
+            # Guarantee SL protects beyond swept liquidity levels
+            if liq_eval.has_sweep and liq_eval.swept_levels:
+                sweep_min_price = min(s.price for s in liq_eval.swept_levels)
+                lookback_bars = min(len(df_ltf), LIQUIDITY_SWEEP_LOOKBACK_BARS)
+                sweep_window_low = df_ltf.iloc[-lookback_bars:]["low"].min()
+                structural_sl = min(structural_sl, min(sweep_min_price, sweep_window_low) - effective_buffer)
 
             sl, risk, applied_sl_mode = calculate_stop_loss(
                 entry=entry,
@@ -412,8 +560,36 @@ class SMCDetector:
             if sl is None or risk is None:
                 return None
 
-            tp1 = entry + (risk * target_rr)
-            tp2 = max(impulse_high, entry + (risk * (target_rr + 1.0)))
+            # Filter: Max SL vs ATR
+            if MAX_SL_ATR_MULTIPLIER > 0 and atr > 0 and risk > (atr * MAX_SL_ATR_MULTIPLIER):
+                logger.info(
+                    f"🛡️ [FILTER] Odrzucono setup {symbol} BUY: SL zbyt szeroki "
+                    f"({risk / point_scale:.1f}p > {MAX_SL_ATR_MULTIPLIER:.1f}*ATR)."
+                )
+                return None
+
+            # SMC TP Targeting: Primary target is Buy-Side Liquidity (BSL) at impulse_high
+            structural_space = impulse_high - entry
+            structural_rr = (structural_space / risk) if risk > 0 else 0.0
+
+            # Filter: Require at least 1.0R structural room to external liquidity
+            if REQUIRE_STRUCTURAL_SPACE_FOR_RR and structural_rr < 1.0:
+                logger.info(
+                    f"🛡️ [FILTER] Odrzucono setup {symbol} BUY: Zbyt mała przestrzeń do szczytu fali BSL "
+                    f"({structural_rr:.2f}R < 1.0R)."
+                )
+                return None
+
+            if structural_rr >= target_rr:
+                tp1 = entry + (risk * target_rr)
+                tp2 = max(impulse_high, entry + (risk * (target_rr + 0.8)))
+                actual_rr = round(target_rr, 1)
+            else:
+                # Cap TP1 at impulse_high (BSL) so price doesn't reverse before taking profit
+                tp1 = impulse_high
+                tp2 = impulse_high + (impulse_range * 0.272)
+                actual_rr = round(structural_rr, 1)
+
             zone_top = fibo_618
             zone_bottom = fibo_786
         else:
@@ -421,6 +597,7 @@ class SMCDetector:
             fibo_618 = impulse_low + (0.618 * impulse_range)
             fibo_705 = impulse_low + (0.705 * impulse_range)
             fibo_786 = impulse_low + (0.786 * impulse_range)
+            # Price must be in premium (at or above 61.8% pullback) and not breaking above impulse high
             if not ((current_price >= fibo_618 - buffer) and (current_price <= impulse_high + buffer)):
                 return None
             entry = current_price
@@ -429,6 +606,13 @@ class SMCDetector:
                 structural_sl = max(fibo_786, recent_pullback_high) + effective_buffer
             else:
                 structural_sl = impulse_high + effective_buffer
+
+            # Guarantee SL protects beyond swept liquidity levels
+            if liq_eval.has_sweep and liq_eval.swept_levels:
+                sweep_max_price = max(s.price for s in liq_eval.swept_levels)
+                lookback_bars = min(len(df_ltf), LIQUIDITY_SWEEP_LOOKBACK_BARS)
+                sweep_window_high = df_ltf.iloc[-lookback_bars:]["high"].max()
+                structural_sl = max(structural_sl, max(sweep_max_price, sweep_window_high) + effective_buffer)
 
             sl, risk, applied_sl_mode = calculate_stop_loss(
                 entry=entry,
@@ -441,12 +625,39 @@ class SMCDetector:
             if sl is None or risk is None:
                 return None
 
-            tp1 = entry - (risk * target_rr)
-            tp2 = min(impulse_low, entry - (risk * (target_rr + 1.0)))
+            # Filter: Max SL vs ATR
+            if MAX_SL_ATR_MULTIPLIER > 0 and atr > 0 and risk > (atr * MAX_SL_ATR_MULTIPLIER):
+                logger.info(
+                    f"🛡️ [FILTER] Odrzucono setup {symbol} SELL: SL zbyt szeroki "
+                    f"({risk / point_scale:.1f}p > {MAX_SL_ATR_MULTIPLIER:.1f}*ATR)."
+                )
+                return None
+
+            # SMC TP Targeting: Primary target is Sell-Side Liquidity (SSL) at impulse_low
+            structural_space = entry - impulse_low
+            structural_rr = (structural_space / risk) if risk > 0 else 0.0
+
+            # Filter: Require at least 1.0R structural room to external liquidity
+            if REQUIRE_STRUCTURAL_SPACE_FOR_RR and structural_rr < 1.0:
+                logger.info(
+                    f"🛡️ [FILTER] Odrzucono setup {symbol} SELL: Zbyt mała przestrzeń do dołka fali SSL "
+                    f"({structural_rr:.2f}R < 1.0R)."
+                )
+                return None
+
+            if structural_rr >= target_rr:
+                tp1 = entry - (risk * target_rr)
+                tp2 = min(impulse_low, entry - (risk * (target_rr + 0.8)))
+                actual_rr = round(target_rr, 1)
+            else:
+                # Cap TP1 at impulse_low (SSL) so price doesn't reverse before taking profit
+                tp1 = impulse_low
+                tp2 = impulse_low - (impulse_range * 0.272)
+                actual_rr = round(structural_rr, 1)
+
             zone_top = fibo_786
             zone_bottom = fibo_618
 
-        actual_rr = round(target_rr, 1)
         breakdown: List[ConfluenceItem] = []
         total_score = 0
 
@@ -461,21 +672,22 @@ class SMCDetector:
             detail=f"H4: {htf_trend} (+{w1}%)"
         ))
 
-        # 2. M15 CHoCH Confirmation (20%)
+        # 2. Market Structure Confirmation (CHoCH / BOS) (20%)
         total_score += 20
         choch_label = "szczytu" if is_buy else "dołka"
+        event_desc = "Odwrócenie trendu (CHoCH)" if event_name == "CHoCH" else "Kontynuacja trendu (BOS)"
         breakdown.append(ConfluenceItem(
-            factor="Potwierdzenie M15 CHoCH",
+            factor=f"Potwierdzenie M15 {event_name}",
             weight=20,
             achieved=True,
-            detail=f"Wybicie {choch_label} {broken_level:.{digits}f} (+20%)"
+            detail=f"{event_desc}: Wybicie {choch_label} {broken_level:.{digits}f} (+20%)"
         ))
 
         # 3. Fibonacci Retracement Depth (20%)
         is_deep_ote = (current_price <= fibo_705) if is_buy else (current_price >= fibo_705)
         w3 = 20 if is_deep_ote else 15
         total_score += w3
-        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8%)"
+        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8% - 70.5%)"
         breakdown.append(ConfluenceItem(
             factor="Poziom Fibonacciego",
             weight=20,
@@ -486,24 +698,19 @@ class SMCDetector:
         # 4. Order Block / FVG Confluence (15%)
         ob_fibo_low = min(fibo_786, fibo_618)
         ob_fibo_high = max(fibo_786, fibo_618)
-        has_ob, ob_detail = self._check_order_block_overlap(df_ltf, swings_ltf, ob_fibo_low, ob_fibo_high, direction)
-        w4 = 15 if has_ob else 0
+        has_ob_fvg, ob_detail = self._check_ob_and_fvg_confluence(
+            df_ltf, swings_ltf, leg_start_idx, ob_fibo_low, ob_fibo_high, direction
+        )
+        w4 = 15 if has_ob_fvg else 0
         total_score += w4
         breakdown.append(ConfluenceItem(
             factor="Zbieżność z Order Block / FVG",
             weight=15,
-            achieved=has_ob,
+            achieved=has_ob_fvg,
             detail=f"{ob_detail} (+{w4}%)"
         ))
 
         # 5. Advanced Liquidity Sweep (15% base + 5% bonus for Multi-Sweep / HTF)
-        liq_eval = self.liquidity_detector.evaluate_sweeps(
-            df_ltf=df_ltf,
-            direction=direction,
-            df_d1=df_d1,
-            df_w1=df_w1,
-            df_h1=df_h1,
-        )
         has_sweep = liq_eval.has_sweep
         w5 = liq_eval.confluence_weight
         bonus = liq_eval.bonus_weight
@@ -537,7 +744,7 @@ class SMCDetector:
             symbol=symbol,
             direction=direction,
             timeframe=LTF_TIMEFRAME,
-            setup_type=f"{LTF_TIMEFRAME} CHoCH + Fibo >= 61.8% Pullback (OTE)",
+            setup_type=f"{LTF_TIMEFRAME} {event_name} + Fibo >= 61.8% Pullback (OTE)",
             entry_price=round(entry, digits),
             sl_price=round(sl, digits),
             tp1_price=round(tp1, digits),
@@ -546,7 +753,7 @@ class SMCDetector:
             htf_trend=htf_trend,
             zone_top=round(zone_top, digits),
             zone_bottom=round(zone_bottom, digits),
-            reason=f"M15 CHoCH + Fibo OTE ({total_score}% Confluence [{grade}]). {liq_eval.summary_msg}.",
+            reason=f"M15 {event_name} + Fibo OTE ({total_score}% Confluence [{grade}]). {liq_eval.summary_msg}.",
             timestamp=current_time,
             fibo_50=round(fibo_50, digits),
             fibo_618=round(fibo_618, digits),

@@ -13,6 +13,7 @@ from config import (
     AUTO_BE_AT_1R,
     AUTO_BE_OFFSET_PIPS,
     BLOCK_ON_HIGH_IMPACT_NEWS,
+    BLOCK_ROLLOVER_SESSION,
     DYNAMIC_FILTER_MODE,
     ENABLE_DYNAMIC_EDGE_FILTER,
     ENABLE_PYRAMIDING,
@@ -47,6 +48,7 @@ from config import (
 from mt5_client import MT5Client
 from news_filter import NewsFilter
 from notion_journal import NotionJournal
+from session_manager import SessionManager
 from smc_detector import SMCDetector, TradeSetup
 from trade_journal import TradeJournal
 from zumiko_detector import ZumikoDetector
@@ -424,6 +426,16 @@ class SMCScanner:
 
         # Refresh macroeconomic news calendar asynchronously
         await self.news_filter.fetch_calendar_async()
+
+        # Rollover & Low Liquidity Session Lock
+        if BLOCK_ROLLOVER_SESSION:
+            curr_session = SessionManager.get_current_session()
+            if "Rollover" in curr_session.get("session_name", ""):
+                logger.info(
+                    f"🛡️ [SESSION LOCK] Aktywna sesja {curr_session.get('session_name')}. "
+                    f"Wstrzymano skanowanie rynków z powodu niskiej płynności i rozszerzonych spreadów (BLOCK_ROLLOVER_SESSION=True)."
+                )
+                return 0
 
         # Prop Firm checks before scanning
         if PROP_FIRM_MODE:

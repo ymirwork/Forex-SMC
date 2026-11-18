@@ -390,15 +390,30 @@ class LiquidityDetector:
         current_price: float,
     ) -> Tuple[bool, int]:
         """
-        Checks if low dipped below level, but closed back above or current_price >= level.
-        Returns (swept: bool, bars_ago: int).
+        Checks if price swept liquidity below `level`:
+        A valid SMC liquidity sweep (Turtle Soup / SFP) occurs when a candle penetrates
+        below `level`, but closes back above `level` on that same bar (wick rejection),
+        or the subsequent bar immediately closes back above `level`, and current price is above `level`.
         """
-        min_low = recent_bars["low"].min()
-        if min_low < level and current_price >= level:
-            # Find the candle where minimum occurred
-            low_series = recent_bars["low"].values
-            idx_from_end = len(low_series) - 1 - int(np.argmin(low_series))
-            return True, idx_from_end
+        if current_price < level or recent_bars is None or recent_bars.empty:
+            return False, 0
+
+        # Scan recent bars in reverse for the penetration below level
+        n = len(recent_bars)
+        for idx in range(n - 1, -1, -1):
+            row = recent_bars.iloc[idx]
+            if row["low"] < level:
+                bars_ago = n - 1 - idx
+                # Check if this bar closed back above the level (Wick rejection / SFP)
+                if row["close"] >= level:
+                    return True, bars_ago
+                # Or if the immediate next bar closed back above the level
+                if idx + 1 < n:
+                    next_bar = recent_bars.iloc[idx + 1]
+                    if next_bar["close"] >= level:
+                        return True, bars_ago
+                # If neither closed back above, it was a structural breakdown, not a sweep
+                break
         return False, 0
 
     @staticmethod
@@ -408,12 +423,26 @@ class LiquidityDetector:
         current_price: float,
     ) -> Tuple[bool, int]:
         """
-        Checks if high spiked above level, but closed back below or current_price <= level.
-        Returns (swept: bool, bars_ago: int).
+        Checks if price swept liquidity above `level`:
+        A valid SMC liquidity sweep occurs when a candle penetrates above `level`,
+        but closes back below `level` on that bar, or the subsequent bar immediately closes back below.
         """
-        max_high = recent_bars["high"].max()
-        if max_high > level and current_price <= level:
-            high_series = recent_bars["high"].values
-            idx_from_end = len(high_series) - 1 - int(np.argmax(high_series))
-            return True, idx_from_end
+        if current_price > level or recent_bars is None or recent_bars.empty:
+            return False, 0
+
+        n = len(recent_bars)
+        for idx in range(n - 1, -1, -1):
+            row = recent_bars.iloc[idx]
+            if row["high"] > level:
+                bars_ago = n - 1 - idx
+                # Check if this bar closed back below the level (Wick rejection / SFP)
+                if row["close"] <= level:
+                    return True, bars_ago
+                # Or if the immediate next bar closed back below the level
+                if idx + 1 < n:
+                    next_bar = recent_bars.iloc[idx + 1]
+                    if next_bar["close"] <= level:
+                        return True, bars_ago
+                # If neither closed back below, it was a structural breakout, not a sweep
+                break
         return False, 0

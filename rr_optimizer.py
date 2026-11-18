@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
+from config import MIN_TRADES_FOR_OPTIMAL_RR, OPTIMAL_RR_MIN_FLOOR
+
 
 @dataclass
 class RROptimizerResult:
@@ -28,18 +30,23 @@ class RROptimizer:
         journal,
         default_rr: float,
         use_optimal_rr: bool = True,
-        min_trades: int = 10,
+        min_trades: Optional[int] = None,
+        min_floor_rr: Optional[float] = None,
     ) -> Tuple[float, bool, str]:
         """
         Determines the target Risk:Reward dynamically:
         If enough trades exist (>= min_trades), uses mathematically
         optimized BEST RR from the journal. Otherwise falls back to default_rr.
+        Guarantees that optimal RR is never below min_floor_rr (default: 2.0).
         """
+        required_trades = min_trades if min_trades is not None else MIN_TRADES_FOR_OPTIMAL_RR
+        floor_rr = min_floor_rr if min_floor_rr is not None else OPTIMAL_RR_MIN_FLOOR
+
         if use_optimal_rr and journal is not None:
             trades = [t for t in journal.get_all_trades() if t.get("status") in ("CLOSED", "WIN", "LOSS", "BE")]
-            if len(trades) >= min_trades:
-                opt_res = RROptimizer.calculate_best_rr(trades)
-                if opt_res and opt_res.best_rr >= 1.0:
+            if len(trades) >= required_trades:
+                opt_res = RROptimizer.calculate_best_rr(trades, min_rr=floor_rr)
+                if opt_res and opt_res.best_rr >= floor_rr:
                     return (
                         opt_res.best_rr,
                         True,
@@ -54,7 +61,7 @@ class RROptimizer:
     @staticmethod
     def calculate_best_rr(
         trades: List[Dict],
-        min_rr: float = 1.0,
+        min_rr: float = OPTIMAL_RR_MIN_FLOOR,
         max_rr: float = 8.0,
         step: float = 0.1,
     ) -> Optional[RROptimizerResult]:

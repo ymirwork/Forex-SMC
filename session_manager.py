@@ -95,17 +95,22 @@ class SessionManager:
         # Convert broker server time to true UTC
         offset_hours = get_broker_utc_offset()
         df_copy["time_utc"] = pd.to_datetime(df_copy["time"]) - pd.Timedelta(hours=offset_hours)
-        latest_date = df_copy["time_utc"].iloc[-1].date()
+        latest_time = df_copy["time_utc"].iloc[-1]
+        latest_date = latest_time.date()
 
-        # Filter candles belonging to today's Asian session
-        asia_candles = df_copy[
-            (df_copy["time_utc"].dt.date == latest_date) &
-            (df_copy["time_utc"].dt.hour >= 0) &
-            (df_copy["time_utc"].dt.hour < 7)
-        ]
+        # If today's Asian session is still in progress (UTC < 07:00), we must use yesterday's completed Asian session
+        if latest_time.hour < 7:
+            asia_candles = pd.DataFrame()
+        else:
+            # Filter candles belonging to today's completed Asian session (00:00 - 07:00 UTC)
+            asia_candles = df_copy[
+                (df_copy["time_utc"].dt.date == latest_date) &
+                (df_copy["time_utc"].dt.hour >= 0) &
+                (df_copy["time_utc"].dt.hour < 7)
+            ]
 
         if asia_candles.empty:
-            # Fallback to the most recent previous trading day with Asian session data (e.g. Friday on Monday)
+            # Fallback to the most recent previous trading day with completed Asian session data (e.g. yesterday, or Friday on Monday)
             unique_dates = sorted(df_copy["time_utc"].dt.date.unique(), reverse=True)
             for prev_date in unique_dates:
                 if prev_date < latest_date:

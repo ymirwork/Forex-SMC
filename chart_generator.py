@@ -110,10 +110,11 @@ class ChartGenerator:
                 )
                 ax.add_patch(zone_rect)
 
-            # Draw CHoCH line if present
+            # Draw CHoCH / BOS line if present
             if setup.choch_level > 0:
                 ax.axhline(setup.choch_level, color="#ec4899", linestyle="--", linewidth=1.2, alpha=0.8)
-                ax.text(2, setup.choch_level, f" M15 CHoCH Level ({setup.choch_level})", color="#ec4899", va="bottom", fontsize=8, fontweight="bold")
+                ev_label = "M15 BOS" if "BOS" in getattr(setup, "setup_type", "").upper() else "M15 CHoCH"
+                ax.text(2, setup.choch_level, f" {ev_label} Level ({setup.choch_level})", color="#ec4899", va="bottom", fontsize=8, fontweight="bold")
 
             # Draw Swept Liquidity lines if present (PDL, PDH, Asian H/L, EQH/EQL, PWL/PWH)
             swept_levels = getattr(setup, "swept_levels", [])

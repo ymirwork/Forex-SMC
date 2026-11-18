@@ -82,7 +82,15 @@ DEFAULT_RR_RATIO = float(os.getenv("DEFAULT_RR_RATIO", "2.0"))          # Defaul
 
 # Dynamic / Adaptive Best RR Settings
 USE_OPTIMAL_RR = os.getenv("USE_OPTIMAL_RR", "True").lower() in ("true", "1")
-MIN_TRADES_FOR_OPTIMAL_RR = int(os.getenv("MIN_TRADES_FOR_OPTIMAL_RR", "5"))
+MIN_TRADES_FOR_OPTIMAL_RR = int(os.getenv("MIN_TRADES_FOR_OPTIMAL_RR", "30"))
+OPTIMAL_RR_MIN_FLOOR = float(os.getenv("OPTIMAL_RR_MIN_FLOOR", "2.0"))
+
+# Rollover & Session Protection
+BLOCK_ROLLOVER_SESSION = os.getenv("BLOCK_ROLLOVER_SESSION", "True").lower() in ("true", "1")
+
+# Max SL & Structural Room Filtering
+MAX_SL_ATR_MULTIPLIER = float(os.getenv("MAX_SL_ATR_MULTIPLIER", "2.5"))
+REQUIRE_STRUCTURAL_SPACE_FOR_RR = os.getenv("REQUIRE_STRUCTURAL_SPACE_FOR_RR", "True").lower() in ("true", "1")
 
 # Scanner Settings
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))   # Check every 60s
