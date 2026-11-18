@@ -55,6 +55,7 @@ MIN_TRADES_FOR_OPTIMAL_RR = int(os.getenv("MIN_TRADES_FOR_OPTIMAL_RR", "5"))
 
 # Scanner Settings
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))   # Check every 60s
+TRADE_MONITOR_INTERVAL_SECONDS = int(os.getenv("TRADE_MONITOR_INTERVAL_SECONDS", "15")) # Check open TP/SL every 15s
 SWING_LENGTH = int(os.getenv("SWING_LENGTH", "5"))                      # Swing pivot length
 LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "300"))                  # Bars to analyze
 
