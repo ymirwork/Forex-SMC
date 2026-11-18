@@ -14,6 +14,12 @@ from telegram.ext import (
 from config import (
     ALLOWED_CHAT_IDS,
     DEFAULT_RISK_PERCENT,
+    PROP_FIRM_MODE,
+    PROP_INITIAL_BALANCE,
+    PROP_MAX_DRAWDOWN_PERCENT,
+    PROP_MAX_OPEN_TRADES,
+    PROP_RISK_PER_TRADE_PERCENT,
+    PROP_SAFETY_BUFFER_PERCENT,
     TELEGRAM_ALERT_CHANNEL,
     TELEGRAM_BOT_TOKEN,
 )
@@ -81,6 +87,7 @@ class TelegramBotManager:
             f"👤 **Twój Chat ID:** `{update.effective_user.id}`\n\n"
             "**Dostępne komendy:**\n"
             "• `/status` - Stan konta i otwarte pozycje w MT5\n"
+            "• `/prop` - Dashboard ryzyka konta Prop Firm (Drawdown, bufor, limity)\n"
             "• `/be` - Przestawienie Stop Loss na Break-Even (cena wejścia)\n"
             "• `/scan` - Wymuś natychmiastowe przeskanowanie rynku\n"
             "• `/journal` - Dziennik zagrań i dotychczasowe statystyki R\n"
@@ -123,6 +130,54 @@ class TelegramBotManager:
             f"• Dźwignia: `1:{acc['leverage']}`"
             f"{pos_text}\n"
             f"📊 Łączny PnL pozycji: `{total_pnl:+.2f} {acc['currency']}`"
+        )
+        if PROP_FIRM_MODE:
+            metrics = self.mt5_client.get_prop_metrics()
+            if metrics:
+                msg += (
+                    f"\n\n🛡️ **Tryb Prop Firm:** Aktywny\n"
+                    f"• Drawdown: `-{metrics['current_dd_pct']:.2f}%` / `10.0%`\n"
+                    f"• Pozostały bufor: `{metrics['remaining_buffer_usd']:.2f} {metrics['currency']}`\n"
+                    f"• Slot pozycji: `{metrics['open_positions_count']}/{metrics['max_open_trades']}`"
+                )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def prop_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Displays comprehensive Prop Firm Risk Dashboard."""
+        if not self._is_authorized(update):
+            return
+
+        metrics = self.mt5_client.get_prop_metrics()
+        if not metrics:
+            await update.message.reply_text("❌ Nie można pobrać parametrów konta MT5.")
+            return
+
+        status_icon = "🟢 BEZPIECZNY"
+        if metrics["is_breached"]:
+            status_icon = "🔴 PRZEKROCZONY (BREACHED)"
+        elif metrics["is_safety_halt"]:
+            status_icon = "🟡 OSTRZEGAWCZY (HALT)"
+
+        open_positions = self.mt5_client.get_open_positions()
+        total_pnl = sum(p["profit"] for p in open_positions)
+        risk_per_trade_usd = metrics["initial_balance"] * (metrics["risk_per_trade_pct"] / 100.0)
+
+        msg = (
+            "🛡️ **PROP FIRM RISK DASHBOARD**\n\n"
+            f"🚥 **Status Konta:** `{status_icon}`\n"
+            f"💵 **Początkowy Balans:** `{metrics['initial_balance']:.2f} {metrics['currency']}`\n"
+            f"💰 **Aktualne Saldo:** `{metrics['current_balance']:.2f} {metrics['currency']}`\n"
+            f"📊 **Aktualne Equity:** `{metrics['current_equity']:.2f} {metrics['currency']}`\n\n"
+            "📉 **Statystyki Drawdownu (Static DD):**\n"
+            f"• Aktualna strata: `-{metrics['current_dd_pct']:.2f}%` (`-{metrics['current_loss_usd']:.2f} {metrics['currency']}`)\n"
+            f"• Maksymalny dozwolony Drawdown: `10.0%` (`{metrics['max_loss_usd']:.2f} {metrics['currency']}`)\n"
+            f"• Poziom krytyczny konta: `{metrics['breach_level_usd']:.2f} {metrics['currency']}`\n"
+            f"• Pozostały bufor bezpieczeństwa: `{metrics['remaining_buffer_usd']:.2f} {metrics['currency']}` (`{metrics['remaining_buffer_pct']:.2f}%`)\n\n"
+            "📦 **Ekspozycja i Ryzyko:**\n"
+            f"• Otwarte pozycje: `{metrics['open_positions_count']} / {metrics['max_open_trades']}`\n"
+            f"• Ryzyko na transakcję: `{metrics['risk_per_trade_pct']}%` (~`{risk_per_trade_usd:.2f} {metrics['currency']}`)\n"
+            f"• Niezrealizowany PnL: `{total_pnl:+.2f} {metrics['currency']}`\n\n"
+            "💡 Użyj komendy `/be`, aby przestawiać zyskowne pozycje na Break-Even!"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -293,7 +348,17 @@ class TelegramBotManager:
             await query.edit_message_caption(caption=f"{query.message.caption}\n\n⚠️ **Ten setup wygasł lub został już przetworzony.**")
             return
 
-        risk_pct = DEFAULT_RISK_PERCENT
+        if action in ("market", "limit"):
+            if PROP_FIRM_MODE:
+                can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol)
+                if not can_trade:
+                    await query.answer(text=reason[:190], show_alert=True)
+                    await query.edit_message_caption(
+                        caption=f"{query.message.caption}\n\n🛑 **Zlecenie zablokowane (Prop Firm Guardian):**\n{reason}"
+                    )
+                    return
+
+        risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
         lot = self.mt5_client.calculate_lot_size(setup.symbol, risk_pct, setup.sl_price, setup.entry_price)
 
         if action == "market":
@@ -410,6 +475,18 @@ class TelegramBotManager:
         rr_badge = "🔥 [Best RR]" if setup.is_optimal_rr else "⚙️ [Domyślne]"
         rr_src = f"\n💡 `{setup.rr_source_info}`" if setup.rr_source_info else ""
 
+        # Prop Firm metrics for alert
+        risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
+        acc = self.mt5_client.get_account_info()
+        bal = acc['balance'] if acc else PROP_INITIAL_BALANCE
+        curr = acc['currency'] if acc else "USD"
+        risk_usd = bal * (risk_pct / 100.0)
+
+        prop_risk_line = ""
+        if PROP_FIRM_MODE:
+            open_count = len(self.mt5_client.get_open_positions())
+            prop_risk_line = f"🛡️ **Prop Risk:** `{risk_pct}%` (`~{risk_usd:.2f} {curr}`) | Slot: `{open_count}/{PROP_MAX_OPEN_TRADES}`\n"
+
         # Strategy title
         strat_name = getattr(setup, "strategy_name", "SMC")
         if strat_name == "GOLDEN_COMBO":
@@ -449,14 +526,15 @@ class TelegramBotManager:
             f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} p)\n"
             f"🎯 **TP1:** `{setup.tp1_price:.{digits}f}` (Target 1:{setup.rr_ratio})\n"
             f"🎯 **TP2:** `{setup.tp2_price:.{digits}f}` (Strukturalny szczyt/dołek)\n"
-            f"⚖️ **Risk / Reward:** `1 : {setup.rr_ratio}` {rr_badge}"
+            f"⚖️ **Risk / Reward:** `1 : {setup.rr_ratio}` {rr_badge}\n"
+            f"{prop_risk_line}"
             f"{rr_src}"
         )
 
         keyboard = [
             [
                 InlineKeyboardButton(
-                    f"🟢 Wejdź Market ({DEFAULT_RISK_PERCENT}% ryzyka)",
+                    f"🟢 Wejdź Market ({risk_pct}% ryzyka)",
                     callback_data=f"market:{setup_id}",
                 ),
             ],
@@ -541,6 +619,7 @@ class TelegramBotManager:
 
         self.app.add_handler(CommandHandler("start", self.start_cmd))
         self.app.add_handler(CommandHandler("status", self.status_cmd))
+        self.app.add_handler(CommandHandler("prop", self.prop_cmd))
         self.app.add_handler(CommandHandler("be", self.be_cmd))
         self.app.add_handler(CommandHandler("scan", self.scan_cmd))
         self.app.add_handler(CommandHandler("journal", self.journal_cmd))

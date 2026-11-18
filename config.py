@@ -74,3 +74,16 @@ ZUMIKO_SLOW_EMA = int(os.getenv("ZUMIKO_SLOW_EMA", "21"))
 ZUMIKO_TREND_EMA = int(os.getenv("ZUMIKO_TREND_EMA", "238"))
 ZUMIKO_SWING_LEN = int(os.getenv("ZUMIKO_SWING_LEN", "10"))
 ZUMIKO_REQUIRE_H1 = os.getenv("ZUMIKO_REQUIRE_H1", "True").lower() in ("true", "1")
+
+# ==========================================
+# PROP FIRM SETTINGS
+# ==========================================
+PROP_FIRM_MODE = os.getenv("PROP_FIRM_MODE", "True").lower() in ("true", "1")
+PROP_INITIAL_BALANCE = float(os.getenv("PROP_INITIAL_BALANCE", "600.0"))
+PROP_MAX_DRAWDOWN_PERCENT = float(os.getenv("PROP_MAX_DRAWDOWN_PERCENT", "10.0")) # 10% Static Max DD
+PROP_SAFETY_BUFFER_PERCENT = float(os.getenv("PROP_SAFETY_BUFFER_PERCENT", "7.5")) # Halts new setups if DD reaches 7.5%
+PROP_RISK_PER_TRADE_PERCENT = float(os.getenv("PROP_RISK_PER_TRADE_PERCENT", "0.5")) # 0.5% per trade
+PROP_MAX_OPEN_TRADES = int(os.getenv("PROP_MAX_OPEN_TRADES", "6")) # Max 6 concurrent open trades
+PROP_MAX_SAME_CURRENCY_TRADES = int(os.getenv("PROP_MAX_SAME_CURRENCY_TRADES", "2")) # Max 2 on same currency
+PROP_ENFORCE_NEWS_FILTER = os.getenv("PROP_ENFORCE_NEWS_FILTER", "True").lower() in ("true", "1")
+

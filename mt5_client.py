@@ -3,6 +3,16 @@ from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
 
+from config import (
+    PROP_FIRM_MODE,
+    PROP_INITIAL_BALANCE,
+    PROP_MAX_DRAWDOWN_PERCENT,
+    PROP_SAFETY_BUFFER_PERCENT,
+    PROP_RISK_PER_TRADE_PERCENT,
+    PROP_MAX_OPEN_TRADES,
+    PROP_MAX_SAME_CURRENCY_TRADES,
+)
+
 logger = logging.getLogger("ForexSMC.MT5Client")
 
 
@@ -231,6 +241,9 @@ class MT5Client:
 
         if loss_per_one_lot <= 0:
             return sym.volume_min
+
+        if PROP_FIRM_MODE:
+            risk_percent = PROP_RISK_PER_TRADE_PERCENT
 
         risk_amount = acc.balance * (risk_percent / 100.0)
         raw_lot = risk_amount / loss_per_one_lot
@@ -549,3 +562,139 @@ class MT5Client:
 
         logger.info(f"Stop Loss for #{ticket} ({p.symbol}) moved to Break-Even: {be_price}")
         return True, f"✅ Stop Loss dla pozycji #{ticket} ({p.symbol}) przestawiony na Break-Even ({be_price})!"
+
+    @staticmethod
+    def _parse_currencies(symbol_clean: str) -> Tuple[str, str]:
+        """
+        Parses base and quote currency from standard Forex/Metals pairs.
+        E.g. EURUSD -> ('EUR', 'USD'), XAUUSD -> ('XAU', 'USD'), USDJPY -> ('USD', 'JPY')
+        """
+        sym = symbol_clean.upper()
+        for sfx in [".PRO", ".RAW", ".ECN", "PRO.", "RAW.", "M."]:
+            sym = sym.replace(sfx, "")
+        sym = sym.replace("/", "").replace("_", "").replace("-", "")
+
+        if len(sym) == 6:
+            return sym[:3], sym[3:]
+        elif "XAU" in sym:
+            return "XAU", sym.replace("XAU", "")
+        elif "XAG" in sym:
+            return "XAG", sym.replace("XAG", "")
+        return sym, ""
+
+    def get_prop_metrics(self) -> dict:
+        """
+        Calculates Prop Firm status based on Static Drawdown rules.
+        """
+        if not self.ensure_connection():
+            return {}
+        acc = mt5.account_info()
+        if acc is None:
+            return {}
+
+        initial_bal = PROP_INITIAL_BALANCE if PROP_INITIAL_BALANCE > 0 else acc.balance
+        max_dd_pct = PROP_MAX_DRAWDOWN_PERCENT
+        safety_dd_pct = PROP_SAFETY_BUFFER_PERCENT
+
+        max_loss_usd = initial_bal * (max_dd_pct / 100.0)
+        breach_level_usd = max(0.0, initial_bal - max_loss_usd)
+
+        current_equity = acc.equity
+        current_balance = acc.balance
+
+        # Static Drawdown: loss relative to initial balance
+        current_loss_usd = max(0.0, initial_bal - current_equity)
+        current_dd_pct = (current_loss_usd / initial_bal) * 100.0 if initial_bal > 0 else 0.0
+
+        # Remaining buffer to breach (in USD and %)
+        remaining_buffer_usd = max(0.0, current_equity - breach_level_usd)
+        remaining_buffer_pct = (remaining_buffer_usd / initial_bal) * 100.0 if initial_bal > 0 else 0.0
+
+        is_breached = current_equity <= breach_level_usd
+        is_safety_halt = current_dd_pct >= safety_dd_pct
+
+        open_positions = self.get_open_positions()
+
+        return {
+            "prop_mode": PROP_FIRM_MODE,
+            "initial_balance": initial_bal,
+            "current_balance": current_balance,
+            "current_equity": current_equity,
+            "currency": acc.currency,
+            "max_dd_pct": max_dd_pct,
+            "safety_dd_pct": safety_dd_pct,
+            "max_loss_usd": max_loss_usd,
+            "breach_level_usd": breach_level_usd,
+            "current_loss_usd": current_loss_usd,
+            "current_dd_pct": current_dd_pct,
+            "remaining_buffer_usd": remaining_buffer_usd,
+            "remaining_buffer_pct": remaining_buffer_pct,
+            "is_breached": is_breached,
+            "is_safety_halt": is_safety_halt,
+            "open_positions_count": len(open_positions),
+            "max_open_trades": PROP_MAX_OPEN_TRADES,
+            "risk_per_trade_pct": PROP_RISK_PER_TRADE_PERCENT,
+        }
+
+    def can_open_new_trade(self, symbol: str) -> Tuple[bool, str]:
+        """
+        Enforces Prop Firm risk boundaries:
+        1. Static Max Drawdown Breach
+        2. Safety Halt threshold
+        3. Max open concurrent trades
+        4. Currency correlation limit
+        """
+        if not PROP_FIRM_MODE:
+            return True, "OK"
+
+        metrics = self.get_prop_metrics()
+        if not metrics:
+            return True, "OK"
+
+        if metrics["is_breached"]:
+            return (
+                False,
+                f"🚨 PROG DRAWDOWNU PRZEKROCZONY! Equity ({metrics['current_equity']:.2f} {metrics['currency']}) "
+                f"spadło poniżej limitu ({metrics['breach_level_usd']:.2f} {metrics['currency']}).",
+            )
+
+        if metrics["is_safety_halt"]:
+            return (
+                False,
+                f"🛡️ PROG BEZPIECZEŃSTWA PROP FIRM! Strata: {metrics['current_dd_pct']:.2f}% "
+                f"(Próg ostrzegawczy: {metrics['safety_dd_pct']}%, Max: {metrics['max_dd_pct']}%). "
+                f"Nowe zlecenia zostały zablokowane.",
+            )
+
+        open_positions = self.get_open_positions()
+        if len(open_positions) >= PROP_MAX_OPEN_TRADES:
+            return (
+                False,
+                f"⚠️ Osiągnięto limit otwartych pozycji: {len(open_positions)}/{PROP_MAX_OPEN_TRADES}. "
+                f"Poczekaj na zamknięcie lub przestawienie pozycji na BE.",
+            )
+
+        if PROP_MAX_SAME_CURRENCY_TRADES > 0:
+            base_curr, quote_curr = self._parse_currencies(symbol)
+            base_count = 0
+            quote_count = 0
+            for p in open_positions:
+                p_base, p_quote = self._parse_currencies(p["symbol"])
+                if base_curr and base_curr in (p_base, p_quote):
+                    base_count += 1
+                if quote_curr and quote_curr in (p_base, p_quote):
+                    quote_count += 1
+
+            if base_curr and base_count >= PROP_MAX_SAME_CURRENCY_TRADES:
+                return (
+                    False,
+                    f"⚠️ Tarcza korelacji: Waluta {base_curr} występuje już w {base_count} pozycjach (Max: {PROP_MAX_SAME_CURRENCY_TRADES}).",
+                )
+            if quote_curr and quote_count >= PROP_MAX_SAME_CURRENCY_TRADES:
+                return (
+                    False,
+                    f"⚠️ Tarcza korelacji: Waluta {quote_curr} występuje już w {quote_count} pozycjach (Max: {PROP_MAX_SAME_CURRENCY_TRADES}).",
+                )
+
+        return True, "OK"
+

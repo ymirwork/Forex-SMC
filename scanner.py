@@ -11,6 +11,10 @@ from config import (
     LOOKBACK_BARS,
     LTF_TIMEFRAME,
     MIN_CONFLUENCE_SCORE,
+    PROP_FIRM_MODE,
+    PROP_MAX_DRAWDOWN_PERCENT,
+    PROP_MAX_OPEN_TRADES,
+    PROP_SAFETY_BUFFER_PERCENT,
     SCAN_INTERVAL_SECONDS,
     TRADE_MONITOR_INTERVAL_SECONDS,
     SWING_LENGTH,
@@ -59,6 +63,7 @@ class SMCScanner:
         self.chart_gen = ChartGenerator()
         self.is_running = False
         self.notified_setups: Dict[str, float] = {}
+        self._prop_warned: bool = False
 
     def _cleanup_old_notifications(self, max_age_hours: float = 6.0):
         """Clears old sent setup keys so memory does not leak."""
@@ -69,10 +74,28 @@ class SMCScanner:
 
     async def monitor_open_trades(self):
         """
-        Monitors active positions tracked in trades.db.
+        Monitors active positions tracked in trades.db and checks Prop Firm risk thresholds.
         When a position closes (TP, SL, or manual), updates the journal
         and dispatches a Telegram notification.
         """
+        # 1. Prop Firm Drawdown Safety Check
+        if PROP_FIRM_MODE and self.telegram:
+            metrics = self.mt5_client.get_prop_metrics()
+            if metrics:
+                if metrics.get("is_safety_halt") and not self._prop_warned:
+                    msg = (
+                        "🚨 **PROP FIRM: OSTRZEŻENIE DRAWDOWNU!** 🚨\n\n"
+                        f"⚠️ Aktualny Drawdown osiągnął: `{metrics['current_dd_pct']:.2f}%`!\n"
+                        f"🛑 Próg bezpieczeństwa: `{metrics['safety_dd_pct']:.1f}%` (Max DD: `{metrics['max_dd_pct']:.1f}%`)\n"
+                        f"💰 Pozostały bufor kapitału: `{metrics['remaining_buffer_usd']:.2f} {metrics['currency']}`\n\n"
+                        "🛡️ **Nowe skanowanie i transakcje zostały wstrzymane**, aby chronić Twoje konto przed utratą!"
+                    )
+                    await self.telegram.send_message(msg)
+                    self._prop_warned = True
+                elif not metrics.get("is_safety_halt") and self._prop_warned:
+                    self._prop_warned = False  # Reset once equity recovers
+
+        # 2. Closed Trades Monitor
         open_trades = self.journal.get_open_trades()
         if not open_trades:
             return
@@ -129,6 +152,23 @@ class SMCScanner:
         self._cleanup_old_notifications()
         # Monitor open positions for closures
         await self.monitor_open_trades()
+
+        # Prop Firm checks before scanning
+        if PROP_FIRM_MODE:
+            metrics = self.mt5_client.get_prop_metrics()
+            if metrics.get("is_safety_halt"):
+                logger.warning(
+                    f"🛡️ [PROP GUARDIAN] Drawdown safety buffer reached ({metrics.get('current_dd_pct', 0):.2f}%). "
+                    f"Wstrzymano skanowanie, aby chronić konto Prop Firm."
+                )
+                return 0
+            open_cnt = metrics.get("open_positions_count", 0)
+            if open_cnt >= PROP_MAX_OPEN_TRADES:
+                logger.info(
+                    f"🛡️ [PROP LIMIT] Osiągnięto limit otwartych pozycji ({open_cnt}/{PROP_MAX_OPEN_TRADES}). "
+                    f"Skaner czeka na zwolnienie slotu pozycji."
+                )
+                return 0
 
         found_count = 0
         busy_symbols = self.mt5_client.get_busy_symbols()
@@ -201,6 +241,13 @@ class SMCScanner:
                     if setup_key in self.notified_setups:
                         continue  # Already notified recently
 
+                    # Prop Firm trade eligibility check before alert
+                    if PROP_FIRM_MODE:
+                        can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol)
+                        if not can_trade:
+                            logger.info(f"🛡️ [PROP SHIELD] Pomijam powiadomienie dla {setup.symbol}: {reason}")
+                            continue
+
                     found_count += 1
                     self.notified_setups[setup_key] = time.time()
                     setup_id = f"{sym}_{setup.strategy_name}_{int(time.time())}"
@@ -231,7 +278,7 @@ class SMCScanner:
         while self.is_running:
             try:
                 now = time.time()
-                # Fast trade monitoring every 10 seconds for instant TP / SL closing alerts
+                # Fast trade monitoring every TRADE_MONITOR_INTERVAL_SECONDS for instant TP / SL closing alerts
                 await self.monitor_open_trades()
 
                 # Full market scan every SCAN_INTERVAL_SECONDS (e.g. 60s)
@@ -242,7 +289,7 @@ class SMCScanner:
             except Exception as e:
                 logger.error(f"Error in scanner loop: {e}", exc_info=True)
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(TRADE_MONITOR_INTERVAL_SECONDS)
 
     def stop(self):
         self.is_running = False
