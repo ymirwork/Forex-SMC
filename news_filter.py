@@ -85,12 +85,16 @@ class NewsFilter:
     def fetch_calendar(self, force: bool = False) -> List[Dict]:
         """Fetches high impact events with local caching (synchronous fallback)."""
         now = time.time()
-        if not force and self._cached_events and (now - self._last_fetch_time < self.CACHE_DURATION_SECONDS):
+        if self._cached_events and not force and (now - self._last_fetch_time < self.CACHE_DURATION_SECONDS):
+            return self._cached_events
+
+        # If cache exists but expired, return stale cache immediately to avoid blocking event loop
+        if self._cached_events and not force:
             return self._cached_events
 
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            with httpx.Client(timeout=4.0) as client:
+            with httpx.Client(timeout=2.0) as client:
                 res = client.get(self.API_URL, headers=headers)
                 if res.status_code == 200:
                     raw_data = res.json()

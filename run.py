@@ -32,6 +32,14 @@ async def main():
         logger.error("Failed to connect to MetaTrader 5 terminal. Exiting.")
         return
 
+    # Auto-reconcile MT5, trades.db and Notion on startup
+    try:
+        from sync_journal import sync_all
+        logger.info("Reconciling MT5, trades.db and Notion...")
+        await sync_all()
+    except Exception as e:
+        logger.warning(f"Startup trade reconciliation warning: {e}")
+
     # Shared Single-Instance Resources (TradeJournal & NewsFilter)
     shared_journal = TradeJournal()
     shared_news_filter = NewsFilter()
@@ -41,22 +49,50 @@ async def main():
     telegram_task = None
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "twoj_token_z_botfather":
-        try:
-            telegram_mgr = TelegramBotManager(
-                mt5_client=mt5_client,
-                token=TELEGRAM_BOT_TOKEN,
-                alert_channel=TELEGRAM_ALERT_CHANNEL,
-                journal=shared_journal,
-                news_filter=shared_news_filter,
-            )
+        telegram_mgr = TelegramBotManager(
+            mt5_client=mt5_client,
+            token=TELEGRAM_BOT_TOKEN,
+            alert_channel=TELEGRAM_ALERT_CHANNEL,
+            journal=shared_journal,
+            news_filter=shared_news_filter,
+        )
+
+        async def init_telegram_with_retry():
+            nonlocal telegram_task
             app = telegram_mgr.build_application()
-            await app.initialize()
-            await app.start()
-            telegram_task = asyncio.create_task(app.updater.start_polling())
-            logger.info("Telegram Bot started in background polling mode.")
-        except Exception as e:
-            logger.error(f"Failed to start Telegram Bot: {e}")
-            telegram_mgr = None
+            for attempt in range(1, 4):
+                try:
+                    logger.info(f"Connecting to Telegram Bot API (attempt {attempt}/3)...")
+                    await app.initialize()
+                    await app.start()
+                    telegram_task = asyncio.create_task(app.updater.start_polling())
+                    logger.info("Telegram Bot started in background polling mode.")
+                    return
+                except Exception as e:
+                    logger.warning(f"Telegram Bot connection attempt {attempt} failed: {e}")
+                    if attempt < 3:
+                        await asyncio.sleep(5)
+
+            logger.error("Initial Telegram connection failed (server 502/timeout).")
+            logger.info("Bot will continue scanning and retry connecting to Telegram in the background.")
+
+            async def background_reconnect_loop():
+                nonlocal telegram_task
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        logger.info("Retrying Telegram connection...")
+                        await app.initialize()
+                        await app.start()
+                        telegram_task = asyncio.create_task(app.updater.start_polling())
+                        logger.info("✅ Telegram Bot successfully reconnected!")
+                        break
+                    except Exception as e:
+                        logger.debug(f"Background Telegram reconnect attempt failed: {e}")
+
+            asyncio.create_task(background_reconnect_loop())
+
+        await init_telegram_with_retry()
     else:
         print("\n⚠️ OSTRZEŻENIE: TELEGRAM_BOT_TOKEN nie został jeszcze skonfigurowany w pliku .env")
         print("   Skaner uruchamia się w trybie konsolowym (alerty i wykresy będą zapisywane w charts/).")

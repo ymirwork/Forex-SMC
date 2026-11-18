@@ -195,6 +195,43 @@ class NotionJournal:
             comment_text = trade.get("comment") or trade.get("setup_type") or "SMC Trade"
             props[prop_name] = {"rich_text": [{"text": {"content": str(comment_text)[:1900]}}]}
 
+        # 14. Session
+        session_match = find_prop(["Session", "Sesja", "Trading Session"])
+        if session_match:
+            prop_name, p_type = session_match
+            session_val = str(trade.get("session_name") or "")
+            if session_val and p_type == "select":
+                props[prop_name] = {"select": {"name": session_val}}
+            elif session_val:
+                props[prop_name] = {"rich_text": [{"text": {"content": session_val}}]}
+
+        # 15. Setup Type
+        stype_match = find_prop(["Setup Type", "Typ Setupu", "Setup"])
+        if stype_match:
+            prop_name, p_type = stype_match
+            stype_val = str(trade.get("setup_type") or trade.get("comment") or "")[:200]
+            if stype_val:
+                if p_type == "select":
+                    props[prop_name] = {"select": {"name": stype_val[:100]}}
+                else:
+                    props[prop_name] = {"rich_text": [{"text": {"content": stype_val}}]}
+
+        # 16. MAE (R) - Maximum Adverse Excursion
+        mae_match = find_prop(["MAE (R)", "MAE", "Max Adverse Excursion"])
+        if mae_match and trade.get("mae_r"):
+            props[mae_match[0]] = {"number": round(float(trade["mae_r"]), 2)}
+
+        # 17. Exit Reason
+        exit_match = find_prop(["Exit Reason", "Powód Zamknięcia", "Exit", "Close Reason"])
+        if exit_match:
+            prop_name, p_type = exit_match
+            exit_val = str(trade.get("exit_reason") or "")
+            if exit_val:
+                if p_type == "select":
+                    props[exit_match[0]] = {"select": {"name": exit_val}}
+                else:
+                    props[exit_match[0]] = {"rich_text": [{"text": {"content": exit_val}}]}
+
         return props
 
     async def log_trade(self, trade: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -202,7 +239,7 @@ class NotionJournal:
         Creates a new trade entry page in Notion.
         Returns (success, page_id).
         """
-        if not self.enabled and not self.is_configured():
+        if not self.enabled:
             return False, None
 
         await self._fetch_schema_if_needed()
@@ -241,7 +278,7 @@ class NotionJournal:
         """
         Updates an existing trade page in Notion when TP / SL or closure is detected.
         """
-        if not self.enabled and not self.is_configured():
+        if not self.enabled:
             return False
 
         await self._fetch_schema_if_needed()
@@ -284,6 +321,19 @@ class NotionJournal:
         notes_col = find_prop(["Notes", "Comment", "Opis"])
         if notes_col and comment:
             patch_props[notes_col] = {"rich_text": [{"text": {"content": comment[:1900]}}]}
+
+        exit_col = find_prop(["Exit Reason", "Powód Zamknięcia", "Exit", "Close Reason"])
+        if exit_col:
+            exit_val = ""
+            if status.upper() == "WIN":
+                exit_val = "TP"
+            elif status.upper() == "LOSS":
+                exit_val = "SL"
+            elif status.upper() == "BE":
+                exit_val = "BE"
+            else:
+                exit_val = "MANUAL"
+            patch_props[exit_col] = {"select": {"name": exit_val}}
 
         if not patch_props:
             return False

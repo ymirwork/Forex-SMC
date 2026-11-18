@@ -82,9 +82,14 @@ async def test_all():
     else:
         try:
             import httpx
-            with httpx.Client(timeout=5.0) as http_client:
+            with httpx.Client(timeout=15.0) as http_client:
                 res = http_client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe")
-                data = res.json()
+                if res.status_code == 502:
+                    print("⚠️ Serwer Telegrama zwrocił błąd 502 Bad Gateway (chwilowa awaria po stronie serwerów Telegrama lub nieaktualny token).")
+                    print("   Wskazówka: Wygeneruj nowy token w @BotFather komendą /revoke i wklej go do .env")
+                    data = {}
+                else:
+                    data = res.json()
             if data.get("ok"):
                 bot_user = data["result"]["username"]
                 print(f"✅ Bot Telegrama zweryfikowany: @{bot_user}")
@@ -92,7 +97,7 @@ async def test_all():
                     print(f"   • Zautoryzowany Chat ID: {TELEGRAM_CHAT_ID}")
                 else:
                     print("   ⚠️ TELEGRAM_CHAT_ID nie jest ustawiony w .env (ustaw, by nikt inny nie miał dostępu).")
-            else:
+            elif res.status_code != 502:
                 print(f"❌ Błędny token Telegrama: {data.get('description')}")
         except Exception as e:
             print(f"⚠️ Nie można połączyć z API Telegrama: {e}")

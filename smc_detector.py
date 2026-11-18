@@ -8,6 +8,7 @@ from smartmoneyconcepts import smc
 from news_filter import NewsFilter
 from rr_optimizer import RROptimizer
 from session_manager import SessionManager
+from liquidity_detector import LiquidityDetector, LiquidityEvaluation
 from trade_journal import TradeJournal
 from config import (
     ADD_SPREAD_TO_SL,
@@ -127,6 +128,11 @@ class TradeSetup:
     pyramid_profit_r: float = 0.0
     spread_used: float = 0.0
     sl_mode: str = "STRUCTURE"
+    swept_levels: List[Dict] = field(default_factory=list)
+    is_multi_sweep: bool = False
+    has_htf_sweep: bool = False
+    liquidity_summary: str = ""
+
 
 
 class SMCDetector:
@@ -151,6 +157,7 @@ class SMCDetector:
         min_trades_for_optimal: int = MIN_TRADES_FOR_OPTIMAL_RR,
         journal: Optional[TradeJournal] = None,
         news_filter: Optional[NewsFilter] = None,
+        liquidity_detector: Optional[LiquidityDetector] = None,
     ):
         self.swing_length = swing_length
         self.default_rr = default_rr
@@ -160,6 +167,7 @@ class SMCDetector:
         self.min_trades_for_optimal = min_trades_for_optimal
         self.news_filter = news_filter or NewsFilter()
         self.journal = journal or TradeJournal()
+        self.liquidity_detector = liquidity_detector or LiquidityDetector()
 
     def get_effective_rr(self) -> Tuple[float, bool, str]:
         """Determines target RR dynamically using shared RROptimizer logic."""
@@ -258,6 +266,9 @@ class SMCDetector:
         df_ltf: pd.DataFrame,
         df_htf: Optional[pd.DataFrame] = None,
         spread: float = 0.0,
+        df_d1: Optional[pd.DataFrame] = None,
+        df_w1: Optional[pd.DataFrame] = None,
+        df_h1: Optional[pd.DataFrame] = None,
     ) -> List[TradeSetup]:
         setups: List[TradeSetup] = []
         if df_ltf is None or len(df_ltf) < 60:
@@ -320,6 +331,9 @@ class SMCDetector:
                     point_scale=point_scale,
                     buffer=buffer,
                     spread=spread,
+                    df_d1=df_d1,
+                    df_w1=df_w1,
+                    df_h1=df_h1,
                 )
                 if setup:
                     setups.append(setup)
@@ -347,6 +361,9 @@ class SMCDetector:
         point_scale: float,
         buffer: float,
         spread: float = 0.0,
+        df_d1: Optional[pd.DataFrame] = None,
+        df_w1: Optional[pd.DataFrame] = None,
+        df_h1: Optional[pd.DataFrame] = None,
     ) -> Optional[TradeSetup]:
         is_buy = direction == "BUY"
         expected_htf = "BULLISH" if is_buy else "BEARISH"
@@ -474,21 +491,31 @@ class SMCDetector:
             detail=f"{ob_detail} (+{w4}%)"
         ))
 
-        # 5. Session Liquidity Sweep (15%)
-        has_sweep, sweep_msg = SessionManager.check_asian_sweep(df_ltf, direction)
-        w5 = 15 if has_sweep else 0
-        total_score += w5
+        # 5. Advanced Liquidity Sweep (15% base + 5% bonus for Multi-Sweep / HTF)
+        liq_eval = self.liquidity_detector.evaluate_sweeps(
+            df_ltf=df_ltf,
+            direction=direction,
+            df_d1=df_d1,
+            df_w1=df_w1,
+            df_h1=df_h1,
+        )
+        has_sweep = liq_eval.has_sweep
+        w5 = liq_eval.confluence_weight
+        bonus = liq_eval.bonus_weight
+        total_score += (w5 + bonus)
+        total_score = min(100, total_score)
         breakdown.append(ConfluenceItem(
             factor="Wybicie płynności (Sweep)",
             weight=15,
             achieved=has_sweep,
-            detail=f"{sweep_msg} (+{w5}%)"
+            detail=f"{liq_eval.summary_msg} (+{w5 + bonus}%)"
         ))
 
         # 6. Candlestick Wick Rejection (10%)
         has_rejection, wick_msg = self._check_candle_rejection(current_candle, direction)
         w6 = 10 if has_rejection else 0
         total_score += w6
+        total_score = min(100, total_score)
         breakdown.append(ConfluenceItem(
             factor="Odrzucenie świecowe (Knot)",
             weight=10,
@@ -514,7 +541,7 @@ class SMCDetector:
             htf_trend=htf_trend,
             zone_top=round(zone_top, digits),
             zone_bottom=round(zone_bottom, digits),
-            reason=f"M15 CHoCH + Fibo OTE ({total_score}% Confluence [{grade}]). {sweep_msg}.",
+            reason=f"M15 CHoCH + Fibo OTE ({total_score}% Confluence [{grade}]). {liq_eval.summary_msg}.",
             timestamp=current_time,
             fibo_50=round(fibo_50, digits),
             fibo_618=round(fibo_618, digits),
@@ -532,4 +559,17 @@ class SMCDetector:
             rr_source_info=rr_source,
             spread_used=spread_buffer,
             sl_mode=applied_sl_mode,
+            swept_levels=[
+                {
+                    "name": s.name,
+                    "price": round(s.price, digits),
+                    "level_type": s.level_type,
+                    "bars_ago": s.bars_ago,
+                    "description": s.description,
+                }
+                for s in liq_eval.swept_levels
+            ],
+            is_multi_sweep=liq_eval.is_multi_sweep,
+            has_htf_sweep=liq_eval.has_htf_sweep,
+            liquidity_summary=liq_eval.summary_msg,
         )

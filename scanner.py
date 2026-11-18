@@ -11,10 +11,13 @@ from config import (
     AUTO_BE_AT_1R,
     AUTO_BE_OFFSET_PIPS,
     BLOCK_ON_HIGH_IMPACT_NEWS,
+    DYNAMIC_FILTER_MODE,
+    ENABLE_DYNAMIC_EDGE_FILTER,
     ENABLE_PYRAMIDING,
     ENABLE_SMC_STRATEGY,
     ENABLE_ZUMIKO_STRATEGY,
     HTF_TIMEFRAME,
+    INSIGHTS_MIN_SAMPLE_SIZE,
     LOOKBACK_BARS,
     LTF_TIMEFRAME,
     MAX_PYRAMID_LEVEL,
@@ -42,6 +45,7 @@ from notion_journal import NotionJournal
 from smc_detector import SMCDetector, TradeSetup
 from trade_journal import TradeJournal
 from zumiko_detector import ZumikoDetector
+from trade_insights import TradeInsightEngine
 
 logger = logging.getLogger("ForexSMC.Scanner")
 
@@ -85,8 +89,10 @@ class SMCScanner:
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
         self.notion = NotionJournal()
+        self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
+        self._cleanup_old_charts(max_days=3)
 
-    def _cleanup_old_charts(self, max_days: int = 7):
+    def _cleanup_old_charts(self, max_days: int = 3):
         """Removes generated chart PNGs older than max_days to prevent disk accumulation."""
         charts_dir = getattr(self.chart_gen, "output_dir", "charts")
         if not os.path.exists(charts_dir):
@@ -209,6 +215,10 @@ class SMCScanner:
 
                 comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD | Max R: {max_r:.2f}R"
                 self.journal.close_trade_by_ticket(ticket, realized_r, max_r=max_r, status=status, comment=comment_str)
+
+                # Record close-time telemetry
+                exit_r = "TP" if status == "WIN" else ("SL" if status == "LOSS" else "BE")
+                self.journal.update_trade_close_telemetry(ticket, exit_reason=exit_r, mae_r=0.0)
 
                 # Update trade result in Notion database
                 if self.notion.enabled:
@@ -365,10 +375,12 @@ class SMCScanner:
                 )
 
             try:
-                # Fetch multi-timeframe candles using configured LTF and HTF
+                # Fetch multi-timeframe candles using configured LTF, HTF, Daily, and Weekly
                 df_ltf = self.mt5_client.fetch_ohlcv(sym, LTF_TIMEFRAME, LOOKBACK_BARS)
                 df_h1 = self.mt5_client.fetch_ohlcv(sym, "H1", LOOKBACK_BARS)
                 df_htf = self.mt5_client.fetch_ohlcv(sym, HTF_TIMEFRAME, LOOKBACK_BARS)
+                df_d1 = self.mt5_client.fetch_ohlcv(sym, "D1", 10)
+                df_w1 = self.mt5_client.fetch_ohlcv(sym, "W1", 5)
 
                 if df_ltf is None or df_htf is None:
                     continue
@@ -380,7 +392,15 @@ class SMCScanner:
                 spread_val = self.mt5_client.get_symbol_spread(sym) if ADD_SPREAD_TO_SL else 0.0
 
                 if ENABLE_SMC_STRATEGY:
-                    smc_setups = self.smc_detector.scan_for_setups(sym, df_ltf, df_htf, spread=spread_val)
+                    smc_setups = self.smc_detector.scan_for_setups(
+                        sym,
+                        df_ltf,
+                        df_htf,
+                        spread=spread_val,
+                        df_d1=df_d1,
+                        df_w1=df_w1,
+                        df_h1=df_h1,
+                    )
 
                 if ENABLE_ZUMIKO_STRATEGY:
                     zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_ltf, df_h1, df_htf, spread=spread_val)
@@ -466,6 +486,24 @@ class SMCScanner:
                         if not can_trade:
                             logger.info(f"🛡️ [PROP SHIELD] Pomijam powiadomienie dla {setup.symbol}: {reason}")
                             continue
+
+                    # Dynamic Edge Filter: Check if this setup is historically weak
+                    if self.insight_engine:
+                        edge_eval = self.insight_engine.evaluate_setup(
+                            symbol=setup.symbol,
+                            session_name=getattr(setup, "session_name", ""),
+                            strategy=getattr(setup, "strategy_name", "SMC"),
+                            confluence_score=setup.confluence_score,
+                            filter_mode=DYNAMIC_FILTER_MODE,
+                        )
+                        if edge_eval.is_flagged:
+                            setup._edge_warnings = edge_eval.warnings
+                            setup._risk_multiplier = edge_eval.risk_multiplier
+                            if edge_eval.risk_multiplier <= 0.0:
+                                logger.info(f"🛑 [EDGE FILTER STRICT] Zablokowano {setup.symbol} {setup.direction}: {edge_eval.summary}")
+                                continue
+                            else:
+                                logger.info(f"⚠️ [EDGE FILTER] {setup.symbol}: {edge_eval.summary}")
 
                     found_count += 1
                     self.notified_setups[setup_key] = time.time()

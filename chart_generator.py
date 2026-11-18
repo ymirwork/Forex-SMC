@@ -115,6 +115,23 @@ class ChartGenerator:
                 ax.axhline(setup.choch_level, color="#ec4899", linestyle="--", linewidth=1.2, alpha=0.8)
                 ax.text(2, setup.choch_level, f" M15 CHoCH Level ({setup.choch_level})", color="#ec4899", va="bottom", fontsize=8, fontweight="bold")
 
+            # Draw Swept Liquidity lines if present (PDL, PDH, Asian H/L, EQH/EQL, PWL/PWH)
+            swept_levels = getattr(setup, "swept_levels", [])
+            if swept_levels:
+                for s_lvl in swept_levels[:2]:  # plot up to 2 key swept levels to avoid clutter
+                    lvl_price = s_lvl.get("price", 0.0)
+                    lvl_name = s_lvl.get("name", "SWEEP")
+                    if lvl_price > 0:
+                        ax.axhline(lvl_price, color="#eab308", linestyle="-.", linewidth=1.3, alpha=0.85)
+                        ax.text(
+                            2, lvl_price,
+                            f" ⚡ SWEPT {lvl_name} ({lvl_price})",
+                            color="#eab308",
+                            va="bottom" if setup.direction == "BUY" else "top",
+                            fontsize=8,
+                            fontweight="bold"
+                        )
+
             # Draw Zumiko EMAs (EMA 10, EMA 21, EMA 238)
             if getattr(setup, "ema_238", 0.0) > 0 or getattr(setup, "strategy_name", "") in ("ZUMIKO", "GOLDEN_COMBO"):
                 e10_full = df["close"].ewm(span=10, adjust=False).mean()
@@ -153,13 +170,23 @@ class ChartGenerator:
             ax.tick_params(colors="#b2b5be", labelsize=9)
             ax.grid(color="#2a2e39", linestyle=":", linewidth=0.5, alpha=0.7)
 
+            chart_low = plot_df["low"].min()
+            chart_high = plot_df["high"].max()
+            chart_range = max(chart_high - chart_low, 0.0001)
+
             # Limits
             all_y = [
-                plot_df["low"].min(), plot_df["high"].max(),
+                chart_low, chart_high,
                 setup.sl_price, setup.tp1_price, setup.entry_price
             ]
             if setup.fibo_786 > 0:
                 all_y.extend([setup.fibo_618, setup.fibo_786])
+            for s_lvl in getattr(setup, "swept_levels", []):
+                p = s_lvl.get("price", 0.0)
+                if p > 0:
+                    # Clamp to visible action window so distant HTF levels don't squash candles
+                    if (chart_low - chart_range * 0.5) <= p <= (chart_high + chart_range * 0.5):
+                        all_y.append(p)
             y_min = min(all_y)
             y_max = max(all_y)
             y_margin = (y_max - y_min) * 0.08

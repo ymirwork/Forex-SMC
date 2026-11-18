@@ -47,6 +47,7 @@ wheels/
 bot.log
 *.sqlite
 *.sqlite3
+*.db
 trades.db
 
 # ==========================================

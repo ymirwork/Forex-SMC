@@ -18,12 +18,13 @@ class TradeJournal:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_db(self):
         with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,21 +41,38 @@ class TradeJournal:
                     chart_path TEXT,
                     mt5_ticket INTEGER,
                     comment TEXT,
-                    notion_page_id TEXT
+                    notion_page_id TEXT,
+                    parent_ticket INTEGER,
+                    is_pyramid INTEGER DEFAULT 0,
+                    strategy TEXT DEFAULT 'SMC',
+                    session_name TEXT DEFAULT '',
+                    is_killzone INTEGER DEFAULT 0,
+                    setup_type TEXT DEFAULT '',
+                    confluences_json TEXT DEFAULT '{}',
+                    mae_r REAL DEFAULT 0.0,
+                    closed_at TEXT DEFAULT '',
+                    exit_reason TEXT DEFAULT ''
                 )
             """)
-            try:
-                conn.execute("ALTER TABLE trades ADD COLUMN notion_page_id TEXT")
-            except sqlite3.OperationalError:
-                pass  # column already exists
-            try:
-                conn.execute("ALTER TABLE trades ADD COLUMN parent_ticket INTEGER")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE trades ADD COLUMN is_pyramid INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticket ON trades(mt5_ticket);")
+            for col, col_def in [
+                ("notion_page_id", "TEXT"),
+                ("parent_ticket", "INTEGER"),
+                ("is_pyramid", "INTEGER DEFAULT 0"),
+                ("strategy", "TEXT DEFAULT 'SMC'"),
+                ("session_name", "TEXT DEFAULT ''"),
+                ("is_killzone", "INTEGER DEFAULT 0"),
+                ("setup_type", "TEXT DEFAULT ''"),
+                ("confluences_json", "TEXT DEFAULT '{}'"),
+                ("mae_r", "REAL DEFAULT 0.0"),
+                ("closed_at", "TEXT DEFAULT ''"),
+                ("exit_reason", "TEXT DEFAULT ''"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_def}")
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     def add_trade(
@@ -73,6 +91,13 @@ class TradeJournal:
         comment: str = "",
         parent_ticket: Optional[int] = None,
         is_pyramid: int = 0,
+        strategy: str = "SMC",
+        session_name: str = "",
+        is_killzone: int = 0,
+        setup_type: str = "",
+        confluences_json: str = "{}",
+        mae_r: float = 0.0,
+        exit_reason: str = "",
     ) -> int:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with self._get_connection() as conn:
@@ -81,12 +106,14 @@ class TradeJournal:
                 INSERT INTO trades (
                     timestamp, symbol, direction, entry_price, sl_price, tp_price,
                     realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
-                    parent_ticket, is_pyramid
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    parent_ticket, is_pyramid,
+                    strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, symbol.upper(), direction.upper(), entry_price, sl_price, tp_price,
                 realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
-                parent_ticket, is_pyramid
+                parent_ticket, is_pyramid,
+                strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason
             ))
             conn.commit()
             return cur.lastrowid
@@ -164,6 +191,23 @@ class TradeJournal:
         with self._get_connection() as conn:
             conn.execute("UPDATE trades SET max_r = ? WHERE mt5_ticket = ?", (max_r, mt5_ticket))
             conn.commit()
+
+    def update_trade_close_telemetry(self, mt5_ticket: int, exit_reason: str = "", mae_r: float = 0.0):
+        """Updates close-time telemetry fields for a trade."""
+        closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE trades SET exit_reason = ?, mae_r = ?, closed_at = ? WHERE mt5_ticket = ? AND status != 'OPEN'",
+                (exit_reason, mae_r, closed_at, mt5_ticket),
+            )
+            conn.commit()
+
+    def get_closed_trades(self) -> List[Dict]:
+        """Returns all closed trades (WIN, LOSS, BE, CLOSED) for analytics."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM trades WHERE status IN ('CLOSED', 'WIN', 'LOSS', 'BE') ORDER BY id ASC")
+            return [dict(row) for row in cur.fetchall()]
 
     def get_all_trades(self) -> List[Dict]:
         with self._get_connection() as conn:

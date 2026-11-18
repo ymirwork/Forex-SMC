@@ -39,6 +39,8 @@ class MT5Client:
         "H1": mt5.TIMEFRAME_H1,
         "H4": mt5.TIMEFRAME_H4,
         "D1": mt5.TIMEFRAME_D1,
+        "W1": mt5.TIMEFRAME_W1,
+        "MN1": mt5.TIMEFRAME_MN1,
     }
 
     def __init__(
@@ -683,6 +685,13 @@ class MT5Client:
 
         pip_size = self.get_pip_size(p.symbol)
         offset_distance = offset_pips * pip_size
+
+        # Clamp offset so it never exceeds 20% of initial risk distance on tight stops
+        orig_sl = self.get_initial_sl(ticket)
+        if orig_sl > 0 and p.price_open > 0:
+            initial_dist = abs(p.price_open - orig_sl)
+            offset_distance = min(offset_distance, initial_dist * 0.20)
+
         is_buy = p.type == mt5.ORDER_TYPE_BUY
 
         # Calculate BE with profit offset to cover costs
@@ -697,8 +706,9 @@ class MT5Client:
             if be_price <= p.price_current:
                 be_price = round(p.price_open, sym_info.digits)
 
-        # Minimum distance from market check (stops_level)
-        min_stop_points = sym_info.stops_level if sym_info.stops_level > 0 else 5
+        # Minimum distance from market check (trade_stops_level)
+        stops_level = getattr(sym_info, "trade_stops_level", 0) or getattr(sym_info, "stops_level", 0)
+        min_stop_points = stops_level if stops_level > 0 else 5
         min_dist = (min_stop_points + 2) * sym_info.point
         if is_buy and (p.price_current - be_price) < min_dist:
             be_price = round(p.price_open, sym_info.digits)

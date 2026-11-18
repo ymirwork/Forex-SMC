@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone
 import pandas as pd
 
@@ -61,6 +62,52 @@ class TestBreakEvenLogic(unittest.TestCase):
         # Zero SL must NEVER be treated as Break-Even
         self.assertFalse(MT5Client.is_position_at_be(entry, 0.0, is_buy=False, initial_sl_dist=dist))
         self.assertFalse(MT5Client.is_position_at_be(entry, -1.0, is_buy=False, initial_sl_dist=dist))
+
+    @patch("mt5_client.mt5")
+    def test_symbol_info_stops_level_attribute_safety(self, mock_mt5):
+        # Position mock
+        mock_pos = MagicMock()
+        mock_pos.ticket = 12345
+        mock_pos.symbol = "EURUSD"
+        mock_pos.type = 0  # BUY
+        mock_pos.price_open = 1.0800
+        mock_pos.price_current = 1.0830
+        mock_pos.tp = 1.0900
+        mock_mt5.positions_get.return_value = [mock_pos]
+
+        # SymbolInfo with modern MT5 trade_stops_level
+        mock_sym = MagicMock()
+        mock_sym.digits = 5
+        mock_sym.point = 0.00001
+        mock_sym.trade_stops_level = 10
+        mock_sym.stops_level = 0
+        mock_mt5.symbol_info.return_value = mock_sym
+
+        mock_send_res = MagicMock()
+        mock_send_res.retcode = 10009  # TRADE_RETCODE_DONE
+        mock_mt5.order_send.return_value = mock_send_res
+        mock_mt5.TRADE_RETCODE_DONE = 10009
+        mock_mt5.ORDER_TYPE_BUY = 0
+
+        client = MT5Client()
+        client.is_connected = True
+        client.get_initial_sl = MagicMock(return_value=1.0700)
+
+        ok, msg = client.move_sl_to_breakeven(12345, offset_pips=1.0)
+        self.assertTrue(ok)
+        self.assertIn("przestawiony na Break-Even", msg)
+
+        # Verify call to order_send with trade_stops_level safety
+        req = mock_mt5.order_send.call_args[0][0]
+        self.assertEqual(req["symbol"], "EURUSD")
+        self.assertGreaterEqual(req["sl"], 1.0800)
+
+        # Fallback when trade_stops_level attribute does not exist (legacy)
+        del mock_sym.trade_stops_level
+        mock_sym.stops_level = 15
+        ok2, msg2 = client.move_sl_to_breakeven(12345, offset_pips=1.0)
+        self.assertTrue(ok2)
+
 
 
 class TestRROptimizer(unittest.TestCase):

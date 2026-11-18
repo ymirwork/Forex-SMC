@@ -98,8 +98,8 @@ TIGHT_SL_MODE = os.getenv("TIGHT_SL_MODE", "True").lower() in ("true", "1")
 MAX_RISK_DEVIATION_TOLERANCE = float(os.getenv("MAX_RISK_DEVIATION_TOLERANCE", "1.35"))
 # Automatyczne przestawianie na Break-Even po osiągnięciu zysku +1.0R
 AUTO_BE_AT_1R = os.getenv("AUTO_BE_AT_1R", "True").lower() in ("true", "1")
-# Dodatkowy bufor w pipsach dodawany do Break-Even w stronę zysku (np. +5 pips), aby pokryć prowizje brokera i spread
-AUTO_BE_OFFSET_PIPS = float(os.getenv("AUTO_BE_OFFSET_PIPS", "5.0"))
+# Dodatkowy bufor w pipsach dodawany do Break-Even w stronę zysku (np. +1.0 pips), aby pokryć prowizje brokera i spread
+AUTO_BE_OFFSET_PIPS = float(os.getenv("AUTO_BE_OFFSET_PIPS", "1.0"))
 # Uwzględnianie spreadu brokera przy kalkulacji Stop Lossa (oddalenie SL o spread)
 ADD_SPREAD_TO_SL = os.getenv("ADD_SPREAD_TO_SL", "True").lower() in ("true", "1")
 # Domyślny spread w pipsach, jeśli MT5 nie zwróci danych
@@ -134,6 +134,31 @@ ENABLE_PYRAMIDING = os.getenv("ENABLE_PYRAMIDING", "True").lower() in ("true", "
 MAX_PYRAMID_LEVEL = int(os.getenv("MAX_PYRAMID_LEVEL", "2"))               # Max 2 concurrent positions per symbol (Base + 1 scale-in)
 PYRAMID_MIN_PROFIT_R = float(os.getenv("PYRAMID_MIN_PROFIT_R", "1.0"))     # Base position must have reached at least +1.0R
 PYRAMID_LOCK_PREVIOUS_PROFIT = os.getenv("PYRAMID_LOCK_PREVIOUS_PROFIT", "True").lower() in ("true", "1") # Lock profit on parent trade
+
+# ==========================================
+# ADVANCED INSTITUTIONAL LIQUIDITY SWEEPS
+# ==========================================
+ENABLE_LIQUIDITY_DETECTOR = os.getenv("ENABLE_LIQUIDITY_DETECTOR", "True").lower() in ("true", "1")
+ENABLE_PDH_PDL_SWEEP = os.getenv("ENABLE_PDH_PDL_SWEEP", "True").lower() in ("true", "1")
+ENABLE_PWH_PWL_SWEEP = os.getenv("ENABLE_PWH_PWL_SWEEP", "True").lower() in ("true", "1")
+ENABLE_EQH_EQL_SWEEP = os.getenv("ENABLE_EQH_EQL_SWEEP", "True").lower() in ("true", "1")
+ENABLE_ASIAN_SWEEP = os.getenv("ENABLE_ASIAN_SWEEP", "True").lower() in ("true", "1")
+LIQUIDITY_SWEEP_LOOKBACK_BARS = int(os.getenv("LIQUIDITY_SWEEP_LOOKBACK_BARS", "15"))
+EQH_EQL_ATR_MULT = float(os.getenv("EQH_EQL_ATR_MULT", "0.15"))
+EQH_EQL_MIN_BARS_DISTANCE = int(os.getenv("EQH_EQL_MIN_BARS_DISTANCE", "5"))
+
+# ==========================================
+# DYNAMIC TRADE INSIGHTS & EDGE FILTER
+# ==========================================
+ENABLE_DYNAMIC_EDGE_FILTER = os.getenv("ENABLE_DYNAMIC_EDGE_FILTER", "True").lower() in ("true", "1")
+# "ADVISORY" = warning badge + 50% risk reduction; "STRICT" = block signal entirely
+DYNAMIC_FILTER_MODE = os.getenv("DYNAMIC_FILTER_MODE", "ADVISORY").upper()
+# Minimum number of trades in a category before the engine issues a warning or restriction
+INSIGHTS_MIN_SAMPLE_SIZE = int(os.getenv("INSIGHTS_MIN_SAMPLE_SIZE", "10"))
+# Automatically send weekend insights report (Sunday before market open)
+SEND_WEEKEND_INSIGHTS_REPORT = os.getenv("SEND_WEEKEND_INSIGHTS_REPORT", "True").lower() in ("true", "1")
+
+
 
 
 

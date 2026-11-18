@@ -100,36 +100,3 @@ class SessionManager:
 
         return None, None
 
-    @classmethod
-    def check_asian_sweep(
-        cls,
-        df: pd.DataFrame,
-        direction: str,
-    ) -> Tuple[bool, str]:
-        """
-        Detects if today's London/NY price action swept the Asian session liquidity pool.
-        For BUY: price dipped below Asian Low and closed back above.
-        For SELL: price spiked above Asian High and closed back below.
-        """
-        asia_high, asia_low = cls.calculate_asian_range(df)
-        if asia_high is None or asia_low is None:
-            return False, "Brak danych sesji azjatyckiej"
-
-        recent_bars = df.tail(20)
-        current_price = df["close"].iloc[-1]
-
-        if direction.upper() == "BUY":
-            min_recent_low = recent_bars["low"].min()
-            # If price dipped below Asian low and is now back above it
-            if min_recent_low < asia_low and current_price >= asia_low:
-                return True, f"Asian Low Swept ({asia_low:.2f} wybite i odrzucone)"
-            return False, f"Brak sweepu Asian Low ({asia_low:.2f})"
-
-        elif direction.upper() == "SELL":
-            max_recent_high = recent_bars["high"].max()
-            # If price spiked above Asian high and is now back below it
-            if max_recent_high > asia_high and current_price <= asia_high:
-                return True, f"Asian High Swept ({asia_high:.2f} wybite i odrzucone)"
-            return False, f"Brak sweepu Asian High ({asia_high:.2f})"
-
-        return False, "Nieokreślony"

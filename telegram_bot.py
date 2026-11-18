@@ -11,12 +11,16 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
 
 from config import (
     ALLOWED_CHAT_IDS,
     DEFAULT_RISK_PERCENT,
     DISMISS_MUTE_HOURS,
+    DYNAMIC_FILTER_MODE,
+    ENABLE_DYNAMIC_EDGE_FILTER,
     ENABLE_NOTION,
+    INSIGHTS_MIN_SAMPLE_SIZE,
     PROP_FIRM_MODE,
     PROP_INITIAL_BALANCE,
     PROP_MAX_DRAWDOWN_PERCENT,
@@ -33,6 +37,7 @@ from notion_journal import NotionJournal
 from rr_optimizer import RROptimizer
 from smc_detector import TradeSetup
 from trade_journal import TradeJournal
+from trade_insights import TradeInsightEngine
 
 logger = logging.getLogger("ForexSMC.TelegramBot")
 
@@ -61,6 +66,7 @@ class TelegramBotManager:
         self.journal = journal or TradeJournal()
         self.notion = NotionJournal()
         self.news_filter = news_filter or NewsFilter()
+        self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
         self.muted_symbols: Dict[Tuple[str, str], float] = {}
 
     def mute_symbol(self, symbol: str, direction: str, hours: float = DISMISS_MUTE_HOURS):
@@ -94,19 +100,35 @@ class TelegramBotManager:
     def _is_authorized(self, update: Update) -> bool:
         """Enforces security whitelist: strictly authorizes personal user ID for trades/callbacks."""
         if not self.allowed_chat_ids:
-            return True
+            logger.warning("Rejecting Telegram action: TELEGRAM_CHAT_ID is not configured in whitelist.")
+            return False
         user_id = update.effective_user.id if update.effective_user else 0
         chat_id = update.effective_chat.id if update.effective_chat else 0
 
-        # For action callbacks (executing trades, BE, dismiss), strictly require positive user ID in whitelist
+        # Check if any personal positive user IDs are explicitly listed in whitelist
+        positive_user_ids = [uid for uid in self.allowed_chat_ids if uid > 0]
+
+        # For action callbacks (executing trades, BE, dismiss)
         if update.callback_query:
-            return user_id > 0 and user_id in self.allowed_chat_ids
+            if positive_user_ids:
+                if user_id in positive_user_ids:
+                    return True
+                logger.warning(
+                    f"Rejecting callback from user_id={user_id} (allowed user IDs: {positive_user_ids})"
+                )
+                return False
+            # If only negative channel/group IDs are configured in .env, allow actions from that channel
+            if chat_id in self.allowed_chat_ids:
+                return True
+            logger.warning(
+                f"Rejecting callback from user_id={user_id} in chat_id={chat_id} (allowed: {self.allowed_chat_ids})"
+            )
+            return False
 
         # For commands and messages: check user ID or whitelisted chat ID
-        return (
-            (user_id > 0 and user_id in self.allowed_chat_ids)
-            or (chat_id > 0 and chat_id in self.allowed_chat_ids)
-        )
+        if positive_user_ids:
+            return (user_id in positive_user_ids) or (chat_id in self.allowed_chat_ids)
+        return (user_id in self.allowed_chat_ids) or (chat_id in self.allowed_chat_ids)
 
     @staticmethod
     async def _safe_edit_message(query, text: str, parse_mode: str = "Markdown"):
@@ -123,7 +145,14 @@ class TelegramBotManager:
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
-            await update.message.reply_text("⛔ Brak uprawnień do korzystania z tego bota.")
+            user_id = update.effective_user.id if update.effective_user else 0
+            await update.message.reply_text(
+                f"⛔ **Brak uprawnień do korzystania z tego bota.**\n\n"
+                f"👤 Twoje prywatne User ID: `{user_id}`\n\n"
+                f"Aby autoryzować swoje konto, dopisz to ID do `TELEGRAM_CHAT_ID` w pliku `.env`:\n"
+                f"`TELEGRAM_CHAT_ID=-1004455323838,{user_id}`",
+                parse_mode="Markdown",
+            )
             return
 
         acc = self.mt5_client.get_account_info()
@@ -143,7 +172,8 @@ class TelegramBotManager:
             "• `/journal` - Dziennik zagrań i dotychczasowe statystyki R\n"
             "• `/notionsync` - Synchronizacja dziennika z Notion Database\n"
             "• `/optimizer` - Optymalizator BEST RR (szukanie idealnego Take Profit)\n"
-            "• `/addtrade` - Ręczne dodanie zagrania do dziennika"
+            "• `/addtrade` - Ręczne dodanie zagrania do dziennika\n"
+            "• `/insights` - Analiza słabych stron i mocnych zagra ń (Edge Report)\n"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -293,14 +323,14 @@ class TelegramBotManager:
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def notionsync_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Syncs all historical or unsynced trades from trades.db to Notion."""
+        """Syncs all historical or unsynced trades between MT5, trades.db, and Notion."""
         if not self._is_authorized(update):
             return
 
         if not self.notion.is_configured():
             help_msg = (
                 "📓 **INTEGRACJA NOTION (TRADE JOURNAL)**\n\n"
-                "System obsługuje automatyczne zapisywanie każdego tradu w Notion (wzorowane na ChatGPT Assistant)!\n\n"
+                "System obsługuje automatyczne zapisywanie każdego tradu w Notion!\n\n"
                 "**Aby połączyć Notion w 2 minuty:**\n"
                 "1. Wejdź na: [notion.so/profile/integrations](https://www.notion.so/profile/integrations)\n"
                 "2. Kliknij **'New integration'**, nazwij np. `Forex-SMC` i kliknij **Save**.\n"
@@ -315,29 +345,17 @@ class TelegramBotManager:
             await update.message.reply_text(help_msg, parse_mode="Markdown")
             return
 
-        await update.message.reply_text("🔄 Weryfikuję połączenie z bazą Notion...")
-        ok, msg = await self.notion.verify_connection()
-        if not ok:
-            await update.message.reply_text(f"❌ {msg}\n\nUpewnij się, że dodałeś połączenie (Connection) do swojej bazy w Notion!")
-            return
-
-        await update.message.reply_text(f"✅ {msg}\nRozpoczynam wysyłanie transakcji...")
-
-        trades = self.journal.get_all_trades()
-        synced_count = 0
-        for t in trades:
-            if not t.get("notion_page_id"):
-                success, page_id = await self.notion.log_trade(t)
-                if success and page_id:
-                    self.journal.set_notion_page_id_by_ticket(t.get("mt5_ticket") or t.get("id"), page_id)
-                    synced_count += 1
-                await asyncio.sleep(0.3)  # Respect Notion API rate limits
-
-        await update.message.reply_text(
-            f"🎉 **Synchronizacja zakończona!**\n"
-            f"Wysłano `{synced_count}` nowych transakcji do Notion.\n"
-            f"Wszystkie kolejne zagrania będą zapisywać się w Notion automatycznie!"
-        )
+        await update.message.reply_text("🔄 Rozpoczynam pełną synchronizację (MT5 <--> trades.db <--> Notion)...")
+        try:
+            from sync_journal import sync_all
+            await sync_all()
+            await update.message.reply_text(
+                "🎉 **Pełna synchronizacja zakończona sukcesem!**\n\n"
+                "✅ Wszystkie transakcje z terminala MT5, bazy lokalnej trades.db oraz Notion są teraz w 100% zgodne.\n"
+                "Wpisz `/status` lub `/journal`, aby sprawdzić aktualne podsumowanie."
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Błąd podczas synchronizacji: {e}")
 
     async def optimizer_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -412,6 +430,33 @@ class TelegramBotManager:
         except Exception as e:
             await update.message.reply_text(f"❌ Błąd zapisu: {e}")
 
+    async def insights_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Generates and sends trade insights report analyzing weak setups."""
+        if not self._is_authorized(update):
+            return
+
+        if not self.insight_engine:
+            await update.message.reply_text("ℹ️ Silnik analityczny jest wyłączony. Ustaw `ENABLE_DYNAMIC_EDGE_FILTER=True` w `.env`.")
+            return
+
+        await update.message.reply_text("🔍 Analizuję historię transakcji...")
+        report = self.insight_engine.generate_insights_report()
+
+        # Split long reports for Telegram's 4096 char limit
+        if len(report) <= 4096:
+            await update.message.reply_text(report, parse_mode="Markdown")
+        else:
+            parts = report.split("\n\n")
+            chunk = ""
+            for part in parts:
+                if len(chunk) + len(part) + 2 > 4000:
+                    await update.message.reply_text(chunk, parse_mode="Markdown")
+                    chunk = part
+                else:
+                    chunk = chunk + "\n\n" + part if chunk else part
+            if chunk:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+
     async def be_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Moves Stop Loss of open position to Break-Even."""
         if not self._is_authorized(update):
@@ -448,11 +493,16 @@ class TelegramBotManager:
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
 
         if not self._is_authorized(update):
-            await self._safe_edit_message(query, "⛔ Brak uprawnień do wykonania tego zlecenia.")
+            user_id = update.effective_user.id if update.effective_user else 0
+            await query.answer(
+                text=f"⛔ Brak uprawnień do wykonania tego zlecenia!\nTwoje User ID to: {user_id}.\nDopisz je do TELEGRAM_CHAT_ID w pliku .env",
+                show_alert=True,
+            )
             return
+
+        await query.answer()
 
         data = query.data or ""
         parts = data.split(":")
@@ -523,6 +573,10 @@ class TelegramBotManager:
                     return
 
         risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
+        # Edge filter risk reduction
+        if hasattr(setup, "_risk_multiplier") and setup._risk_multiplier < 1.0 and setup._risk_multiplier > 0:
+            risk_pct = risk_pct * setup._risk_multiplier
+            logger.info(f"Edge filter reduced risk to {risk_pct:.2f}% for {setup.symbol}")
         lot = self.mt5_client.calculate_lot_size(setup.symbol, risk_pct, setup.sl_price, setup.entry_price)
 
         is_pyr = 1 if getattr(setup, "is_pyramid", False) else 0
@@ -732,20 +786,42 @@ class TelegramBotManager:
         if getattr(setup, "ema_238", 0.0) > 0:
             zumiko_text = f"📈 **Zumiko:** EMA 10/21: `{setup.ema_fast:.{digits}f}/{setup.ema_slow:.{digits}f}` | 🌟 EMA 238: `{setup.ema_238:.{digits}f}` | {setup.swing_pattern}\n"
 
+        # Swept Liquidity highlight line
+        liq_line = ""
+        swept_levels = getattr(setup, "swept_levels", [])
+        if swept_levels:
+            swept_names = [f"**{s.get('name')}** (`{s.get('price'):.{digits}f}`)" for s in swept_levels]
+            multi_tag = " 🌟 [MULTI-SWEEP]" if getattr(setup, "is_multi_sweep", False) else ""
+            liq_line = f"⚡ **Wymieciona płynność:** {', '.join(swept_names)}{multi_tag}\n"
+        elif getattr(setup, "liquidity_summary", ""):
+            liq_line = f"⚡ **Płynność:** {setup.liquidity_summary}\n"
+
         sl_mode_txt = f"[{setup.sl_mode}] " if getattr(setup, "sl_mode", "") else ""
         spread_info = f" [w tym spread: +{setup.spread_used / point_scale:.1f}p]" if getattr(setup, "spread_used", 0.0) > 0 else ""
+
+        # Edge Filter Warning Badge
+        edge_warning_text = ""
+        if hasattr(setup, "_edge_warnings") and setup._edge_warnings:
+            edge_warning_text = "\n⚠️ **OSTRZEŻENIE EDGE FILTRA:**\n"
+            for w in setup._edge_warnings[:3]:
+                edge_warning_text += f"{w}\n"
+            if hasattr(setup, "_risk_multiplier") and setup._risk_multiplier < 1.0:
+                edge_warning_text += f"📉 _Ryzyko automatycznie zredukowane o {int((1-setup._risk_multiplier)*100)}%_\n"
+            edge_warning_text += "\n"
 
         caption = (
             f"{header_title}\n"
             f"🎯 **Ocena:** `{setup.confluence_score}%` {grade_emoji}\n\n"
             f"{pyramid_banner}"
             f"{news_banner}"
+            f"{edge_warning_text}"
             f"📊 **Kierunek:** {dir_emoji}\n"
             f"⏱ **Interwał:** `{setup.timeframe}` (H4: **{setup.htf_trend}**) | {session_badge}\n"
             f"🎯 **Strategia:** `{setup.setup_type}`\n\n"
             f"{mtf_text}"
             f"{zumiko_text}"
             f"{fibo_text}"
+            f"{liq_line}"
             f"{confluence_lines}"
             f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_mode_txt}{sl_pips:.1f} p{spread_info})\n"
             f"🎯 **TP1:** `{setup.tp1_price:.{digits}f}` (Target 1:{setup.rr_ratio})\n"
@@ -781,6 +857,10 @@ class TelegramBotManager:
             ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if not self.app or not self.app.bot:
+            logger.warning(f"Telegram Bot is not connected. Alert for {setup.symbol} saved locally only.")
+            return
 
         try:
             target_chat = self.alert_channel
@@ -859,7 +939,13 @@ class TelegramBotManager:
         if not self.token:
             raise ValueError("TELEGRAM_BOT_TOKEN is not configured in .env file.")
 
-        builder = Application.builder().token(self.token)
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+        )
+        builder = Application.builder().token(self.token).request(request)
         self.app = builder.build()
 
         self.app.add_handler(CommandHandler("start", self.start_cmd))
@@ -872,6 +958,7 @@ class TelegramBotManager:
         self.app.add_handler(CommandHandler("optimizer", self.optimizer_cmd))
         self.app.add_handler(CommandHandler("bestrr", self.optimizer_cmd))
         self.app.add_handler(CommandHandler("addtrade", self.addtrade_cmd))
+        self.app.add_handler(CommandHandler("insights", self.insights_cmd))
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
         return self.app
