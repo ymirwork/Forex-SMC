@@ -154,16 +154,27 @@ class NotionJournal:
             props[max_r_match[0]] = {"number": round(float(trade["max_r"]), 2)}
 
         # 8. Profit in USD
-        pnl_match = find_prop(["PnL", "Profit", "Zysk ($)", "PnL ($)", "Profit (USD)"])
+        pnl_match = find_prop(["PnL ($)", "PnL", "Profit", "Zysk ($)", "Profit (USD)"])
         if pnl_match and "profit" in trade:
             props[pnl_match[0]] = {"number": round(float(trade["profit"]), 2)}
 
         # 9. Confluence Score (%)
-        conf_match = find_prop(["Confluence", "Confluence Score", "Score (%)", "Koniunkcja"])
+        conf_match = find_prop(["Confluence (%)", "Confluence", "Confluence Score", "Score (%)", "Koniunkcja"])
         if conf_match and trade.get("confluence_score"):
             props[conf_match[0]] = {"number": int(trade["confluence_score"])}
 
-        # 10. Date / Timestamp
+        # 10. Strategy
+        strat_match = find_prop(["Strategy", "Strategia"])
+        if strat_match:
+            strat_val = str(trade.get("strategy") or trade.get("strategy_name") or "SMC").upper()
+            props[strat_match[0]] = {"select": {"name": strat_val}}
+
+        # 11. Grade (A+, A, B)
+        grade_match = find_prop(["Grade", "Klasa", "Ocena"])
+        if grade_match and trade.get("grade"):
+            props[grade_match[0]] = {"select": {"name": str(trade["grade"])}}
+
+        # 12. Date / Timestamp
         date_match = find_prop(["Date", "Data", "Timestamp", "Created"])
         if date_match:
             prop_name, p_type = date_match
@@ -177,7 +188,7 @@ class NotionJournal:
                     pass
             props[prop_name] = {"date": {"start": iso_date}}
 
-        # 11. Notes / Strategy / Comment
+        # 13. Notes / Strategy / Comment
         notes_match = find_prop(["Notes", "Comment", "Strategy", "Strategia", "Opis", "Setup"])
         if notes_match:
             prop_name, _ = notes_match
