@@ -48,6 +48,8 @@ bot.log
 *.sqlite
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
 trades.db
 
 # ==========================================
