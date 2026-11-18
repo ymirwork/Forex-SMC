@@ -50,27 +50,27 @@ echo       Sprawdzanie stanu repozytorium...
 set "LOCAL_CHANGES="
 for /f "delims=" %%i in ('git status -uno --porcelain 2^>nul') do set "LOCAL_CHANGES=1"
 
-if defined LOCAL_CHANGES (
-    echo.
-    echo ============================================================
-    echo [UWAGA] Wykryto lokalnie zmodyfikowane pliki!
-    echo ============================================================
-    echo Posiadasz wlasne modyfikacje w plikach projektu, ktore moga
-    echo kolidowac z nowa wersja pobierana z GitHuba.
-    echo.
-    echo Wybierz, jak chcesz postapic:
-    echo.
-    echo   [1] Bezpieczna aktualizacja (Stash - zachowaj zmiany i zaktualizuj)
-    echo   [2] Standardowy git pull (moze zwrocic blad w razie kolizji)
-    echo   [3] Twardy reset (ODRZUC lokalne zmiany i pobierz czysta wersje)
-    echo   [4] Anuluj aktualizacje
-    echo ============================================================
-    choice /C 1234 /N /M "Wybierz opcje (1-4): "
-    if errorlevel 4 goto CANCEL_UPDATE
-    if errorlevel 3 goto CONFIRM_HARD_RESET
-    if errorlevel 2 goto NORMAL_PULL
-    if errorlevel 1 goto STASH_PULL
-)
+if not defined LOCAL_CHANGES goto NORMAL_PULL
+
+echo.
+echo ============================================================
+echo [UWAGA] Wykryto lokalnie zmodyfikowane pliki!
+echo ============================================================
+echo Posiadasz wlasne modyfikacje w plikach projektu, ktore moga
+echo kolidowac z nowa wersja pobierana z GitHuba.
+echo.
+echo Wybierz, jak chcesz postapic:
+echo.
+echo   [1] Bezpieczna aktualizacja (Stash - zachowaj zmiany i zaktualizuj)
+echo   [2] Standardowy git pull (moze zwrocic blad w razie kolizji)
+echo   [3] Twardy reset (ODRZUC lokalne zmiany i pobierz czysta wersje)
+echo   [4] Anuluj aktualizacje
+echo ============================================================
+choice /C 1234 /N /M "Wybierz opcje 1-4: "
+if errorlevel 4 goto CANCEL_UPDATE
+if errorlevel 3 goto CONFIRM_HARD_RESET
+if errorlevel 2 goto NORMAL_PULL
+if errorlevel 1 goto STASH_PULL
 
 :NORMAL_PULL
 echo.
@@ -114,7 +114,7 @@ echo.
 echo ============================================================
 echo [OSTRZEZENIE] Twardy reset bezpowrotnie usunie Twoje lokalne
 echo modyfikacje w sledzonych plikach i przywroci stan z GitHuba!
-echo (Twoj plik .env nie zostanie naruszony).
+echo Plik konfiguracyjny .env NIE zostanie naruszony.
 echo ============================================================
 choice /C TN /N /M "Czy na pewno chcesz nadpisac lokalne pliki? (T=Tak, N=Nie): "
 if errorlevel 2 goto CANCEL_UPDATE
@@ -151,23 +151,24 @@ if not exist ".env" (
 )
 
 :: Aktualizacja bibliotek w .venv jesli srodowisko istnieje
-if exist ".venv\Scripts\python.exe" (
-    echo Weryfikacja zaleznosci wirtualnego srodowiska (.venv)...
-    where uv >nul 2>nul
-    if %ERRORLEVEL% equ 0 (
-        uv pip install --python .venv\Scripts\python.exe -r requirements.txt
-    ) else (
-        .venv\Scripts\python.exe -m pip install -r requirements.txt --upgrade --quiet
-    )
-    if %ERRORLEVEL% equ 0 (
-        echo Zaleznosci sa aktualne.
-    ) else (
-        echo [OSTRZEZENIE] Wystapil problem podczas aktualizacji bibliotek. Mozesz uruchomic setup.bat.
-    )
-) else (
+if not exist ".venv\Scripts\python.exe" (
     echo [INFO] Nie wykryto folderu .venv. Jezeli to pierwsze uruchomienie, uzyj setup.bat.
+    goto FINISH_UPDATE
 )
 
+echo Weryfikacja zaleznosci wirtualnego srodowiska .venv...
+where uv >nul 2>nul
+if %ERRORLEVEL% equ 0 (
+    uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+    goto DEPS_DONE
+)
+
+.venv\Scripts\python.exe -m pip install -r requirements.txt --quiet
+
+:DEPS_DONE
+echo Zaleznosci sa aktualne.
+
+:FINISH_UPDATE
 echo.
 echo ============================================================
 echo   PROJEKT ZOSTAL POMYSLNIE ZAKTUALIZOWANY!
