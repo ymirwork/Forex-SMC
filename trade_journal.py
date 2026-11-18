@@ -96,7 +96,9 @@ class TradeJournal:
                     mae_r REAL DEFAULT 0.0,
                     closed_at TEXT DEFAULT '',
                     exit_reason TEXT DEFAULT '',
-                    grade TEXT DEFAULT ''
+                    grade TEXT DEFAULT '',
+                    is_rollover_shielded INTEGER DEFAULT 0,
+                    shielded_original_sl REAL DEFAULT 0.0
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);")
@@ -115,6 +117,8 @@ class TradeJournal:
                 ("closed_at", "TEXT DEFAULT ''"),
                 ("exit_reason", "TEXT DEFAULT ''"),
                 ("grade", "TEXT DEFAULT ''"),
+                ("is_rollover_shielded", "INTEGER DEFAULT 0"),
+                ("shielded_original_sl", "REAL DEFAULT 0.0"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_def}")
@@ -445,13 +449,13 @@ class TradeJournal:
             if max_r is not None:
                 cur.execute("""
                     UPDATE trades
-                    SET realized_r = ?, max_r = ?, status = ?, comment = ?
+                    SET realized_r = ?, max_r = ?, status = ?, comment = ?, is_rollover_shielded = 0
                     WHERE mt5_ticket = ? AND status IN ('OPEN', 'PENDING')
                 """, (realized_r, max_r, status, comment, mt5_ticket))
             else:
                 cur.execute("""
                     UPDATE trades
-                    SET realized_r = ?, status = ?, comment = ?
+                    SET realized_r = ?, status = ?, comment = ?, is_rollover_shielded = 0
                     WHERE mt5_ticket = ? AND status IN ('OPEN', 'PENDING')
                 """, (realized_r, status, comment, mt5_ticket))
             conn.commit()
@@ -464,7 +468,7 @@ class TradeJournal:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE trades
-                SET status = 'CANCELLED', comment = ?
+                SET status = 'CANCELLED', comment = ?, is_rollover_shielded = 0
                 WHERE mt5_ticket = ? AND status IN ('OPEN', 'PENDING')
             """, (comment, mt5_ticket))
             conn.commit()
@@ -476,6 +480,40 @@ class TradeJournal:
         with self._get_connection() as conn:
             conn.execute("UPDATE trades SET max_r = ? WHERE mt5_ticket = ?", (max_r, mt5_ticket))
             conn.commit()
+
+    @_auto_recover_on_corruption
+    def mark_trade_rollover_shielded(self, mt5_ticket: int, original_sl: float) -> bool:
+        """Records that an open position has its SL temporarily widened for rollover protection."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades
+                SET is_rollover_shielded = 1, shielded_original_sl = ?
+                WHERE mt5_ticket = ? AND status = 'OPEN'
+            """, (original_sl, mt5_ticket))
+            conn.commit()
+            return cur.rowcount > 0
+
+    @_auto_recover_on_corruption
+    def unmark_trade_rollover_shielded(self, mt5_ticket: int) -> bool:
+        """Clears the rollover shield status for a trade."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades
+                SET is_rollover_shielded = 0, shielded_original_sl = 0.0
+                WHERE mt5_ticket = ?
+            """, (mt5_ticket,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    @_auto_recover_on_corruption
+    def get_rollover_shielded_trades(self) -> List[Dict]:
+        """Returns all trades currently marked as rollover shielded."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM trades WHERE is_rollover_shielded = 1 AND status = 'OPEN'")
+            return [dict(row) for row in cur.fetchall()]
 
     @_auto_recover_on_corruption
     def update_trade_close_telemetry(self, mt5_ticket: int, exit_reason: str = "", mae_r: float = 0.0):

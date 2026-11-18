@@ -87,6 +87,13 @@ OPTIMAL_RR_MIN_FLOOR = float(os.getenv("OPTIMAL_RR_MIN_FLOOR", "2.0"))
 
 # Rollover & Session Protection
 BLOCK_ROLLOVER_SESSION = os.getenv("BLOCK_ROLLOVER_SESSION", "True").lower() in ("true", "1")
+ENABLE_ROLLOVER_SL_SHIELD = os.getenv("ENABLE_ROLLOVER_SL_SHIELD", "True").lower() in ("true", "1")
+ROLLOVER_SHIELD_START_MINUTES = int(os.getenv("ROLLOVER_SHIELD_START_MINUTES", "20"))  # Min before D1 close (23:40 MT5)
+ROLLOVER_SHIELD_END_MINUTES = int(os.getenv("ROLLOVER_SHIELD_END_MINUTES", "30"))      # Min after D1 open (00:30 MT5)
+ROLLOVER_DISASTER_SL_R = float(os.getenv("ROLLOVER_DISASTER_SL_R", "2.5"))              # Disaster SL distance in R
+ROLLOVER_MAX_SPREAD_MULT = float(os.getenv("ROLLOVER_MAX_SPREAD_MULT", "1.5"))          # Max spread multiplier before restoring SL
+ROLLOVER_MAX_SPREAD_PIPS = float(os.getenv("ROLLOVER_MAX_SPREAD_PIPS", "3.0"))          # Absolute max spread floor in pips for Forex majors
+ROLLOVER_MAX_SPREAD_GOLD_PIPS = float(os.getenv("ROLLOVER_MAX_SPREAD_GOLD_PIPS", "25.0")) # Max spread floor in pips for Gold ($2.50)
 
 # Max SL & Structural Room Filtering
 MAX_SL_ATR_MULTIPLIER = float(os.getenv("MAX_SL_ATR_MULTIPLIER", "2.5"))

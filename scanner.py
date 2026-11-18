@@ -1,8 +1,9 @@
 import asyncio
+from datetime import datetime
 import logging
 import os
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import MetaTrader5 as mt5
 import pandas as pd
 
@@ -17,6 +18,7 @@ from config import (
     DYNAMIC_FILTER_MODE,
     ENABLE_DYNAMIC_EDGE_FILTER,
     ENABLE_PYRAMIDING,
+    ENABLE_ROLLOVER_SL_SHIELD,
     ENABLE_SMC_STRATEGY,
     ENABLE_ZUMIKO_STRATEGY,
     HTF_TIMEFRAME,
@@ -34,6 +36,12 @@ from config import (
     PYRAMID_LOCK_PREVIOUS_PROFIT,
     PYRAMID_MIN_PROFIT_R,
     PYRAMID_MIN_RR_TO_TP,
+    ROLLOVER_DISASTER_SL_R,
+    ROLLOVER_MAX_SPREAD_GOLD_PIPS,
+    ROLLOVER_MAX_SPREAD_MULT,
+    ROLLOVER_MAX_SPREAD_PIPS,
+    ROLLOVER_SHIELD_END_MINUTES,
+    ROLLOVER_SHIELD_START_MINUTES,
     SCAN_INTERVAL_SECONDS,
     TRADE_MONITOR_INTERVAL_SECONDS,
     SWING_LENGTH,
@@ -55,6 +63,20 @@ from zumiko_detector import ZumikoDetector
 from trade_insights import TradeInsightEngine
 
 logger = logging.getLogger("ForexSMC.Scanner")
+
+
+def is_in_rollover_window(broker_dt: datetime, start_mins: int = 15, end_mins: int = 15) -> bool:
+    """
+    Checks if broker server time falls within the daily rollover window.
+    Default: 23:(60 - start_mins) to 00:(end_mins) broker time.
+    """
+    h = broker_dt.hour
+    m = broker_dt.minute
+    if h == 23 and (60 - m) <= start_mins:
+        return True
+    if h == 0 and m < end_mins:
+        return True
+    return False
 
 
 class SMCScanner:
@@ -95,6 +117,16 @@ class SMCScanner:
         self._last_alert_by_symbol: Dict[Tuple[str, str], float] = {}
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
+        self._shielded_trades: Dict[int, float] = {}
+        try:
+            stored_shielded = self.journal.get_rollover_shielded_trades()
+            for st in stored_shielded:
+                t_num = st.get("mt5_ticket")
+                orig_sl = float(st.get("shielded_original_sl") or 0.0)
+                if t_num and orig_sl > 0:
+                    self._shielded_trades[t_num] = orig_sl
+        except Exception as e:
+            logger.warning(f"Failed to restore shielded trades from database: {e}")
         self._htf_cache: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
         self.notion = NotionJournal()
         self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
@@ -219,6 +251,7 @@ class SMCScanner:
             closed_info = self.mt5_client.get_closed_deal_info(ticket)
             if closed_info and closed_info.get("status") == "CANCELLED":
                 self._be_moved_tickets.discard(ticket)
+                self._shielded_trades.pop(ticket, None)
                 self.journal.cancel_trade_by_ticket(
                     ticket,
                     comment=closed_info.get("comment", "Zlecenie oczekujące anulowane w MT5"),
@@ -251,6 +284,7 @@ class SMCScanner:
             if closed_info:
                 if closed_info.get("status") == "CANCELLED":
                     self._be_moved_tickets.discard(ticket)
+                    self._shielded_trades.pop(ticket, None)
                     self.journal.cancel_trade_by_ticket(
                         ticket,
                         comment=closed_info.get("comment", "Zlecenie oczekujące anulowane w MT5"),
@@ -308,6 +342,7 @@ class SMCScanner:
 
                 comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD | Max R: {max_r:.2f}R"
                 self._be_moved_tickets.discard(ticket)
+                self._shielded_trades.pop(ticket, None)
                 self.journal.close_trade_by_ticket(ticket, realized_r, max_r=max_r, status=status, comment=comment_str)
 
                 # Record close-time telemetry
@@ -383,7 +418,7 @@ class SMCScanner:
 
             # Auto Break-Even Assistant (Locks 0 risk when trade reaches +1.0R)
             if AUTO_BE_AT_1R:
-                if ticket in self._be_moved_tickets:
+                if ticket in self._be_moved_tickets or ticket in self._shielded_trades:
                     continue
 
                 # If SL is already moved to BE or into profit
@@ -415,6 +450,187 @@ class SMCScanner:
                                 f"🔒 Pozycja jest w 100% bezpieczna (Guaranteed Profit / Risk-Free)."
                             )
                             await self.telegram.send_message(alert_msg)
+
+        # 4. Rollover SL Shield (Protects tight SL and BE trades during rollover spread spike)
+        await self._handle_rollover_sl_shield(open_positions)
+
+    async def _handle_rollover_sl_shield(self, open_positions: List[Dict]):
+        """
+        Rollover SL Shield:
+        Protects tight SL and Break-Even trades during broker rollover spread spikes (23:45 - 00:15 broker time).
+        - Moves physical SL in MT5 to Disaster SL (e.g. 2.5R) so spread widening doesn't prematurely trigger SL.
+        - Bot monitors true market MID price = (Bid + Ask) / 2. If MID hits the original SL, position is closed at market.
+        - Restores original SL once rollover window ends AND symbol spread normalizes.
+        """
+        if not ENABLE_ROLLOVER_SL_SHIELD or not open_positions:
+            return
+
+        broker_now = self.mt5_client.get_broker_server_time()
+        in_rollover = is_in_rollover_window(
+            broker_now,
+            start_mins=ROLLOVER_SHIELD_START_MINUTES,
+            end_mins=ROLLOVER_SHIELD_END_MINUTES,
+        )
+
+        open_by_ticket = {p["ticket"]: p for p in open_positions}
+
+        # Clean up shielded trades that are no longer in open positions
+        for t_num in list(self._shielded_trades.keys()):
+            if t_num not in open_by_ticket:
+                self._shielded_trades.pop(t_num, None)
+                self.journal.unmark_trade_rollover_shielded(t_num)
+
+        if in_rollover:
+            # 1. Activation Phase: Shield qualifying open positions not yet shielded
+            for p in open_positions:
+                ticket = p["ticket"]
+                if ticket in self._shielded_trades:
+                    continue
+
+                entry_p = float(p.get("price_open", 0.0))
+                sl_p = float(p.get("sl", 0.0))
+                if sl_p <= 0 or entry_p <= 0:
+                    continue
+
+                is_buy = p["type"] == "BUY"
+                orig_sl = self.mt5_client.get_initial_sl(ticket)
+                if orig_sl <= 0:
+                    orig_sl = sl_p
+
+                initial_dist = abs(entry_p - orig_sl)
+                pip_size = self.mt5_client.get_pip_size(p["symbol"])
+                if initial_dist <= 0:
+                    initial_dist = 25 * pip_size
+
+                # Check qualification: Only shield trades at Initial SL or at Break-Even
+                is_be = self.mt5_client.is_position_at_be(
+                    entry=entry_p,
+                    sl=sl_p,
+                    is_buy=is_buy,
+                    initial_sl_dist=initial_dist,
+                    tolerance_ratio=0.15,
+                )
+                is_deep_trailing = (sl_p > entry_p + (initial_dist * 0.5)) if is_buy else (sl_p < entry_p - (initial_dist * 0.5))
+
+                if is_deep_trailing and not is_be:
+                    continue
+
+                # Calculate Disaster SL (placed safely away at 2.5R)
+                sym_info = mt5.symbol_info(p["symbol"])
+                digits = getattr(sym_info, "digits", 5) if sym_info else 5
+
+                disaster_distance = initial_dist * ROLLOVER_DISASTER_SL_R
+                if is_buy:
+                    disaster_sl = round(entry_p - disaster_distance, digits)
+                    if disaster_sl >= sl_p:
+                        disaster_sl = round(sl_p - disaster_distance, digits)
+                else:
+                    disaster_sl = round(entry_p + disaster_distance, digits)
+                    if disaster_sl <= sl_p:
+                        disaster_sl = round(sl_p + disaster_distance, digits)
+
+                # Send SL update to MT5
+                ok, msg = self.mt5_client.modify_position_sl(ticket, disaster_sl)
+                if ok:
+                    self._shielded_trades[ticket] = sl_p
+                    self.journal.mark_trade_rollover_shielded(ticket, sl_p)
+                    logger.info(
+                        f"🛡️ [ROLLOVER SHIELD] Pozycja #{ticket} ({p['symbol']}) zabezpieczona: "
+                        f"Oryginalny SL={sl_p}, Disaster SL={disaster_sl} ({ROLLOVER_DISASTER_SL_R:.1f}R)"
+                    )
+                    start_min_clamped = min(59, max(1, ROLLOVER_SHIELD_START_MINUTES))
+                    start_time_str = f"23:{60 - start_min_clamped:02d}"
+                    if self.telegram:
+                        await self.telegram.send_message(
+                            f"🛡️ **ROLLOVER SL SHIELD: AKTYWACJA ({start_time_str} MT5)**\n\n"
+                            f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
+                            f"📍 Wejście: `{entry_p}` | Pierwotny SL: `{sl_p}`\n"
+                            f"⚠️ **Awaryjny Disaster SL:** `{disaster_sl}` ({ROLLOVER_DISASTER_SL_R:.1f}R)\n"
+                            f"🔒 Bot czuwa nad ceną rynkową MID – ochrona przed sztucznym rozszerzeniem nocnego spreadu."
+                        )
+
+            # 2. Monitoring Phase: Check if MID price legitimately crossed original SL (Cached per symbol)
+            tick_cache: Dict[str, Any] = {}
+            for ticket, orig_sl in list(self._shielded_trades.items()):
+                p = open_by_ticket.get(ticket)
+                if not p:
+                    continue
+
+                sym = p["symbol"]
+                if sym not in tick_cache:
+                    tick_cache[sym] = mt5.symbol_info_tick(sym)
+                tick = tick_cache[sym]
+                if not tick or tick.bid <= 0 or tick.ask <= 0:
+                    continue
+
+                mid_price = (tick.bid + tick.ask) / 2.0
+                is_buy = p["type"] == "BUY"
+
+                mid_hit_sl = (mid_price <= orig_sl) if is_buy else (mid_price >= orig_sl)
+                if mid_hit_sl:
+                    logger.warning(
+                        f"🚨 [ROLLOVER SHIELD] Cena MID ({mid_price}) przebiła oryginalny SL ({orig_sl}) na #{ticket}!"
+                    )
+                    close_ok, close_msg = self.mt5_client.close_market_position(
+                        ticket,
+                        comment="Rollover Shield: Mid hit SL",
+                    )
+                    if close_ok:
+                        self._shielded_trades.pop(ticket, None)
+                        self.journal.unmark_trade_rollover_shielded(ticket)
+                        if self.telegram:
+                            await self.telegram.send_message(
+                                f"🚨 **AWARYJNE ZAMKNIĘCIE W TRAKCIE ROLLOVERU!**\n\n"
+                                f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
+                                f"📉 Rzeczywista cena MID: `{mid_price:.5f}` wybiła pierwotny SL: `{orig_sl}`\n"
+                                f"🛑 Pozycja została zamknięta rynkowo, aby zapobiec powiększeniu straty."
+                            )
+
+        else:
+            # 3. Restoration Phase: After rollover, check spread normalization and restore SL (Cached per symbol)
+            if not self._shielded_trades:
+                return
+
+            spread_cache: Dict[str, float] = {}
+            for ticket, orig_sl in list(self._shielded_trades.items()):
+                p = open_by_ticket.get(ticket)
+                if not p:
+                    self._shielded_trades.pop(ticket, None)
+                    self.journal.unmark_trade_rollover_shielded(ticket)
+                    continue
+
+                sym = p["symbol"]
+                if sym not in spread_cache:
+                    spread_cache[sym] = self.mt5_client.get_symbol_spread(sym)
+                spread_pips = spread_cache[sym]
+
+                is_gold = "XAU" in clean_symbol(sym)
+                max_spread = ROLLOVER_MAX_SPREAD_GOLD_PIPS if is_gold else ROLLOVER_MAX_SPREAD_PIPS
+
+                if spread_pips <= max_spread:
+                    ok, msg = self.mt5_client.modify_position_sl(ticket, orig_sl)
+                    if ok:
+                        self._shielded_trades.pop(ticket, None)
+                        self.journal.unmark_trade_rollover_shielded(ticket)
+                        logger.info(
+                            f"✅ [ROLLOVER SHIELD] Spread unormowany ({spread_pips:.1f} pips). "
+                            f"Przywrócono oryginalny SL={orig_sl} dla #{ticket} ({p['symbol']})."
+                        )
+                        if self.telegram:
+                            await self.telegram.send_message(
+                                f"✅ **ROLLOVER SL SHIELD: ZAKOŃCZONO (Spread w normie)**\n\n"
+                                f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
+                                f"📊 Aktualny spread: `{spread_pips:.1f} pips` (<= `{max_spread:.1f}`)\n"
+                                f"🛡️ **Przywrócono ciasny Stop Loss:** `{orig_sl}`\n"
+                                f"Pozycja kontynuuje standardowe monitorowanie."
+                            )
+                    else:
+                        logger.warning(f"Could not restore SL for #{ticket}: {msg}")
+                else:
+                    logger.debug(
+                        f"Rollover Shield waiting for spread normalization on {p['symbol']}: "
+                        f"current={spread_pips:.1f} pips > threshold={max_spread:.1f} pips"
+                    )
 
     async def scan_once(self) -> int:
         """Runs a single scan across all configured symbols."""

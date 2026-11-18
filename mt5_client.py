@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import logging
 import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -769,6 +769,120 @@ class MT5Client:
         offset_desc = f" (+{offset_pips:.1f} pips na pokrycie kosztów)" if offset_pips > 0 else ""
         logger.info(f"Stop Loss for #{ticket} ({p.symbol}) moved to Break-Even: {be_price}{offset_desc}")
         return True, f"✅ Stop Loss dla pozycji #{ticket} ({p.symbol}) przestawiony na Break-Even ({be_price}){offset_desc}!"
+
+    def modify_position_sl(self, ticket: int, new_sl: float) -> Tuple[bool, str]:
+        """
+        Modifies the Stop Loss of an active position to new_sl.
+        Validates connection, position existence, digits, and stops_level.
+        """
+        if not self.ensure_connection():
+            return False, "Brak połączenia z MT5"
+
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos:
+            return False, f"Pozycja #{ticket} nie została znaleziona w MT5"
+
+        p = pos[0]
+        sym_info = mt5.symbol_info(p.symbol)
+        if not sym_info:
+            return False, f"Brak danych symbolu {p.symbol}"
+
+        target_sl = round(new_sl, sym_info.digits)
+        if target_sl == p.sl:
+            return True, f"SL dla #{ticket} jest już na poziomie {target_sl}"
+
+        # stops_level safety check
+        stops_level = getattr(sym_info, "trade_stops_level", 0) or getattr(sym_info, "stops_level", 0) or 5
+        min_dist = (stops_level + 2) * sym_info.point
+        is_buy = p.type == mt5.ORDER_TYPE_BUY
+        if is_buy and (p.price_current - target_sl) < min_dist:
+            return False, f"Target SL {target_sl} zbyt blisko ceny rynkowej ({p.price_current})"
+        elif not is_buy and (target_sl - p.price_current) < min_dist:
+            return False, f"Target SL {target_sl} zbyt blisko ceny rynkowej ({p.price_current})"
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": p.ticket,
+            "symbol": p.symbol,
+            "sl": target_sl,
+            "tp": p.tp,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            err = mt5.last_error()
+            return False, f"Błąd modyfikacji SL: {err}"
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            return False, f"Modyfikacja SL odrzucona: retcode={result.retcode} ({result.comment})"
+
+        logger.info(f"Stop Loss for #{ticket} ({p.symbol}) successfully set to {target_sl}")
+        return True, f"SL dla #{ticket} zaktualizowany na {target_sl}"
+
+    def close_market_position(self, ticket: int, comment: str = "") -> Tuple[bool, str]:
+        """
+        Closes an active MT5 position at current market price.
+        """
+        if not self.ensure_connection():
+            return False, "Brak połączenia z MT5"
+
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos:
+            return False, f"Pozycja #{ticket} nie istnieje lub została już zamknięta"
+
+        p = pos[0]
+        sym_info = mt5.symbol_info(p.symbol)
+        if not sym_info:
+            return False, f"Brak danych symbolu {p.symbol}"
+
+        tick = mt5.symbol_info_tick(p.symbol)
+        if not tick:
+            return False, f"Brak ticka rynkowego dla {p.symbol}"
+
+        is_buy = p.type == mt5.ORDER_TYPE_BUY
+        order_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
+        close_price = tick.bid if is_buy else tick.ask
+
+        filling = self._determine_filling_mode(sym_info)
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "position": p.ticket,
+            "symbol": p.symbol,
+            "volume": p.volume,
+            "type": order_type,
+            "price": close_price,
+            "deviation": 25,
+            "magic": p.magic,
+            "comment": comment or "Close position",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            err = mt5.last_error()
+            return False, f"Błąd zlecenia zamknięcia: {err}"
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            return False, f"Zamknięcie pozycji odrzucone: retcode={result.retcode} ({result.comment})"
+
+        logger.info(f"Position #{ticket} ({p.symbol}) closed successfully at {close_price}")
+        return True, f"Pozycja #{ticket} zamknięta po cenie {close_price}"
+
+    def get_broker_server_time(self) -> datetime:
+        """
+        Returns current broker server time:
+        Uses MT5 tick time if available, or UTC + broker offset.
+        """
+        try:
+            tick = mt5.symbol_info_tick("EURUSD") or mt5.symbol_info_tick("XAUUSD")
+            if tick and tick.time > 0:
+                return datetime.fromtimestamp(tick.time, tz=timezone.utc)
+        except Exception:
+            pass
+        from session_manager import get_broker_utc_offset
+        return datetime.now(timezone.utc) + timedelta(hours=get_broker_utc_offset())
 
     @staticmethod
     def is_position_at_be(
