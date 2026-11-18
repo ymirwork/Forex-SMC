@@ -1,6 +1,8 @@
-from datetime import datetime, timezone, time as dtime
+from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, Optional, Tuple
 import pandas as pd
+
+from config import BROKER_UTC_OFFSET_HOURS
 
 
 class SessionManager:
@@ -17,7 +19,8 @@ class SessionManager:
         if dt is None:
             dt = datetime.now(timezone.utc)
         elif dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            # Adjust naive candle timestamp (broker server time) to UTC
+            dt = (dt - timedelta(hours=BROKER_UTC_OFFSET_HOURS)).replace(tzinfo=timezone.utc)
 
         t = dt.time()
 
@@ -71,8 +74,8 @@ class SessionManager:
         if "time" not in df_copy.columns:
             return None, None
 
-        # Convert to UTC if needed
-        df_copy["time_utc"] = pd.to_datetime(df_copy["time"])
+        # Convert broker server time to true UTC
+        df_copy["time_utc"] = pd.to_datetime(df_copy["time"]) - pd.Timedelta(hours=BROKER_UTC_OFFSET_HOURS)
         latest_date = df_copy["time_utc"].iloc[-1].date()
 
         # Filter candles belonging to today's Asian session

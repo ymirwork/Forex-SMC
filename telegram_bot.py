@@ -15,6 +15,7 @@ from telegram.ext import (
 from config import (
     ALLOWED_CHAT_IDS,
     DEFAULT_RISK_PERCENT,
+    DISMISS_MUTE_HOURS,
     ENABLE_NOTION,
     PROP_FIRM_MODE,
     PROP_INITIAL_BALANCE,
@@ -27,6 +28,7 @@ from config import (
     TELEGRAM_BOT_TOKEN,
 )
 from mt5_client import MT5Client
+from news_filter import NewsFilter
 from notion_journal import NotionJournal
 from rr_optimizer import RROptimizer
 from smc_detector import TradeSetup
@@ -45,6 +47,7 @@ class TelegramBotManager:
         alert_channel: int = TELEGRAM_ALERT_CHANNEL,
         allowed_ids: Optional[list] = None,
         journal: Optional[TradeJournal] = None,
+        news_filter: Optional[NewsFilter] = None,
     ):
         self.mt5_client = mt5_client
         self.token = token
@@ -57,6 +60,25 @@ class TelegramBotManager:
         self.scanner_callback = None  # Reference to manual trigger scan
         self.journal = journal or TradeJournal()
         self.notion = NotionJournal()
+        self.news_filter = news_filter or NewsFilter()
+        self.muted_symbols: Dict[Tuple[str, str], float] = {}
+
+    def mute_symbol(self, symbol: str, direction: str, hours: float = DISMISS_MUTE_HOURS):
+        """Mutes alerts for this symbol & direction for a specified duration after dismissal."""
+        key = (symbol.upper().replace(".PRO", "").replace(".RAW", ""), direction.upper())
+        self.muted_symbols[key] = time.time() + (hours * 3600)
+        logger.info(f"Muted {key[0]} {key[1]} alerts for {hours:.1f} hours.")
+
+    def is_symbol_muted(self, symbol: str, direction: str) -> bool:
+        """Checks if alerts for this symbol & direction are currently muted."""
+        key = (symbol.upper().replace(".PRO", "").replace(".RAW", ""), direction.upper())
+        exp = self.muted_symbols.get(key)
+        if exp:
+            if time.time() < exp:
+                return True
+            else:
+                del self.muted_symbols[key]
+        return False
 
     def _cleanup_expired_setups(self, max_age_hours: float = 6.0):
         """Cleans up setups in pending_setups older than max_age_hours to prevent memory leaks."""
@@ -438,7 +460,12 @@ class TelegramBotManager:
         setup = self.pending_setups.get(setup_id)
 
         if action == "dismiss":
-            await query.edit_message_caption(caption=f"{query.message.caption}\n\n❌ **Setup odrzucony przez użytkownika.**")
+            mute_txt = ""
+            if setup:
+                self.mute_symbol(setup.symbol, setup.direction, hours=DISMISS_MUTE_HOURS)
+                mute_txt = f"\n\n🔇 **Powiadomienia dla {setup.symbol} [{setup.direction}] wyciszone na {DISMISS_MUTE_HOURS:.1f}h.**"
+
+            await query.edit_message_caption(caption=f"{query.message.caption}\n\n❌ **Setup odrzucony przez użytkownika.**{mute_txt}")
             if setup_id in self.pending_setups:
                 del self.pending_setups[setup_id]
             self.pending_setups_time.pop(setup_id, None)
@@ -449,6 +476,18 @@ class TelegramBotManager:
             return
 
         if action in ("market", "limit"):
+            from config import BLOCK_ON_HIGH_IMPACT_NEWS, PROP_ENFORCE_NEWS_FILTER
+            should_block_news = BLOCK_ON_HIGH_IMPACT_NEWS or (PROP_FIRM_MODE and PROP_ENFORCE_NEWS_FILTER)
+            if should_block_news:
+                # Live news verification at the exact time of order placement
+                has_news, news_warn, _ = self.news_filter.check_news(setup.symbol)
+                if has_news and news_warn:
+                    await query.answer(text="Zablokowano: zbliżają się wiadomości High-Impact!", show_alert=True)
+                    await query.edit_message_caption(
+                        caption=f"{query.message.caption}\n\n🛑 **Zlecenie zablokowane na żywo (Filtr Wiadomości High-Impact):**\n{news_warn}"
+                    )
+                    return
+
             if PROP_FIRM_MODE:
                 sl_dist = abs(setup.entry_price - setup.sl_price)
                 can_trade, reason = self.mt5_client.can_open_new_trade(
@@ -471,7 +510,7 @@ class TelegramBotManager:
         strat_label = f"PYRAMID_{setup.strategy_name}" if is_pyr else setup.setup_type
 
         if action == "market":
-            success, msg, ticket = self.mt5_client.execute_market_order(
+            success, msg, ticket, fill_price = self.mt5_client.execute_market_order(
                 symbol=setup.symbol,
                 direction=setup.direction,
                 volume=lot,
@@ -480,6 +519,7 @@ class TelegramBotManager:
                 comment=f"SMC {'Pyr L2 ' if is_pyr else ''}{setup.setup_type[:10]}",
             )
             if success:
+                actual_entry = fill_price if fill_price > 0 else setup.entry_price
                 trail_msg = ""
                 if is_pyr and parent_t and PYRAMID_LOCK_PREVIOUS_PROFIT:
                     trail_ok, t_msg = self.mt5_client.trail_sl_to_profit(parent_t, profit_r=0.5)
@@ -489,7 +529,7 @@ class TelegramBotManager:
                 self.journal.add_trade(
                     symbol=setup.symbol,
                     direction=setup.direction,
-                    entry_price=setup.entry_price,
+                    entry_price=actual_entry,
                     sl_price=setup.sl_price,
                     tp_price=setup.tp1_price,
                     realized_r=0.0,
@@ -504,7 +544,7 @@ class TelegramBotManager:
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
                     "direction": setup.direction,
-                    "entry_price": setup.entry_price,
+                    "entry_price": actual_entry,
                     "sl_price": setup.sl_price,
                     "tp_price": setup.tp1_price,
                     "realized_r": 0.0,
@@ -518,6 +558,7 @@ class TelegramBotManager:
                     f"{query.message.caption}\n\n"
                     f"✅ **ZLECENIE WYKONANE W MT5!**\n"
                     f"🎫 **Ticket:** `#{ticket}`\n"
+                    f"📍 **Cena egzekucji:** `{actual_entry}`\n"
                     f"📦 **Wolumen:** `{lot} lot` (Ryzyko: {risk_pct}%)\n"
                     f"🎯 **SL:** `{setup.sl_price}` | **TP:** `{setup.tp1_price}`"
                     f"{trail_msg}"
@@ -529,7 +570,7 @@ class TelegramBotManager:
                 )
 
         elif action == "limit":
-            success, msg, ticket = self.mt5_client.execute_limit_order(
+            success, msg, ticket, _ = self.mt5_client.execute_limit_order(
                 symbol=setup.symbol,
                 direction=setup.direction,
                 price=setup.entry_price,
@@ -669,6 +710,7 @@ class TelegramBotManager:
         if getattr(setup, "ema_238", 0.0) > 0:
             zumiko_text = f"📈 **Zumiko:** EMA 10/21: `{setup.ema_fast:.{digits}f}/{setup.ema_slow:.{digits}f}` | 🌟 EMA 238: `{setup.ema_238:.{digits}f}` | {setup.swing_pattern}\n"
 
+        sl_mode_txt = f"[{setup.sl_mode}] " if getattr(setup, "sl_mode", "") else ""
         spread_info = f" [w tym spread: +{setup.spread_used / point_scale:.1f}p]" if getattr(setup, "spread_used", 0.0) > 0 else ""
 
         caption = (
@@ -683,7 +725,7 @@ class TelegramBotManager:
             f"{zumiko_text}"
             f"{fibo_text}"
             f"{confluence_lines}"
-            f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} p{spread_info})\n"
+            f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_mode_txt}{sl_pips:.1f} p{spread_info})\n"
             f"🎯 **TP1:** `{setup.tp1_price:.{digits}f}` (Target 1:{setup.rr_ratio})\n"
             f"🎯 **TP2:** `{setup.tp2_price:.{digits}f}` (Strukturalny szczyt/dołek)\n"
             f"⚖️ **Risk / Reward:** `1 : {setup.rr_ratio}` {rr_badge}\n"

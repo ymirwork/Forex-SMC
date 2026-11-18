@@ -7,6 +7,7 @@ from typing import Dict, List, Set
 from chart_generator import ChartGenerator
 from config import (
     ADD_SPREAD_TO_SL,
+    ALERT_COOLDOWN_MINUTES,
     AUTO_BE_AT_1R,
     AUTO_BE_OFFSET_PIPS,
     BLOCK_ON_HIGH_IMPACT_NEWS,
@@ -80,6 +81,7 @@ class SMCScanner:
         self.chart_gen = ChartGenerator()
         self.is_running = False
         self.notified_setups: Dict[str, float] = {}
+        self._last_alert_by_symbol: Dict[Tuple[str, str], float] = {}
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
         self.notion = NotionJournal()
@@ -109,6 +111,9 @@ class SMCScanner:
         expired = [k for k, ts in self.notified_setups.items() if (now - ts) > (max_age_hours * 3600)]
         for k in expired:
             del self.notified_setups[k]
+        expired_symbols = [k for k, ts in self._last_alert_by_symbol.items() if (now - ts) > (max_age_hours * 3600)]
+        for k in expired_symbols:
+            del self._last_alert_by_symbol[k]
         self._cleanup_old_charts()
 
     async def monitor_open_trades(self):
@@ -146,6 +151,20 @@ class SMCScanner:
 
             closed_info = self.mt5_client.get_closed_deal_info(ticket)
             if closed_info:
+                if closed_info.get("status") == "CANCELLED":
+                    self.journal.cancel_trade_by_ticket(
+                        ticket,
+                        comment=closed_info.get("comment", "Zlecenie oczekujące anulowane w MT5"),
+                    )
+                    logger.info(f"Pending order #{ticket} ({t['symbol']}) marked as CANCELLED.")
+                    if self.telegram:
+                        await self.telegram.send_message(
+                            f"ℹ️ **ZLECENIE ANULOWANE: {t['symbol']} [{t['direction']}]**\n\n"
+                            f"🎫 **Ticket:** `#{ticket}`\n"
+                            f"Status: Zlecenie oczekujące wygasło lub zostało anulowane w MT5."
+                        )
+                    continue
+
                 profit = closed_info.get("profit", 0.0)
                 reason = closed_info.get("reason", 0)
                 price_close = closed_info.get("price_close", 0.0)
@@ -263,8 +282,15 @@ class SMCScanner:
                 if ticket in self._be_moved_tickets:
                     continue
 
-                # If SL is already moved to BE (within 15% distance to entry)
-                if abs(entry_p - sl_p) < (initial_sl_dist * 0.15):
+                # If SL is already moved to BE or into profit
+                is_already_be = self.mt5_client.is_position_at_be(
+                    entry=entry_p,
+                    sl=sl_p,
+                    is_buy=is_buy,
+                    initial_sl_dist=initial_sl_dist,
+                    tolerance_ratio=0.15,
+                )
+                if is_already_be:
                     self._be_moved_tickets.add(ticket)
                     continue
 
@@ -336,12 +362,12 @@ class SMCScanner:
                 )
 
             try:
-                # Fetch multi-timeframe candles
-                df_m15 = self.mt5_client.fetch_ohlcv(sym, "M15", LOOKBACK_BARS)
+                # Fetch multi-timeframe candles using configured LTF and HTF
+                df_ltf = self.mt5_client.fetch_ohlcv(sym, LTF_TIMEFRAME, LOOKBACK_BARS)
                 df_h1 = self.mt5_client.fetch_ohlcv(sym, "H1", LOOKBACK_BARS)
-                df_h4 = self.mt5_client.fetch_ohlcv(sym, "H4", LOOKBACK_BARS)
+                df_htf = self.mt5_client.fetch_ohlcv(sym, HTF_TIMEFRAME, LOOKBACK_BARS)
 
-                if df_m15 is None or df_h4 is None:
+                if df_ltf is None or df_htf is None:
                     continue
 
                 smc_setups: List[TradeSetup] = []
@@ -351,10 +377,10 @@ class SMCScanner:
                 spread_val = self.mt5_client.get_symbol_spread(sym) if ADD_SPREAD_TO_SL else 0.0
 
                 if ENABLE_SMC_STRATEGY:
-                    smc_setups = self.smc_detector.scan_for_setups(sym, df_m15, df_h4, spread=spread_val)
+                    smc_setups = self.smc_detector.scan_for_setups(sym, df_ltf, df_htf, spread=spread_val)
 
                 if ENABLE_ZUMIKO_STRATEGY:
-                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_m15, df_h1, df_h4, spread=spread_val)
+                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_ltf, df_h1, df_htf, spread=spread_val)
 
                 final_setups: List[TradeSetup] = []
 
@@ -400,9 +426,23 @@ class SMCScanner:
                         setup.pyramid_profit_r = pyramid_status.get("profit_r", 0.0)
                         setup.setup_type = f"[DOKŁADKA TRENDOWA L{pyramid_status.get('count', 1) + 1}] {setup.setup_type}"
 
-                    setup_key = f"{setup.symbol}_{setup.direction}_{setup.strategy_name}_{setup.entry_price:.2f}"
+                    # Anti-Spam Check 1: User Dismissed / Muted Check
+                    if self.telegram and self.telegram.is_symbol_muted(setup.symbol, setup.direction):
+                        logger.info(f"🔇 [MUTED] Pomijam alert dla {setup.symbol} {setup.direction} (użytkownik odrzucił ten setup).")
+                        continue
+
+                    # Anti-Spam Check 2: M15 Candle Lock (1 alert max per M15 candle timestamp)
+                    candle_str = setup.timestamp.strftime("%Y%m%d_%H%M") if hasattr(setup.timestamp, "strftime") else str(setup.timestamp)
+                    setup_key = f"{setup.symbol}_{setup.direction}_{setup.strategy_name}_{candle_str}"
                     if setup_key in self.notified_setups:
-                        continue  # Already notified recently
+                        continue  # Already notified for this M15 candle
+
+                    # Anti-Spam Check 3: Time Cooldown per Symbol & Direction
+                    sym_dir_key = (setup.symbol.upper().replace(".PRO", "").replace(".RAW", ""), setup.direction.upper())
+                    last_alert_t = self._last_alert_by_symbol.get(sym_dir_key, 0.0)
+                    if (time.time() - last_alert_t) < (ALERT_COOLDOWN_MINUTES * 60):
+                        logger.debug(f"⏳ [COOLDOWN] Pomijam alert dla {setup.symbol} {setup.direction} (aktywny cooldown {ALERT_COOLDOWN_MINUTES}m).")
+                        continue
 
                     # Macroeconomic High-Impact News Filter Check
                     should_block_news = BLOCK_ON_HIGH_IMPACT_NEWS or (PROP_FIRM_MODE and PROP_ENFORCE_NEWS_FILTER)
@@ -426,6 +466,7 @@ class SMCScanner:
 
                     found_count += 1
                     self.notified_setups[setup_key] = time.time()
+                    self._last_alert_by_symbol[sym_dir_key] = time.time()
                     setup_id = f"{sym}_{setup.strategy_name}_{int(time.time())}"
 
                     logger.info(
@@ -433,7 +474,7 @@ class SMCScanner:
                     )
 
                     # Generate visual chart with Fibo or EMAs
-                    chart_path = self.chart_gen.generate_setup_chart(df_m15, setup)
+                    chart_path = self.chart_gen.generate_setup_chart(df_ltf, setup)
 
                     # Send to Telegram
                     if self.telegram:

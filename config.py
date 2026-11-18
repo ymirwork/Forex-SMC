@@ -8,7 +8,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Support single or multiple allowed Telegram IDs (e.g. channel and user ID)
 raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "0")
 ALLOWED_CHAT_IDS = [
-    int(x.strip()) for x in raw_chat_id.split(",") if x.strip() and x.strip() != "0"
+    int(x.strip().strip("'\"")) for x in raw_chat_id.split(",") if x.strip().strip("'\"") and x.strip().strip("'\"") != "0"
 ]
 # Primary destination channel for alerts (first negative ID, or first ID)
 TELEGRAM_ALERT_CHANNEL = next(
@@ -43,6 +43,8 @@ SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).sp
 HTF_TIMEFRAME = os.getenv("HTF_TIMEFRAME", "H4")  # H4 as primary HTF
 # LTF (Lower Timeframe) for Entry Confirmations
 LTF_TIMEFRAME = os.getenv("LTF_TIMEFRAME", "M15") # M15 as execution timeframe
+# Broker Timezone Settings (MT5 server time offset from UTC, e.g. EET = UTC+2, EEST = UTC+3)
+BROKER_UTC_OFFSET_HOURS = int(os.getenv("BROKER_UTC_OFFSET_HOURS", "2"))
 
 # Risk Management Settings
 DEFAULT_RISK_PERCENT = float(os.getenv("DEFAULT_RISK_PERCENT", "1.0"))  # 1% per trade
@@ -102,6 +104,21 @@ AUTO_BE_OFFSET_PIPS = float(os.getenv("AUTO_BE_OFFSET_PIPS", "5.0"))
 ADD_SPREAD_TO_SL = os.getenv("ADD_SPREAD_TO_SL", "True").lower() in ("true", "1")
 # Domyślny spread w pipsach, jeśli MT5 nie zwróci danych
 DEFAULT_SPREAD_PIPS = float(os.getenv("DEFAULT_SPREAD_PIPS", "1.0"))
+
+# Tryb kalkulacji Stop Lossa: "STRUCTURE", "ATR" lub "HYBRID" (domyślnie HYBRID)
+SL_CALCULATION_MODE = os.getenv("SL_CALCULATION_MODE", "HYBRID").upper()
+# Mnożnik ATR dla czystego trybu ATR (np. 1.5 * ATR(14))
+SL_ATR_MULTIPLIER = float(os.getenv("SL_ATR_MULTIPLIER", "1.5"))
+# Minimalny bufor ATR dla trybu HYBRID (np. 0.8 * ATR(14))
+SL_HYBRID_MIN_ATR_MULT = float(os.getenv("SL_HYBRID_MIN_ATR_MULT", "0.8"))
+
+# ==========================================
+# ANTI-SPAM & ALERT COOLDOWN SETTINGS
+# ==========================================
+# Minimalny czas (w minutach) pomiędzy kolejnymi alertami na tym samym symbolu i kierunku
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
+# Czas (w godzinach) wyciszenia alertów po kliknięciu "Odrzuć" na Telegramie
+DISMISS_MUTE_HOURS = float(os.getenv("DISMISS_MUTE_HOURS", "2.0"))
 
 # ==========================================
 # NOTION TRADE JOURNAL SETTINGS

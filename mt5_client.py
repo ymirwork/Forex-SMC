@@ -13,6 +13,7 @@ from config import (
     ENABLE_PYRAMIDING,
     MAX_PYRAMID_LEVEL,
     MAX_RISK_DEVIATION_TOLERANCE,
+    MAX_RISK_PERCENT,
     PROP_FIRM_MODE,
     PROP_INITIAL_BALANCE,
     PROP_MAX_DRAWDOWN_PERCENT,
@@ -259,6 +260,11 @@ class MT5Client:
 
         if PROP_FIRM_MODE:
             risk_percent = PROP_RISK_PER_TRADE_PERCENT
+        elif risk_percent > MAX_RISK_PERCENT:
+            logger.warning(
+                f"Requested risk {risk_percent}% exceeds MAX_RISK_PERCENT ({MAX_RISK_PERCENT}%). Capping risk."
+            )
+            risk_percent = MAX_RISK_PERCENT
 
         risk_amount = acc.balance * (risk_percent / 100.0)
         raw_lot = risk_amount / loss_per_one_lot
@@ -301,19 +307,19 @@ class MT5Client:
         sl: float,
         tp: float,
         comment: str = "SMC SemiAuto",
-    ) -> Tuple[bool, str, Optional[int]]:
+    ) -> Tuple[bool, str, Optional[int], float]:
         """Executes a market order in MT5 with SL/TP and automatic filling mode fallback."""
         if not self.ensure_connection():
-            return False, "Not connected to MT5", None
+            return False, "Not connected to MT5", None, 0.0
 
         resolved = self.resolve_symbol(symbol)
         if not resolved:
-            return False, f"Unknown symbol: {symbol}", None
+            return False, f"Unknown symbol: {symbol}", None, 0.0
 
         sym_info = mt5.symbol_info(resolved)
         tick = mt5.symbol_info_tick(resolved)
         if sym_info is None or tick is None:
-            return False, f"Failed to get tick info for {resolved}", None
+            return False, f"Failed to get tick info for {resolved}", None, 0.0
 
         is_buy = direction.upper() == "BUY"
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
@@ -359,15 +365,16 @@ class MT5Client:
 
         if result is None:
             err = mt5.last_error()
-            return False, f"order_send() returned None: {err}", None
+            return False, f"order_send() returned None: {err}", None, 0.0
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            return False, f"Execution failed: retcode={result.retcode} ({result.comment})", None
+            return False, f"Execution failed: retcode={result.retcode} ({result.comment})", None, 0.0
 
+        fill_price = float(result.price) if getattr(result, "price", 0.0) > 0 else float(price)
         logger.info(
-            f"Market {direction} executed on {resolved}! Ticket: {result.order}, Volume: {volume}, Price: {result.price}"
+            f"Market {direction} executed on {resolved}! Ticket: {result.order}, Volume: {volume}, Price: {fill_price}"
         )
-        return True, f"Success! Order #{result.order} opened at {result.price}", result.order
+        return True, f"Success! Order #{result.order} opened at {fill_price}", result.order, fill_price
 
     def execute_limit_order(
         self,
@@ -378,18 +385,18 @@ class MT5Client:
         sl: float,
         tp: float,
         comment: str = "SMC Limit",
-    ) -> Tuple[bool, str, Optional[int]]:
+    ) -> Tuple[bool, str, Optional[int], float]:
         """Places a pending limit order at the specified entry price with filling fallback."""
         if not self.ensure_connection():
-            return False, "Not connected to MT5", None
+            return False, "Not connected to MT5", None, 0.0
 
         resolved = self.resolve_symbol(symbol)
         if not resolved:
-            return False, f"Unknown symbol: {symbol}", None
+            return False, f"Unknown symbol: {symbol}", None, 0.0
 
         sym_info = mt5.symbol_info(resolved)
         if sym_info is None:
-            return False, f"Failed to get symbol info for {resolved}", None
+            return False, f"Failed to get symbol info for {resolved}", None, 0.0
 
         is_buy = direction.upper() == "BUY"
         order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
@@ -432,15 +439,15 @@ class MT5Client:
 
         if result is None:
             err = mt5.last_error()
-            return False, f"order_send() returned None: {err}", None
+            return False, f"order_send() returned None: {err}", None, 0.0
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            return False, f"Pending order failed: retcode={result.retcode} ({result.comment})", None
+            return False, f"Pending order failed: retcode={result.retcode} ({result.comment})", None, 0.0
 
         logger.info(
             f"Limit {direction} placed on {resolved} at {price}! Ticket: {result.order}, Volume: {volume}"
         )
-        return True, f"Limit order #{result.order} placed at {price}", result.order
+        return True, f"Limit order #{result.order} placed at {price}", result.order, float(price)
 
     def get_open_positions(self) -> List[Dict]:
         """Retrieves list of active open positions."""
@@ -477,7 +484,8 @@ class MT5Client:
             return set()
 
         busy = set()
-        from config import DEFAULT_SYMBOLS
+        from config import DEFAULT_SYMBOLS, SYMBOLS
+        all_tracked = set(s.upper() for s in (DEFAULT_SYMBOLS + SYMBOLS))
 
         # 1. Open market positions
         positions = mt5.positions_get()
@@ -485,9 +493,9 @@ class MT5Client:
             for p in positions:
                 busy.add(p.symbol.upper())
                 clean = p.symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(".", "")
-                for base in DEFAULT_SYMBOLS:
-                    if base.upper() in clean:
-                        busy.add(base.upper())
+                for base in all_tracked:
+                    if base in clean:
+                        busy.add(base)
 
         # 2. Pending limit / stop orders
         orders = mt5.orders_get()
@@ -495,16 +503,16 @@ class MT5Client:
             for o in orders:
                 busy.add(o.symbol.upper())
                 clean = o.symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(".", "")
-                for base in DEFAULT_SYMBOLS:
-                    if base.upper() in clean:
-                        busy.add(base.upper())
+                for base in all_tracked:
+                    if base in clean:
+                        busy.add(base)
 
         return busy
 
     def get_closed_deal_info(self, ticket: int) -> Optional[Dict]:
         """
         Checks MT5 deal history for a closed position ticket.
-        Returns deal outcome info if closed, or None if still open.
+        Returns deal outcome info if closed, cancellation info if cancelled pending order, or None if still open.
         """
         if not self.ensure_connection():
             return None
@@ -517,6 +525,28 @@ class MT5Client:
         # Retrieve closing deal from history
         deals = mt5.history_deals_get(position=ticket)
         if not deals:
+            # Check if this was a pending limit order that was cancelled, expired or rejected
+            hist_orders = mt5.history_orders_get(ticket=ticket)
+            if hist_orders and len(hist_orders) > 0:
+                ord_state = getattr(hist_orders[0], "state", -1)
+                # mt5.ORDER_STATE_CANCELED = 2, mt5.ORDER_STATE_REJECTED = 5, mt5.ORDER_STATE_EXPIRED = 6
+                if ord_state in (
+                    mt5.ORDER_STATE_CANCELED,
+                    mt5.ORDER_STATE_REJECTED,
+                    mt5.ORDER_STATE_EXPIRED,
+                ):
+                    return {
+                        "ticket": ticket,
+                        "deal_ticket": ticket,
+                        "status": "CANCELLED",
+                        "profit": 0.0,
+                        "price_close": 0.0,
+                        "reason": ord_state,
+                        "comment": f"Pending order cancelled (state={ord_state})",
+                        "time_open": getattr(hist_orders[0], "time_setup", 0),
+                        "time_close": getattr(hist_orders[0], "time_done", 0),
+                        "time": getattr(hist_orders[0], "time_done", 0),
+                    }
             return None
 
         # Find the exit deal (entry == DEAL_ENTRY_OUT)
@@ -696,6 +726,26 @@ class MT5Client:
         return True, f"✅ Stop Loss dla pozycji #{ticket} ({p.symbol}) przestawiony na Break-Even ({be_price}){offset_desc}!"
 
     @staticmethod
+    def is_position_at_be(
+        entry: float,
+        sl: float,
+        is_buy: bool,
+        initial_sl_dist: float,
+        tolerance_ratio: float = 0.15,
+    ) -> bool:
+        """
+        Checks whether Stop Loss is at Break-Even or in profit.
+        Requires sl > 0 for both BUY and SELL.
+        """
+        if sl <= 0 or entry <= 0 or initial_sl_dist <= 0:
+            return False
+
+        if is_buy:
+            return sl >= (entry - (initial_sl_dist * tolerance_ratio))
+        else:
+            return sl <= (entry + (initial_sl_dist * tolerance_ratio))
+
+    @staticmethod
     def _parse_currencies(symbol_clean: str) -> Tuple[str, str]:
         """
         Parses base and quote currency from standard Forex/Metals pairs.
@@ -705,6 +755,10 @@ class MT5Client:
         for sfx in [".PRO", ".RAW", ".ECN", "PRO.", "RAW.", "M."]:
             sym = sym.replace(sfx, "")
         sym = sym.replace("/", "").replace("_", "").replace("-", "")
+
+        # Handle single-character broker suffixes like EURUSDm, GBPUSDp, USDJPYf
+        if len(sym) == 7 and sym.endswith(("P", "M", "C", "I", "S", "F")):
+            sym = sym[:-1]
 
         if len(sym) == 6:
             return sym[:3], sym[3:]
@@ -911,7 +965,7 @@ class MT5Client:
         profit_r = favorable_move / initial_sl_dist
 
         # Check if SL is moved to BE (within 10% tolerance) or in profit
-        is_be = (sl >= (entry - (initial_sl_dist * 0.1))) if is_buy else (sl <= (entry + (initial_sl_dist * 0.1)))
+        is_be = self.is_position_at_be(entry, sl, is_buy, initial_sl_dist, tolerance_ratio=0.10)
 
         if profit_r >= PYRAMID_MIN_PROFIT_R and is_be:
             return {

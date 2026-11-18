@@ -81,9 +81,10 @@ async def test_all():
         print("   (Uzupełnij .env tokenem od @BotFather, aby otrzymywać powiadomienia)")
     else:
         try:
-            import requests
-            res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=5)
-            data = res.json()
+            import httpx
+            with httpx.Client(timeout=5.0) as http_client:
+                res = http_client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe")
+                data = res.json()
             if data.get("ok"):
                 bot_user = data["result"]["username"]
                 print(f"✅ Bot Telegrama zweryfikowany: @{bot_user}")

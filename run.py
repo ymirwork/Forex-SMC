@@ -47,6 +47,7 @@ async def main():
                 token=TELEGRAM_BOT_TOKEN,
                 alert_channel=TELEGRAM_ALERT_CHANNEL,
                 journal=shared_journal,
+                news_filter=shared_news_filter,
             )
             app = telegram_mgr.build_application()
             await app.initialize()
@@ -76,10 +77,10 @@ async def main():
     # Graceful stop handling
     stop_event = asyncio.Event()
 
-    def signal_handler():
+    def signal_handler(*args):
         logger.info("Received termination signal.")
         scanner.stop()
-        stop_event.set()
+        loop.call_soon_threadsafe(stop_event.set)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -88,7 +89,7 @@ async def main():
         except NotImplementedError:
             # On Windows, add_signal_handler is not implemented by ProactorEventLoop
             try:
-                signal.signal(sig, lambda s, f: signal_handler())
+                signal.signal(sig, signal_handler)
             except Exception:
                 pass
 
@@ -99,11 +100,18 @@ async def main():
     finally:
         logger.info("Shutting down...")
         scanner.stop()
-        if scanner_task:
+        if scanner_task and not scanner_task.done():
             scanner_task.cancel()
+        if telegram_task and not telegram_task.done():
+            telegram_task.cancel()
         if telegram_mgr and telegram_mgr.app:
-            await telegram_mgr.app.stop()
-            await telegram_mgr.app.shutdown()
+            try:
+                if telegram_mgr.app.updater and telegram_mgr.app.updater.running:
+                    await telegram_mgr.app.updater.stop()
+                await telegram_mgr.app.stop()
+                await telegram_mgr.app.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down Telegram app: {e}")
         mt5_client.disconnect()
         logger.info("All services cleanly terminated.")
 

@@ -2,7 +2,9 @@ from datetime import datetime, timezone
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
-import requests
+import httpx
+
+from config import NEWS_WINDOW_MINUTES
 
 logger = logging.getLogger("ForexSMC.NewsFilter")
 
@@ -17,8 +19,8 @@ class NewsFilter:
     API_URL = "https://biquote.io/api/calendar?importance=high"
     CACHE_DURATION_SECONDS = 3600  # Refresh every hour
 
-    def __init__(self, window_minutes: int = 45):
-        self.window_minutes = window_minutes
+    def __init__(self, window_minutes: Optional[int] = None):
+        self.window_minutes = window_minutes if window_minutes is not None else NEWS_WINDOW_MINUTES
         self._cached_events: List[Dict] = []
         self._last_fetch_time: float = 0.0
 
@@ -46,31 +48,32 @@ class NewsFilter:
 
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            res = requests.get(self.API_URL, headers=headers, timeout=8)
-            if res.status_code == 200:
-                raw_data = res.json()
-                parsed = []
-                for item in raw_data:
-                    try:
-                        time_str = item.get("time", "")
-                        if not time_str:
+            with httpx.Client(timeout=8.0) as client:
+                res = client.get(self.API_URL, headers=headers)
+                if res.status_code == 200:
+                    raw_data = res.json()
+                    parsed = []
+                    for item in raw_data:
+                        try:
+                            time_str = item.get("time", "")
+                            if not time_str:
+                                continue
+                            # Standard ISO 8601 UTC
+                            dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                            parsed.append({
+                                "name": item.get("name", "High Impact Event"),
+                                "currency": item.get("currency", "").upper(),
+                                "importance": item.get("importance", "high"),
+                                "datetime_utc": dt,
+                                "forecast": str(item.get("forecast", "")),
+                                "previous": str(item.get("previous", "")),
+                            })
+                        except Exception:
                             continue
-                        # Standard ISO 8601 UTC
-                        dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-                        parsed.append({
-                            "name": item.get("name", "High Impact Event"),
-                            "currency": item.get("currency", "").upper(),
-                            "importance": item.get("importance", "high"),
-                            "datetime_utc": dt,
-                            "forecast": str(item.get("forecast", "")),
-                            "previous": str(item.get("previous", "")),
-                        })
-                    except Exception:
-                        continue
 
-                self._cached_events = parsed
-                self._last_fetch_time = now
-                logger.info(f"Economic calendar refreshed ({len(self._cached_events)} high impact events loaded).")
+                    self._cached_events = parsed
+                    self._last_fetch_time = now
+                    logger.info(f"Economic calendar refreshed ({len(self._cached_events)} high impact events loaded).")
         except Exception as e:
             logger.warning(f"Failed to fetch economic calendar: {e}")
 

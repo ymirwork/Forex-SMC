@@ -36,7 +36,7 @@ class RROptimizer:
         optimized BEST RR from the journal. Otherwise falls back to default_rr.
         """
         if use_optimal_rr and journal is not None:
-            trades = journal.get_all_trades()
+            trades = [t for t in journal.get_all_trades() if t.get("status") in ("CLOSED", "WIN", "LOSS", "BE")]
             if len(trades) >= min_trades:
                 opt_res = RROptimizer.calculate_best_rr(trades)
                 if opt_res and opt_res.best_rr >= 1.0:
@@ -62,9 +62,18 @@ class RROptimizer:
         Runs counter-factual simulation across candidate RR targets from min_rr to max_rr.
         Each trade dict must have: 'max_r' (float), and optionally 'realized_r' (float).
         """
-        if not trades or len(trades) < 2:
+        if not trades:
             return None
 
+        # Filter out OPEN trades so unclosed positions don't skew the win rate and simulation
+        valid_trades = [t for t in trades if t.get("status") in ("CLOSED", "WIN", "LOSS", "BE")]
+        if not valid_trades:
+            valid_trades = [t for t in trades if t.get("status") != "OPEN"]
+
+        if len(valid_trades) < 2:
+            return None
+
+        trades = valid_trades
         total_trades = len(trades)
         actual_realized_r = sum(t.get("realized_r", 0.0) for t in trades)
         actual_wins = sum(1 for t in trades if t.get("realized_r", 0.0) > 0)

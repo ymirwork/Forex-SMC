@@ -13,6 +13,9 @@ from config import (
     ADD_SPREAD_TO_SL,
     DEFAULT_RR_RATIO,
     MIN_TRADES_FOR_OPTIMAL_RR,
+    SL_ATR_MULTIPLIER,
+    SL_CALCULATION_MODE,
+    SL_HYBRID_MIN_ATR_MULT,
     TIGHT_SL_MODE,
     USE_OPTIMAL_RR,
 )
@@ -367,12 +370,28 @@ class ZumikoDetector:
 
         spread_buffer = spread if ADD_SPREAD_TO_SL else 0.0
         effective_buffer = buffer + spread_buffer
+        atr = (df_m15["high"] - df_m15["low"]).tail(14).mean()
 
         entry = c
         if is_buy:
             recent_low = df_m15.iloc[-5:]["low"].min()
             sl_ref = min(recent_low, curr_e21) if TIGHT_SL_MODE else (min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer))
-            sl = sl_ref - effective_buffer
+            structural_sl = sl_ref - effective_buffer
+            structural_risk = entry - structural_sl
+            atr_risk = atr * SL_ATR_MULTIPLIER
+
+            if SL_CALCULATION_MODE == "ATR":
+                sl = entry - (atr_risk + spread_buffer)
+                applied_sl_mode = "ATR"
+            elif SL_CALCULATION_MODE == "HYBRID":
+                min_risk = atr * SL_HYBRID_MIN_ATR_MULT
+                final_risk = max(structural_risk, min_risk)
+                sl = entry - final_risk
+                applied_sl_mode = "HYBRID"
+            else:
+                sl = structural_sl
+                applied_sl_mode = "STRUCTURE"
+
             risk = entry - sl
             if risk <= (point_scale * 5):
                 return None
@@ -384,7 +403,22 @@ class ZumikoDetector:
         else:
             recent_high = df_m15.iloc[-5:]["high"].max()
             sl_ref = max(recent_high, curr_e21) if TIGHT_SL_MODE else (max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer))
-            sl = sl_ref + effective_buffer
+            structural_sl = sl_ref + effective_buffer
+            structural_risk = structural_sl - entry
+            atr_risk = atr * SL_ATR_MULTIPLIER
+
+            if SL_CALCULATION_MODE == "ATR":
+                sl = entry + (atr_risk + spread_buffer)
+                applied_sl_mode = "ATR"
+            elif SL_CALCULATION_MODE == "HYBRID":
+                min_risk = atr * SL_HYBRID_MIN_ATR_MULT
+                final_risk = max(structural_risk, min_risk)
+                sl = entry + final_risk
+                applied_sl_mode = "HYBRID"
+            else:
+                sl = structural_sl
+                applied_sl_mode = "STRUCTURE"
+
             risk = sl - entry
             if risk <= (point_scale * 5):
                 return None
@@ -428,4 +462,5 @@ class ZumikoDetector:
             ema_238=round(curr_e238, digits),
             swing_pattern=swing_pat,
             spread_used=spread_buffer,
+            sl_mode=applied_sl_mode,
         )

@@ -147,6 +147,18 @@ class TradeJournal:
             conn.commit()
             return cur.rowcount > 0
 
+    def cancel_trade_by_ticket(self, mt5_ticket: int, comment: str = "Order cancelled in MT5") -> bool:
+        """Marks a pending trade record as CANCELLED in trades.db."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades
+                SET status = 'CANCELLED', comment = ?
+                WHERE mt5_ticket = ? AND status = 'OPEN'
+            """, (comment, mt5_ticket))
+            conn.commit()
+            return cur.rowcount > 0
+
     def update_trade_max_r(self, mt5_ticket: int, max_r: float):
         """Updates the highest R reached (MFE) for an active trade."""
         with self._get_connection() as conn:
