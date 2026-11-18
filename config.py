@@ -7,9 +7,14 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Support single or multiple allowed Telegram IDs (e.g. channel and user ID)
 raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "0")
-ALLOWED_CHAT_IDS = [
-    int(x.strip().strip("'\"")) for x in raw_chat_id.split(",") if x.strip().strip("'\"") and x.strip().strip("'\"") != "0"
-]
+ALLOWED_CHAT_IDS = []
+for x in raw_chat_id.split(","):
+    clean_val = x.strip().strip("'\"")
+    if clean_val and clean_val != "0":
+        try:
+            ALLOWED_CHAT_IDS.append(int(clean_val))
+        except ValueError:
+            pass
 # Primary destination channel for alerts (first negative ID, or first ID)
 TELEGRAM_ALERT_CHANNEL = next(
     (cid for cid in ALLOWED_CHAT_IDS if cid < 0),
@@ -42,11 +47,15 @@ SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).sp
 def clean_symbol(symbol: str) -> str:
     """
     Normalizes a broker symbol to standard clean uppercase ticker:
-    e.g. 'EURUSD.pro' -> 'EURUSD', 'XAUUSD.raw' -> 'XAUUSD', 'EURUSDm' -> 'EURUSD'.
+    e.g. 'EURUSD.pro' -> 'EURUSD', 'XAUUSD.raw' -> 'XAUUSD', 'EURUSDm' -> 'EURUSD', 'pro.EURUSD' -> 'EURUSD'.
     """
     if not symbol:
         return ""
     clean = symbol.upper().strip()
+    for prefix in ["PRO.", "RAW.", "ECN.", "M.", "PRO_", "RAW_", "ECN_"]:
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
     for suffix in [".PRO", ".RAW", ".ECN", ".F", "_PRO", "_RAW", ".STP", ".C"]:
         if clean.endswith(suffix):
             clean = clean[:-len(suffix)]

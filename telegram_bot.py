@@ -752,7 +752,7 @@ class TelegramBotManager:
                     "realized_r": 0.0,
                     "max_r": 0.0,
                     "confluence_score": setup.confluence_score,
-                    "status": "OPEN",
+                    "status": "PENDING",
                     "mt5_ticket": ticket,
                     "strategy": strat_name_db,
                     "grade": grade_val,
@@ -949,45 +949,99 @@ class TelegramBotManager:
             if chart_path and os.path.exists(chart_path):
                 with open(chart_path, "rb") as photo:
                     if len(caption) <= 1024:
-                        await self.app.bot.send_photo(
-                            chat_id=target_chat,
-                            photo=photo,
-                            caption=caption,
-                            parse_mode="Markdown",
-                            reply_markup=reply_markup,
-                        )
+                        try:
+                            await self.app.bot.send_photo(
+                                chat_id=target_chat,
+                                photo=photo,
+                                caption=caption,
+                                parse_mode="Markdown",
+                                reply_markup=reply_markup,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to send photo with Markdown, retrying plain text: {e}")
+                            photo.seek(0)
+                            await self.app.bot.send_photo(
+                                chat_id=target_chat,
+                                photo=photo,
+                                caption=caption,
+                                parse_mode=None,
+                                reply_markup=reply_markup,
+                            )
                     else:
                         # Truncate cleanly at 1000 characters to never exceed Telegram 1024 limit
                         safe_caption = caption[:1000].rsplit("\n", 1)[0]
-                        msg = await self.app.bot.send_photo(
+                        if safe_caption.count("`") % 2 != 0:
+                            safe_caption += "`"
+                        if safe_caption.count("**") % 2 != 0:
+                            safe_caption += "**"
+                        try:
+                            msg = await self.app.bot.send_photo(
+                                chat_id=target_chat,
+                                photo=photo,
+                                caption=safe_caption,
+                                parse_mode="Markdown",
+                                reply_markup=reply_markup,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to send truncated photo alert with Markdown: {e}")
+                            photo.seek(0)
+                            msg = await self.app.bot.send_photo(
+                                chat_id=target_chat,
+                                photo=photo,
+                                caption=safe_caption,
+                                parse_mode=None,
+                                reply_markup=reply_markup,
+                            )
+                        # Send full specification as follow-up reply (capped to fit Telegram limit)
+                        follow_up = f"📋 **Szczegóły setupu:**\n\n{caption}"
+                        if len(follow_up) > 4000:
+                            follow_up = follow_up[:3996] + "..."
+                        try:
+                            await self.app.bot.send_message(
+                                chat_id=target_chat,
+                                text=follow_up,
+                                parse_mode="Markdown",
+                                reply_to_message_id=msg.message_id,
+                            )
+                        except Exception:
+                            await self.app.bot.send_message(
+                                chat_id=target_chat,
+                                text=follow_up,
+                                parse_mode=None,
+                                reply_to_message_id=msg.message_id,
+                            )
+            else:
+                if len(caption) <= 4096:
+                    try:
+                        await self.app.bot.send_message(
                             chat_id=target_chat,
-                            photo=photo,
-                            caption=safe_caption,
+                            text=caption,
                             parse_mode="Markdown",
                             reply_markup=reply_markup,
                         )
-                        # Send full specification as follow-up reply
+                    except Exception:
                         await self.app.bot.send_message(
                             chat_id=target_chat,
-                            text=f"📋 **Szczegóły setupu:**\n\n{caption}",
-                            parse_mode="Markdown",
-                            reply_to_message_id=msg.message_id,
+                            text=caption,
+                            parse_mode=None,
+                            reply_markup=reply_markup,
                         )
-            else:
-                if len(caption) <= 4096:
-                    await self.app.bot.send_message(
-                        chat_id=target_chat,
-                        text=caption,
-                        parse_mode="Markdown",
-                        reply_markup=reply_markup,
-                    )
                 else:
-                    await self.app.bot.send_message(
-                        chat_id=target_chat,
-                        text=caption[:4000],
-                        parse_mode="Markdown",
-                        reply_markup=reply_markup,
-                    )
+                    safe_msg = caption[:4000]
+                    try:
+                        await self.app.bot.send_message(
+                            chat_id=target_chat,
+                            text=safe_msg,
+                            parse_mode="Markdown",
+                            reply_markup=reply_markup,
+                        )
+                    except Exception:
+                        await self.app.bot.send_message(
+                            chat_id=target_chat,
+                            text=safe_msg,
+                            parse_mode=None,
+                            reply_markup=reply_markup,
+                        )
             logger.info(f"Alert sent to Telegram for {setup.symbol} [{setup.direction}]")
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")

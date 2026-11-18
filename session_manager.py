@@ -105,13 +105,18 @@ class SessionManager:
         ]
 
         if asia_candles.empty:
-            # Fallback to previous day's Asian session
-            prev_date = latest_date - pd.Timedelta(days=1)
-            asia_candles = df_copy[
-                (df_copy["time_utc"].dt.date == prev_date) &
-                (df_copy["time_utc"].dt.hour >= 0) &
-                (df_copy["time_utc"].dt.hour < 7)
-            ]
+            # Fallback to the most recent previous trading day with Asian session data (e.g. Friday on Monday)
+            unique_dates = sorted(df_copy["time_utc"].dt.date.unique(), reverse=True)
+            for prev_date in unique_dates:
+                if prev_date < latest_date:
+                    past_asia = df_copy[
+                        (df_copy["time_utc"].dt.date == prev_date) &
+                        (df_copy["time_utc"].dt.hour >= 0) &
+                        (df_copy["time_utc"].dt.hour < 7)
+                    ]
+                    if not past_asia.empty:
+                        asia_candles = past_asia
+                        break
 
         if not asia_candles.empty:
             asia_high = float(asia_candles["high"].max())

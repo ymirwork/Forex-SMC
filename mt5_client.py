@@ -266,7 +266,7 @@ class MT5Client:
             return sym.volume_min
 
         if PROP_FIRM_MODE:
-            risk_percent = PROP_RISK_PER_TRADE_PERCENT
+            risk_percent = min(risk_percent, PROP_RISK_PER_TRADE_PERCENT)
         elif risk_percent > MAX_RISK_PERCENT:
             logger.warning(
                 f"Requested risk {risk_percent}% exceeds MAX_RISK_PERCENT ({MAX_RISK_PERCENT}%). Capping risk."
@@ -770,14 +770,7 @@ class MT5Client:
         Parses base and quote currency from standard Forex/Metals pairs.
         E.g. EURUSD -> ('EUR', 'USD'), XAUUSD -> ('XAU', 'USD'), USDJPY -> ('USD', 'JPY')
         """
-        sym = symbol_clean.upper()
-        for sfx in [".PRO", ".RAW", ".ECN", "PRO.", "RAW.", "M."]:
-            sym = sym.replace(sfx, "")
-        sym = sym.replace("/", "").replace("_", "").replace("-", "")
-
-        # Handle single-character broker suffixes like EURUSDm, GBPUSDp, USDJPYf
-        if len(sym) == 7 and sym.endswith(("P", "M", "C", "I", "S", "F")):
-            sym = sym[:-1]
+        sym = clean_symbol(symbol_clean)
 
         if len(sym) == 6:
             return sym[:3], sym[3:]
@@ -1146,6 +1139,13 @@ class MT5Client:
         vol_min = sym_info.volume_min
         vol_max = sym_info.volume_max
         vol_step = sym_info.volume_step if sym_info.volume_step > 0 else 0.01
+
+        # Strict risk check: if minimum lot exceeds allowed risk, reject pyramid scale-in
+        if (vol_min * loss_per_lot) > allowed_risk_usd:
+            return 0.0, round(total_locked_usd, 2), round(allowed_risk_usd, 2), (
+                f"Minimalny wolumen ({vol_min}) ryzykuje {vol_min * loss_per_lot:.2f} USD, "
+                f"przekraczając dozwolone ryzyko dokładki ({allowed_risk_usd:.2f} USD)"
+            )
 
         calc_lot = round(calc_lot / vol_step) * vol_step
         calc_lot = max(vol_min, min(vol_max, calc_lot))

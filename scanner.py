@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import MetaTrader5 as mt5
 
 from chart_generator import ChartGenerator
@@ -92,6 +92,7 @@ class SMCScanner:
         self._last_alert_by_symbol: Dict[Tuple[str, str], float] = {}
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
+        self._htf_cache: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
         self.notion = NotionJournal()
         self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
         self._cleanup_old_charts(max_days=3)
@@ -125,6 +126,24 @@ class SMCScanner:
         for k in expired_symbols:
             del self._last_alert_by_symbol[k]
         self._cleanup_old_charts()
+
+    def _fetch_cached_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        n_bars: int,
+        max_age_seconds: float = 1800.0,
+    ) -> Optional[object]:
+        """Caches slower HTF candles (D1, W1) to eliminate redundant MT5 IPC queries."""
+        key = (symbol.upper(), timeframe.upper())
+        now = time.time()
+        cached = self._htf_cache.get(key)
+        if cached and (now - cached[0]) < max_age_seconds:
+            return cached[1]
+        df = self.mt5_client.fetch_ohlcv(symbol, timeframe, n_bars)
+        if df is not None and not df.empty:
+            self._htf_cache[key] = (now, df)
+        return df
 
     async def monitor_open_trades(self):
         """
@@ -196,6 +215,7 @@ class SMCScanner:
             # Check if pending order was cancelled in MT5
             closed_info = self.mt5_client.get_closed_deal_info(ticket)
             if closed_info and closed_info.get("status") == "CANCELLED":
+                self._be_moved_tickets.discard(ticket)
                 self.journal.cancel_trade_by_ticket(
                     ticket,
                     comment=closed_info.get("comment", "Zlecenie oczekujące anulowane w MT5"),
@@ -227,6 +247,7 @@ class SMCScanner:
             closed_info = self.mt5_client.get_closed_deal_info(ticket)
             if closed_info:
                 if closed_info.get("status") == "CANCELLED":
+                    self._be_moved_tickets.discard(ticket)
                     self.journal.cancel_trade_by_ticket(
                         ticket,
                         comment=closed_info.get("comment", "Zlecenie oczekujące anulowane w MT5"),
@@ -283,6 +304,7 @@ class SMCScanner:
                 max_r = max(calc_mfe, realized_r, float(t.get("max_r") or 0.0))
 
                 comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD | Max R: {max_r:.2f}R"
+                self._be_moved_tickets.discard(ticket)
                 self.journal.close_trade_by_ticket(ticket, realized_r, max_r=max_r, status=status, comment=comment_str)
 
                 # Record close-time telemetry
@@ -449,8 +471,8 @@ class SMCScanner:
                 df_ltf = self.mt5_client.fetch_ohlcv(sym, LTF_TIMEFRAME, scan_bars)
                 df_h1 = self.mt5_client.fetch_ohlcv(sym, "H1", scan_bars)
                 df_htf = self.mt5_client.fetch_ohlcv(sym, HTF_TIMEFRAME, scan_bars)
-                df_d1 = self.mt5_client.fetch_ohlcv(sym, "D1", 10)
-                df_w1 = self.mt5_client.fetch_ohlcv(sym, "W1", 5)
+                df_d1 = self._fetch_cached_ohlcv(sym, "D1", 10, max_age_seconds=1800.0)
+                df_w1 = self._fetch_cached_ohlcv(sym, "W1", 5, max_age_seconds=7200.0)
 
                 if df_ltf is None or df_htf is None:
                     continue

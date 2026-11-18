@@ -60,6 +60,7 @@ class TradeInsightEngine:
         self.journal = journal
         self.min_sample_size = min_sample_size
         self._edge_cache: Dict[str, List[EdgeMetrics]] = {}
+        self._cached_closed_trades: List[Dict] = []
         self._last_refresh_count: int = 0
 
     def _get_closed_trades(self) -> List[Dict]:
@@ -103,6 +104,7 @@ class TradeInsightEngine:
     def refresh_edge_data(self) -> Dict[str, List[EdgeMetrics]]:
         """Recomputes all edge matrices from closed trades."""
         trades = self._get_closed_trades()
+        self._cached_closed_trades = trades
         if len(trades) == self._last_refresh_count and self._edge_cache:
             return self._edge_cache
         self._last_refresh_count = len(trades)
@@ -266,7 +268,7 @@ class TradeInsightEngine:
                 )
 
         # Check symbol+session cross
-        closed = self._get_closed_trades()
+        closed = self._cached_closed_trades or self._get_closed_trades()
         sym_sess_trades = [
             t for t in closed
             if t.get("symbol", "").upper() == symbol.upper()

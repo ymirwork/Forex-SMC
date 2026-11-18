@@ -7,6 +7,8 @@ import matplotlib.patches as patches
 import pandas as pd
 from smc_detector import TradeSetup
 
+plt.style.use("dark_background")
+
 
 class ChartGenerator:
     """Generates professional dark-themed candlestick charts with SMC zone overlays and Fibonacci levels."""
@@ -32,8 +34,6 @@ class ChartGenerator:
         if plot_df.empty:
             return None
 
-        # Dark theme style setup
-        plt.style.use("dark_background")
         fig, ax = plt.subplots(figsize=(13, 7.0), dpi=150)
         try:
             fig.patch.set_facecolor("#131722")

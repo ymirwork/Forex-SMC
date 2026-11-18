@@ -398,20 +398,40 @@ class NotionJournal:
 
     async def _find_page_id_by_ticket(self, ticket: int) -> Optional[str]:
         """Queries Notion database for a page containing the MT5 ticket."""
+        await self._fetch_schema_if_needed()
         url = f"{self.BASE_URL}/databases/{self.database_id}/query"
-        payload = {
-            "page_size": 20,
-        }
+        ticket_str = str(ticket)
+
+        title_col = None
+        if self._db_properties:
+            for orig_name, p_type in self._db_properties.values():
+                if p_type == "title":
+                    title_col = orig_name
+                    break
+
+        payload: Dict[str, Any] = {"page_size": 20}
+        if title_col:
+            payload["filter"] = {
+                "property": title_col,
+                "title": {
+                    "contains": f"#{ticket_str}"
+                }
+            }
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.post(url, headers=self._get_headers(), json=payload)
+                # If filtered query failed (e.g. schema mismatch), fallback to broad search
+                if res.status_code != 200 and "filter" in payload:
+                    del payload["filter"]
+                    payload["page_size"] = 100
+                    res = await client.post(url, headers=self._get_headers(), json=payload)
+
                 if res.status_code == 200:
                     results = res.json().get("results", [])
-                    ticket_str = str(ticket)
                     for page in results:
-                        # Inspect properties for the ticket
                         props = page.get("properties", {})
-                        for _, p_val in props.items():
+                        for p_val in props.values():
                             p_type = p_val.get("type")
                             if p_type == "title":
                                 title_texts = p_val.get("title", [])
@@ -421,6 +441,8 @@ class NotionJournal:
                                 rich_texts = p_val.get("rich_text", [])
                                 if any(ticket_str in t.get("plain_text", "") for t in rich_texts):
                                     return page.get("id")
+                            elif p_type == "number" and p_val.get("number") == ticket:
+                                return page.get("id")
         except Exception as e:
             logger.error(f"Error searching Notion by ticket: {e}")
         return None

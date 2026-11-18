@@ -184,14 +184,54 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 strat = "SMC"
                 grade = "A"
 
+            # Determine true direction and prices from opening deal in MT5 history
+            direction = "BUY"
+            entry_p = 0.0
+            sl_p = 0.0
+            tp_p = 0.0
+            open_deals = mt5.history_deals_get(position=ticket)
+            if open_deals:
+                for od in open_deals:
+                    if getattr(od, "entry", -1) == 0:  # DEAL_ENTRY_IN
+                        direction = "BUY" if od.type == mt5.DEAL_TYPE_BUY else "SELL"
+                        entry_p = float(od.price)
+                        break
+            elif "BUY" in (d.get("comment") or "").upper():
+                direction = "BUY"
+            elif "SELL" in (d.get("comment") or "").upper():
+                direction = "SELL"
+
+            hist_orders = mt5.history_orders_get(position=ticket)
+            if hist_orders and len(hist_orders) > 0:
+                sl_p = float(getattr(hist_orders[0], "sl", 0.0) or 0.0)
+                tp_p = float(getattr(hist_orders[0], "tp", 0.0) or 0.0)
+
+            risk_dist = abs(entry_p - sl_p) if (entry_p > 0 and sl_p > 0) else 0.0
+            price_close = d.get("price_close", 0.0)
+            if risk_dist > 0 and price_close > 0:
+                p_diff = (price_close - entry_p) if direction == "BUY" else (entry_p - price_close)
+                realized_r = round(p_diff / risk_dist, 2)
+            else:
+                realized_r = 1.8 if profit > 0 else (-1.0 if profit < 0 else 0.0)
+
+            calc_mfe = client.get_position_mfe(
+                symbol=d["symbol"],
+                is_buy=(direction == "BUY"),
+                entry_price=entry_p,
+                initial_sl_price=sl_p,
+                time_open=open_deals[0].time if (open_deals and len(open_deals) > 0) else 0,
+                time_close=d["time_close"],
+            ) if (entry_p > 0 and sl_p > 0) else 0.0
+            max_r = max(calc_mfe, realized_r if realized_r > 0 else 0.0)
+
             tid = journal.add_trade(
                 symbol=raw_sym,
-                direction="BUY" if "BUY" in (d.get("comment") or "").upper() else "SELL",
-                entry_price=0.0,
-                sl_price=0.0,
-                tp_price=0.0,
+                direction=direction,
+                entry_price=entry_p,
+                sl_price=sl_p,
+                tp_price=tp_p,
                 realized_r=realized_r,
-                max_r=realized_r if realized_r > 0 else 0.0,
+                max_r=max_r,
                 confluence_score=80,
                 status=status,
                 chart_path=None,
@@ -222,8 +262,15 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 notion_pages = res.json().get("results", [])
                 notion_by_ticket: Dict[int, Dict[str, Any]] = {}
                 for p in notion_pages:
-                    name_p = p.get("properties", {}).get("Name", {}).get("title", [])
-                    title = name_p[0]["plain_text"] if name_p else ""
+                    props = p.get("properties", {})
+                    # Dynamically locate title property regardless of column name
+                    title = ""
+                    for prop_val in props.values():
+                        if prop_val.get("type") == "title":
+                            title_list = prop_val.get("title", [])
+                            title = title_list[0]["plain_text"] if title_list else ""
+                            break
+
                     # Title format: #<ticket> <symbol>
                     if title.startswith("#"):
                         try:

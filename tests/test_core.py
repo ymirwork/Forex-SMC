@@ -19,6 +19,8 @@ class TestCurrencyParsing(unittest.TestCase):
         self.assertEqual(MT5Client._parse_currencies("EURUSD.pro"), ("EUR", "USD"))
         self.assertEqual(MT5Client._parse_currencies("EURUSD.raw"), ("EUR", "USD"))
         self.assertEqual(MT5Client._parse_currencies("pro.EURUSD"), ("EUR", "USD"))
+        self.assertEqual(MT5Client._parse_currencies("EURUSD.stp"), ("EUR", "USD"))
+        self.assertEqual(MT5Client._parse_currencies("EURUSD.c"), ("EUR", "USD"))
 
     def test_single_char_suffixes(self):
         # Exness (m), Roboforex (p), IC Markets (f)
@@ -264,6 +266,167 @@ class TestAuthorizationSecurity(unittest.TestCase):
         update_unauth.effective_chat.id = -100999999
         update_unauth.callback_query.message.chat.id = -100999999
         self.assertFalse(bot._is_authorized(update_unauth))
+
+
+class TestPropFirmRiskMin(unittest.TestCase):
+    @patch("MetaTrader5.symbol_info")
+    @patch("MetaTrader5.account_info")
+    @patch.object(MT5Client, "ensure_connection", return_value=True)
+    def test_edge_filter_reduced_risk_preserved_in_prop_mode(self, mock_conn, mock_acc, mock_sym):
+        from config import PROP_RISK_PER_TRADE_PERCENT
+        sym_mock = MagicMock()
+        sym_mock.digits = 5
+        sym_mock.point = 0.00001
+        sym_mock.trade_tick_value = 1.0
+        sym_mock.trade_tick_size = 0.00001
+        sym_mock.volume_min = 0.01
+        sym_mock.volume_max = 100.0
+        sym_mock.volume_step = 0.01
+        mock_sym.return_value = sym_mock
+
+        acc_mock = MagicMock()
+        acc_mock.balance = 10000.0
+        acc_mock.currency = "USD"
+        mock_acc.return_value = acc_mock
+
+        client = MT5Client()
+        lot_full = client.calculate_lot_size("EURUSD", PROP_RISK_PER_TRADE_PERCENT, 1.07800, 1.08000)
+        lot_halved = client.calculate_lot_size("EURUSD", 0.25, 1.07800, 1.08000)
+        self.assertLess(lot_halved, lot_full)
+        self.assertAlmostEqual(lot_halved, lot_full * 0.5, delta=0.02)
+
+
+class TestPyramidMinLotRiskProtection(unittest.TestCase):
+    @patch("MetaTrader5.symbol_info")
+    @patch("MetaTrader5.account_info")
+    @patch.object(MT5Client, "ensure_connection", return_value=True)
+    def test_pyramid_rejects_when_min_lot_exceeds_locked_risk(self, mock_conn, mock_acc, mock_sym):
+        sym_mock = MagicMock()
+        sym_mock.digits = 5
+        sym_mock.point = 0.00001
+        sym_mock.trade_tick_value = 1.0
+        sym_mock.trade_tick_size = 0.00001
+        sym_mock.volume_min = 0.01
+        sym_mock.volume_max = 100.0
+        sym_mock.volume_step = 0.01
+        mock_sym.return_value = sym_mock
+
+        acc_mock = MagicMock()
+        acc_mock.balance = 1000.0
+        mock_acc.return_value = acc_mock
+
+        cluster_status = {
+            "direction": "BUY",
+            "next_level": 2,
+            "positions": [
+                {
+                    "ticket": 101,
+                    "symbol": "EURUSD",
+                    "type": "BUY",
+                    "price_open": 1.08000,
+                    "volume": 0.01,
+                    "sl": 1.08010,
+                }
+            ],
+        }
+        client = MT5Client()
+        lot, locked, allowed, reason = client.calculate_pyramid_position_size(
+            symbol="EURUSD",
+            entry_price=1.08200,
+            sl_price=1.08010,
+            setup_grade="A+",
+            cluster_status=cluster_status,
+        )
+        self.assertEqual(lot, 0.0)
+        self.assertIn("przekraczając dozwolone ryzyko", reason)
+
+
+class TestAsianRangeMondayFallback(unittest.TestCase):
+    def test_monday_fallback_to_friday(self):
+        fri_bars = pd.date_range("2026-11-13 00:00", "2026-11-13 06:45", freq="15min")
+        mon_bars = pd.date_range("2026-11-16 08:00", "2026-11-16 09:30", freq="15min")
+        times = list(fri_bars) + list(mon_bars)
+
+        highs = [1.0950 if i == 5 else 1.0930 for i in range(len(times))]
+        lows = [1.0910 if i == 10 else 1.0920 for i in range(len(times))]
+        closes = [1.0925] * len(times)
+
+        df = pd.DataFrame({"time": times, "high": highs, "low": lows, "close": closes})
+
+        with patch("session_manager.get_broker_utc_offset", return_value=0):
+            # Monday at 09:30 (today's Asian session candles are absent from df, falls back to Friday)
+            asia_h, asia_l = SessionManager.calculate_asian_range(df)
+            self.assertEqual(asia_h, 1.0950)
+            self.assertEqual(asia_l, 1.0910)
+
+
+class TestTelegramCallbacksAndOrderExecution(unittest.IsolatedAsyncioTestCase):
+    async def test_callback_dismiss_mutes_symbol(self):
+        from telegram_bot import TelegramBotManager
+        from smc_detector import TradeSetup
+        mt5_mock = MagicMock()
+        journal_mock = MagicMock()
+        bot = TelegramBotManager(mt5_mock, token="dummy", alert_channel=-100123, allowed_ids=[123456], journal=journal_mock)
+
+        setup = MagicMock(spec=TradeSetup)
+        setup.symbol = "EURUSD"
+        setup.direction = "BUY"
+        bot.pending_setups["setup_1"] = setup
+        bot.pending_setups_time["setup_1"] = 1000
+
+        update = MagicMock()
+        update.effective_user.id = 123456
+        update.effective_chat.id = -100123
+        update.callback_query.data = "dismiss:setup_1"
+        update.callback_query.message.caption = "Old caption"
+        update.callback_query.answer = unittest.mock.AsyncMock()
+        update.callback_query.edit_message_caption = unittest.mock.AsyncMock()
+
+        await bot.handle_callback(update, MagicMock())
+
+        self.assertTrue(bot.is_symbol_muted("EURUSD", "BUY"))
+        self.assertNotIn("setup_1", bot.pending_setups)
+
+    async def test_callback_limit_order_logs_as_pending(self):
+        from telegram_bot import TelegramBotManager
+        from smc_detector import TradeSetup
+        mt5_mock = MagicMock()
+        mt5_mock.execute_limit_order.return_value = (True, "OK", 777001, 1.0850)
+        mt5_mock.calculate_lot_size.return_value = 0.1
+        mt5_mock.can_open_new_trade.return_value = (True, "OK")
+
+        journal_mock = MagicMock()
+        bot = TelegramBotManager(mt5_mock, token="dummy", alert_channel=-100123, allowed_ids=[123456], journal=journal_mock)
+
+        setup = MagicMock(spec=TradeSetup)
+        setup.symbol = "EURUSD"
+        setup.direction = "BUY"
+        setup.entry_price = 1.0850
+        setup.sl_price = 1.0820
+        setup.tp1_price = 1.0910
+        setup.confluence_score = 80
+        setup.setup_type = "M15 CHoCH"
+        setup.strategy_name = "SMC"
+        setup.is_pyramid = False
+        bot.pending_setups["setup_2"] = setup
+        bot.pending_setups_time["setup_2"] = 1000
+
+        update = MagicMock()
+        update.effective_user.id = 123456
+        update.effective_chat.id = -100123
+        update.callback_query.data = "limit:setup_2"
+        update.callback_query.message.caption = "Old caption"
+        update.callback_query.answer = unittest.mock.AsyncMock()
+        update.callback_query.edit_message_caption = unittest.mock.AsyncMock()
+
+        with patch.object(bot.news_filter, "check_news_async", unittest.mock.AsyncMock(return_value=(False, None, None))):
+            await bot.handle_callback(update, MagicMock())
+
+        mt5_mock.execute_limit_order.assert_called_once()
+        journal_mock.add_trade.assert_called_once()
+        _, kwargs = journal_mock.add_trade.call_args
+        self.assertEqual(kwargs.get("status"), "PENDING")
+        self.assertEqual(kwargs.get("mt5_ticket"), 777001)
 
 
 if __name__ == "__main__":
