@@ -56,6 +56,9 @@ class TradeSetup:
     ema_slow: float = 0.0
     ema_238: float = 0.0
     swing_pattern: str = ""
+    is_pyramid: bool = False
+    parent_ticket: Optional[int] = None
+    pyramid_profit_r: float = 0.0
 
 
 class SMCDetector:

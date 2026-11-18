@@ -104,5 +104,14 @@ ENABLE_NOTION = os.getenv("ENABLE_NOTION", "False").lower() in ("true", "1")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 
+# ==========================================
+# RISK-NEUTRAL PYRAMIDING SETTINGS (SCALE-IN)
+# ==========================================
+ENABLE_PYRAMIDING = os.getenv("ENABLE_PYRAMIDING", "True").lower() in ("true", "1")
+MAX_PYRAMID_LEVEL = int(os.getenv("MAX_PYRAMID_LEVEL", "2"))               # Max 2 concurrent positions per symbol (Base + 1 scale-in)
+PYRAMID_MIN_PROFIT_R = float(os.getenv("PYRAMID_MIN_PROFIT_R", "1.0"))     # Base position must have reached at least +1.0R
+PYRAMID_LOCK_PREVIOUS_PROFIT = os.getenv("PYRAMID_LOCK_PREVIOUS_PROFIT", "True").lower() in ("true", "1") # Lock profit on parent trade
+
+
 
 

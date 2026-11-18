@@ -5,14 +5,18 @@ import MetaTrader5 as mt5
 
 from config import (
     DEFAULT_RISK_PERCENT,
+    ENABLE_PYRAMIDING,
+    MAX_PYRAMID_LEVEL,
     MAX_RISK_DEVIATION_TOLERANCE,
     PROP_FIRM_MODE,
     PROP_INITIAL_BALANCE,
     PROP_MAX_DRAWDOWN_PERCENT,
-    PROP_SAFETY_BUFFER_PERCENT,
-    PROP_RISK_PER_TRADE_PERCENT,
     PROP_MAX_OPEN_TRADES,
     PROP_MAX_SAME_CURRENCY_TRADES,
+    PROP_RISK_PER_TRADE_PERCENT,
+    PROP_SAFETY_BUFFER_PERCENT,
+    PYRAMID_LOCK_PREVIOUS_PROFIT,
+    PYRAMID_MIN_PROFIT_R,
 )
 
 logger = logging.getLogger("ForexSMC.MT5Client")
@@ -451,6 +455,7 @@ class MT5Client:
                 "tp": p.tp,
                 "profit": p.profit,
                 "comment": p.comment,
+                "time": p.time,
             })
         return res
 
@@ -523,10 +528,67 @@ class MT5Client:
                 "price_close": exit_deal.price,
                 "reason": exit_deal.reason,  # 4 is SL, 5 is TP, 0/1/3 is Client/Mobile/Expert
                 "comment": exit_deal.comment,
+                "time_open": deals[0].time if len(deals) > 0 else exit_deal.time,
+                "time_close": exit_deal.time,
                 "time": exit_deal.time,
             }
 
         return None
+
+    def get_initial_sl(self, ticket: int) -> float:
+        """Returns the original Stop Loss set when the position was opened."""
+        if not self.ensure_connection():
+            return 0.0
+        orders = mt5.history_orders_get(position=ticket)
+        if orders and len(orders) > 0 and orders[0].sl > 0:
+            return float(orders[0].sl)
+        pos = mt5.positions_get(ticket=ticket)
+        if pos and len(pos) > 0:
+            return float(pos[0].sl)
+        return 0.0
+
+    def get_position_mfe(
+        self,
+        symbol: str,
+        is_buy: bool,
+        entry_price: float,
+        initial_sl_price: float,
+        time_open: int,
+        time_close: Optional[int] = None,
+    ) -> float:
+        """
+        Calculates the Maximum Favorable Excursion (Max R) reached by a position
+        between time_open and time_close (or current tick time).
+        """
+        if not self.ensure_connection():
+            return 0.0
+
+        risk_dist = abs(entry_price - initial_sl_price)
+        if risk_dist <= 0:
+            return 0.0
+
+        resolved = self.resolve_symbol(symbol)
+        if time_close is None:
+            tick = mt5.symbol_info_tick(resolved)
+            time_close = tick.time if tick else int(datetime.now().timestamp())
+
+        if time_open >= time_close:
+            return 0.0
+
+        rates = mt5.copy_rates_range(resolved, mt5.TIMEFRAME_M5, time_open, time_close)
+        if rates is None or len(rates) == 0:
+            rates = mt5.copy_rates_range(resolved, mt5.TIMEFRAME_M1, time_open, time_close)
+
+        if rates is not None and len(rates) > 0:
+            if is_buy:
+                peak_price = float(max(r["high"] for r in rates))
+                favorable_move = max(0.0, peak_price - entry_price)
+            else:
+                peak_price = float(min(r["low"] for r in rates))
+                favorable_move = max(0.0, entry_price - peak_price)
+            return round(favorable_move / risk_dist, 2)
+
+        return 0.0
 
     def move_sl_to_breakeven(self, ticket: int) -> Tuple[bool, str]:
         """
@@ -638,13 +700,18 @@ class MT5Client:
             "risk_per_trade_pct": PROP_RISK_PER_TRADE_PERCENT,
         }
 
-    def can_open_new_trade(self, symbol: str, sl_distance: float = 0.0) -> Tuple[bool, str]:
+    def can_open_new_trade(
+        self,
+        symbol: str,
+        sl_distance: float = 0.0,
+        is_pyramid: bool = False,
+    ) -> Tuple[bool, str]:
         """
         Enforces Prop Firm risk boundaries and Scalable Lot Risk:
         1. Static Max Drawdown Breach
         2. Safety Halt threshold
         3. Max open concurrent trades
-        4. Currency correlation limit
+        4. Currency correlation limit (bypassed if scaling into existing position)
         5. Scalable % Risk vs Minimum Lot Constraint
         """
         if not PROP_FIRM_MODE:
@@ -677,7 +744,9 @@ class MT5Client:
                 f"Poczekaj na zamknięcie lub przestawienie pozycji na BE.",
             )
 
-        if PROP_MAX_SAME_CURRENCY_TRADES > 0:
+        # Correlation shield is only for BRAND NEW currency exposure.
+        # If scaling into an existing trade (pyramid), we are not adding new currency pairs.
+        if PROP_MAX_SAME_CURRENCY_TRADES > 0 and not is_pyramid:
             base_curr, quote_curr = self._parse_currencies(symbol)
             base_count = 0
             quote_count = 0
@@ -726,4 +795,122 @@ class MT5Client:
                     )
 
         return True, "OK"
+
+    def get_pyramid_status(self, symbol: str) -> dict:
+        """
+        Checks if an active position on `symbol` qualifies for risk-neutral pyramiding:
+        1. Open positions on this symbol < MAX_PYRAMID_LEVEL (e.g. 1 position open).
+        2. The active base position has reached at least +1.0R in profit.
+        3. The active base position has its SL at or better than Break-Even (0 risk).
+        """
+        if not ENABLE_PYRAMIDING or not self.ensure_connection():
+            return {"is_eligible": False, "count": 0}
+
+        clean_sym = symbol.upper().replace(".PRO", "").replace(".RAW", "")
+        open_positions = self.get_open_positions()
+
+        sym_positions = [
+            p for p in open_positions
+            if p["symbol"].upper().replace(".PRO", "").replace(".RAW", "") == clean_sym
+        ]
+
+        count = len(sym_positions)
+        if count == 0:
+            return {"is_eligible": False, "count": 0}
+
+        if count >= MAX_PYRAMID_LEVEL:
+            return {"is_eligible": False, "count": count, "reason": f"Osiągnięto limit piramidy ({count}/{MAX_PYRAMID_LEVEL})"}
+
+        base_pos = sym_positions[0]
+        base_ticket = base_pos["ticket"]
+        entry = base_pos["price_open"]
+        curr = base_pos["price_current"]
+        sl = base_pos["sl"]
+        is_buy = base_pos["type"] == "BUY"
+
+        orig_sl = self.get_initial_sl(base_ticket)
+        if orig_sl <= 0 and sl > 0:
+            orig_sl = sl
+
+        if orig_sl <= 0 or entry <= 0:
+            return {"is_eligible": False, "count": count, "reason": "Brak SL na pozycji bazowej"}
+
+        initial_sl_dist = abs(entry - orig_sl)
+        if initial_sl_dist <= 0:
+            return {"is_eligible": False, "count": count, "reason": "Nieprawidłowy dystans SL"}
+
+        favorable_move = (curr - entry) if is_buy else (entry - curr)
+        profit_r = favorable_move / initial_sl_dist
+
+        # Check if SL is moved to BE (within 10% tolerance) or in profit
+        is_be = (sl >= (entry - (initial_sl_dist * 0.1))) if is_buy else (sl <= (entry + (initial_sl_dist * 0.1)))
+
+        if profit_r >= PYRAMID_MIN_PROFIT_R and is_be:
+            return {
+                "is_eligible": True,
+                "count": count,
+                "direction": base_pos["type"],
+                "base_ticket": base_pos["ticket"],
+                "profit_r": round(profit_r, 2),
+                "profit_usd": base_pos["profit"],
+            }
+
+        return {
+            "is_eligible": False,
+            "count": count,
+            "direction": base_pos["type"],
+            "profit_r": round(profit_r, 2),
+            "is_be": is_be,
+            "reason": f"Zysk ({profit_r:.1f}R) < wymagane {PYRAMID_MIN_PROFIT_R}R lub brak BE",
+        }
+
+    def trail_sl_to_profit(self, ticket: int, profit_r: float = 0.5) -> Tuple[bool, str]:
+        """
+        Trails the SL of a parent trade to lock in guaranteed profit (e.g. +0.5R or +1.0R)
+        when a pyramid scale-in position is opened.
+        """
+        if not self.ensure_connection():
+            return False, "Brak połączenia z MT5"
+
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos:
+            return False, f"Pozycja #{ticket} nie została znaleziona"
+
+        p = pos[0]
+        sym_info = mt5.symbol_info(p.symbol)
+        if not sym_info:
+            return False, f"Brak danych symbolu {p.symbol}"
+
+        is_buy = p.type == mt5.POSITION_TYPE_BUY
+        entry = p.price_open
+        current_sl = p.sl
+
+        orig_sl = self.get_initial_sl(ticket)
+        initial_dist = abs(entry - orig_sl) if (orig_sl > 0 and entry > 0) else abs(entry - current_sl)
+        if initial_dist <= 0:
+            initial_dist = sym_info.point * 100
+
+        lock_dist = initial_dist * profit_r
+
+        target_sl = (entry + lock_dist) if is_buy else (entry - lock_dist)
+        target_sl = round(target_sl, sym_info.digits)
+
+        # Only update if target_sl improves the current SL
+        should_update = (target_sl > current_sl) if is_buy else (target_sl < current_sl or current_sl <= 0)
+        if not should_update:
+            return True, "SL jest już na lepszym poziomie zabezpieczenia"
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": p.ticket,
+            "symbol": p.symbol,
+            "sl": target_sl,
+            "tp": p.tp,
+        }
+
+        res = mt5.order_send(request)
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"Pozycja #{ticket} ({p.symbol}) zabezpieczona na zysku +{profit_r}R ({target_sl})")
+            return True, f"Zabezpieczono zysk +{profit_r}R na pozycji #{ticket} (SL: {target_sl})"
+        return False, f"Błąd modyfikacji SL: {res.comment if res else mt5.last_error()}"
 

@@ -47,6 +47,14 @@ class TradeJournal:
                 conn.execute("ALTER TABLE trades ADD COLUMN notion_page_id TEXT")
             except sqlite3.OperationalError:
                 pass  # column already exists
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN parent_ticket INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN is_pyramid INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
     def _seed_initial_data_if_empty(self):
@@ -92,6 +100,8 @@ class TradeJournal:
         chart_path: Optional[str] = None,
         mt5_ticket: Optional[int] = None,
         comment: str = "",
+        parent_ticket: Optional[int] = None,
+        is_pyramid: int = 0,
     ) -> int:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with self._get_connection() as conn:
@@ -99,11 +109,13 @@ class TradeJournal:
             cur.execute("""
                 INSERT INTO trades (
                     timestamp, symbol, direction, entry_price, sl_price, tp_price,
-                    realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
+                    parent_ticket, is_pyramid
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, symbol.upper(), direction.upper(), entry_price, sl_price, tp_price,
-                realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment
+                realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
+                parent_ticket, is_pyramid
             ))
             conn.commit()
             return cur.lastrowid
@@ -142,19 +154,33 @@ class TradeJournal:
         self,
         mt5_ticket: int,
         realized_r: float,
+        max_r: Optional[float] = None,
         status: str = "CLOSED",
         comment: str = "",
     ) -> bool:
         """Closes an open trade record in trades.db by its MT5 ticket number."""
         with self._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("""
-                UPDATE trades
-                SET realized_r = ?, status = ?, comment = ?
-                WHERE mt5_ticket = ? AND status = 'OPEN'
-            """, (realized_r, status, comment, mt5_ticket))
+            if max_r is not None:
+                cur.execute("""
+                    UPDATE trades
+                    SET realized_r = ?, max_r = ?, status = ?, comment = ?
+                    WHERE mt5_ticket = ? AND status = 'OPEN'
+                """, (realized_r, max_r, status, comment, mt5_ticket))
+            else:
+                cur.execute("""
+                    UPDATE trades
+                    SET realized_r = ?, status = ?, comment = ?
+                    WHERE mt5_ticket = ? AND status = 'OPEN'
+                """, (realized_r, status, comment, mt5_ticket))
             conn.commit()
             return cur.rowcount > 0
+
+    def update_trade_max_r(self, mt5_ticket: int, max_r: float):
+        """Updates the highest R reached (MFE) for an active trade."""
+        with self._get_connection() as conn:
+            conn.execute("UPDATE trades SET max_r = ? WHERE mt5_ticket = ?", (max_r, mt5_ticket))
+            conn.commit()
 
     def get_all_trades(self) -> List[Dict]:
         with self._get_connection() as conn:
@@ -171,17 +197,23 @@ class TradeJournal:
     def get_summary_stats(self) -> Dict:
         trades = self.get_all_trades()
         if not trades:
-            return {"total": 0, "wins": 0, "losses": 0, "winrate": 0.0, "net_r": 0.0, "avg_r": 0.0}
+            return {"total": 0, "closed": 0, "wins": 0, "losses": 0, "winrate": 0.0, "net_r": 0.0, "avg_r": 0.0}
 
-        total = len(trades)
-        wins = sum(1 for t in trades if t["realized_r"] > 0)
-        losses = sum(1 for t in trades if t["realized_r"] <= 0)
-        net_r = sum(t["realized_r"] for t in trades)
-        avg_r = (net_r / total) if total > 0 else 0.0
-        winrate = (wins / total * 100) if total > 0 else 0.0
+        # Only closed trades count toward winrate and realized net R
+        closed_trades = [t for t in trades if t.get("status") in ("CLOSED", "WIN", "LOSS", "BE")]
+        if not closed_trades:
+            return {"total": len(trades), "closed": 0, "wins": 0, "losses": 0, "winrate": 0.0, "net_r": 0.0, "avg_r": 0.0}
+
+        total_closed = len(closed_trades)
+        wins = sum(1 for t in closed_trades if t["realized_r"] > 0)
+        losses = sum(1 for t in closed_trades if t["realized_r"] < 0)
+        net_r = sum(t["realized_r"] for t in closed_trades)
+        avg_r = (net_r / total_closed) if total_closed > 0 else 0.0
+        winrate = (wins / total_closed * 100) if total_closed > 0 else 0.0
 
         return {
-            "total": total,
+            "total": len(trades),
+            "closed": total_closed,
             "wins": wins,
             "losses": losses,
             "winrate": round(winrate, 1),

@@ -235,6 +235,7 @@ class NotionJournal:
         status: str,
         profit: float = 0.0,
         comment: str = "",
+        max_r: Optional[float] = None,
         page_id: Optional[str] = None,
     ) -> bool:
         """
@@ -271,6 +272,10 @@ class NotionJournal:
         r_col = find_prop(["Realized R", "R", "RR", "R-Multiple", "Realized RR"])
         if r_col:
             patch_props[r_col] = {"number": round(realized_r, 2)}
+
+        max_r_col = find_prop(["Max R", "MFE", "Potential R", "Max RR"])
+        if max_r_col and max_r is not None:
+            patch_props[max_r_col] = {"number": round(max_r, 2)}
 
         pnl_col = find_prop(["PnL", "Profit", "Zysk ($)", "PnL ($)", "Profit (USD)"])
         if pnl_col:

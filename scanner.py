@@ -6,16 +6,20 @@ from typing import Dict, List, Set
 from chart_generator import ChartGenerator
 from config import (
     AUTO_BE_AT_1R,
+    ENABLE_PYRAMIDING,
     ENABLE_SMC_STRATEGY,
     ENABLE_ZUMIKO_STRATEGY,
     HTF_TIMEFRAME,
     LOOKBACK_BARS,
     LTF_TIMEFRAME,
+    MAX_PYRAMID_LEVEL,
     MIN_CONFLUENCE_SCORE,
     PROP_FIRM_MODE,
     PROP_MAX_DRAWDOWN_PERCENT,
     PROP_MAX_OPEN_TRADES,
     PROP_SAFETY_BUFFER_PERCENT,
+    PYRAMID_LOCK_PREVIOUS_PROFIT,
+    PYRAMID_MIN_PROFIT_R,
     SCAN_INTERVAL_SECONDS,
     TRADE_MONITOR_INTERVAL_SECONDS,
     SWING_LENGTH,
@@ -113,23 +117,48 @@ class SMCScanner:
             if closed_info:
                 profit = closed_info.get("profit", 0.0)
                 reason = closed_info.get("reason", 0)
+                price_close = closed_info.get("price_close", 0.0)
 
-                # Determine outcome based on deal reason and profit
-                if reason == 5 or profit > 0:
-                    status = "WIN"
-                    status_desc = "🎯 TAKE PROFIT OSIĄGNIĘTY!"
-                    realized_r = t.get("max_r", 1.8) if t.get("max_r", 0) > 0 else 1.8
-                elif reason == 4 or profit < 0:
-                    status = "LOSS"
-                    status_desc = "🛑 STOP LOSS TRAFIONY"
-                    realized_r = -1.0
+                entry_p = t.get("entry_price", 0.0)
+                sl_p = t.get("sl_price", 0.0)
+                tp_p = t.get("tp_price", 0.0)
+                is_buy = t.get("direction", "").upper() == "BUY"
+
+                # Mathematically exact Realized R calculation
+                initial_risk_dist = abs(entry_p - sl_p) if (entry_p > 0 and sl_p > 0) else 0.0
+                if initial_risk_dist > 0 and price_close > 0:
+                    price_diff = (price_close - entry_p) if is_buy else (entry_p - price_close)
+                    realized_r = round(price_diff / initial_risk_dist, 2)
                 else:
-                    status = "WIN" if profit > 0 else "LOSS"
-                    status_desc = "✋ ZAMKNIĘCIE RĘCZNE"
-                    realized_r = 0.5 if profit > 0 else -0.5
+                    realized_r = 1.8 if profit > 0 else -1.0
 
-                comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD"
-                self.journal.close_trade_by_ticket(ticket, realized_r, status, comment_str)
+                # Determine accurate status and description
+                if profit > 0 and realized_r > 0.1:
+                    status = "WIN"
+                    status_desc = "🎯 TAKE PROFIT OSIĄGNIĘTY!" if (reason == 5 or (tp_p > 0 and abs(price_close - tp_p) <= (initial_risk_dist * 0.15))) else "📈 ZAMKNIĘCIE W ZYSKU"
+                elif profit < 0 or realized_r < -0.2:
+                    status = "LOSS"
+                    status_desc = "🛑 STOP LOSS TRAFIONY" if reason == 4 else "📉 ZAMKNIĘCIE ZE STRATĄ"
+                else:
+                    status = "BE"
+                    status_desc = "🛡️ ZAMKNIĘCIE NA BREAK-EVEN (0.0R)"
+                    realized_r = 0.0
+
+                # Calculate exact MFE (Max R) between trade open and close
+                time_open = closed_info.get("time_open", 0)
+                time_close = closed_info.get("time_close", 0)
+                calc_mfe = self.mt5_client.get_position_mfe(
+                    symbol=t["symbol"],
+                    is_buy=is_buy,
+                    entry_price=entry_p,
+                    initial_sl_price=sl_p,
+                    time_open=time_open,
+                    time_close=time_close,
+                )
+                max_r = max(calc_mfe, realized_r, float(t.get("max_r") or 0.0))
+
+                comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD | Max R: {max_r:.2f}R"
+                self.journal.close_trade_by_ticket(ticket, realized_r, max_r=max_r, status=status, comment=comment_str)
 
                 # Update trade result in Notion database
                 if self.notion.enabled:
@@ -140,49 +169,74 @@ class SMCScanner:
                             status=status,
                             profit=profit,
                             comment=comment_str,
+                            max_r=max_r,
                             page_id=t.get("notion_page_id"),
                         )
                     )
 
                 logger.info(
                     f"Trade #{ticket} ({t['symbol']}) closed! Status: {status}, "
-                    f"Realized R: {realized_r:+.1f}R, Profit: {profit:+.2f} USD"
+                    f"Exact Realized R: {realized_r:+.2f}R, Max R: {max_r:.2f}R, Profit: {profit:+.2f} USD"
                 )
+
+                pyramid_badge = ""
+                if t.get("is_pyramid") or t.get("parent_ticket"):
+                    pyramid_badge = f"\n🔥 **Transakcja Piramidy (Dokładka do #{t.get('parent_ticket')})**"
 
                 if self.telegram:
                     msg = (
-                        f"🏁 **POZYCJA ZAMKNIĘTA: {t['symbol']} [{t['direction']}]**\n\n"
+                        f"🏁 **POZYCJA ZAMKNIĘTA: {t['symbol']} [{t['direction']}]**{pyramid_badge}\n\n"
                         f"🎫 **Ticket:** `#{ticket}`\n"
                         f"🎯 **Status:** **{status_desc}**\n"
-                        f"💵 **Wynik:** `{profit:+.2f} USD` (`{realized_r:+.1f}R`)\n\n"
+                        f"💵 **Wynik:** `{profit:+.2f} USD` (`{realized_r:+.2f}R` | Max R: `{max_r:.2f}R`)\n\n"
                         f"🔓 **Para {t['symbol']} została odblokowana i wraca do skanera!**\n"
                         f"📓 Dziennik zaktualizowany. Wpisz `/journal` lub `/optimizer`"
                     )
                     await self.telegram.send_message(msg)
 
-        # 3. Auto Break-Even Assistant (Locks 0 risk when trade reaches +1.0R)
-        if AUTO_BE_AT_1R:
-            open_positions = self.mt5_client.get_open_positions()
-            for p in open_positions:
-                ticket = p["ticket"]
+        # 3. Auto Break-Even Assistant & Live Max R Tracking
+        open_positions = self.mt5_client.get_open_positions()
+        for p in open_positions:
+            ticket = p["ticket"]
+            entry_p = p["price_open"]
+            sl_p = p["sl"]
+            curr_p = p["price_current"]
+            pnl = p["profit"]
+            is_buy = p["type"] == "BUY"
+
+            orig_sl = self.mt5_client.get_initial_sl(ticket)
+            if orig_sl <= 0:
+                orig_sl = sl_p
+
+            if orig_sl <= 0 or entry_p <= 0:
+                continue
+
+            initial_sl_dist = abs(entry_p - orig_sl)
+
+            # Live Max R (MFE) tracking for open positions in trades.db
+            journal_trade = self.journal.get_trade_by_ticket(ticket)
+            if journal_trade and initial_sl_dist > 0:
+                current_mfe = self.mt5_client.get_position_mfe(
+                    symbol=p["symbol"],
+                    is_buy=is_buy,
+                    entry_price=entry_p,
+                    initial_sl_price=orig_sl,
+                    time_open=p.get("time", 0),
+                )
+                prev_max = float(journal_trade.get("max_r") or 0.0)
+                if current_mfe > prev_max:
+                    self.journal.update_trade_max_r(ticket, current_mfe)
+
+            # Auto Break-Even Assistant (Locks 0 risk when trade reaches +1.0R)
+            if AUTO_BE_AT_1R:
                 if ticket in self._be_moved_tickets:
                     continue
 
-                entry_p = p["price_open"]
-                sl_p = p["sl"]
-                curr_p = p["price_current"]
-                pnl = p["profit"]
-
-                if sl_p <= 0 or entry_p <= 0:
-                    continue
-
-                initial_sl_dist = abs(entry_p - sl_p)
                 # If SL is already moved to BE (within 15% distance to entry)
                 if abs(entry_p - sl_p) < (initial_sl_dist * 0.15):
                     self._be_moved_tickets.add(ticket)
                     continue
 
-                is_buy = p["type"] == "BUY"
                 favorable_move = (curr_p - entry_p) if is_buy else (entry_p - curr_p)
 
                 # If market moved >= 1.0R in favor of trade
@@ -236,10 +290,20 @@ class SMCScanner:
         )
 
         for sym in SYMBOLS:
-            # Active Position Lock: Skip symbol if it currently has an open position or pending order
-            if sym.upper() in busy_symbols:
+            # Check pyramiding eligibility for this symbol
+            pyramid_status = self.mt5_client.get_pyramid_status(sym) if ENABLE_PYRAMIDING else {"is_eligible": False}
+            is_pyramid = pyramid_status.get("is_eligible", False)
+
+            # Active Position Lock: Skip symbol if it currently has an open position and is NOT eligible for pyramiding
+            if sym.upper() in busy_symbols and not is_pyramid:
                 logger.info(f"🔒 [SYMBOL LOCK] {sym} posiada aktywną pozycję/zlecenie w MT5. Pomijam skanowanie do czasu zamknięcia.")
                 continue
+
+            if is_pyramid:
+                logger.info(
+                    f"🔥 [PYRAMID SCAN] {sym} posiada pozycję bazową w zysku (+{pyramid_status.get('profit_r')}R) "
+                    f"i zabezpieczoną na BE. Skanuję pod kątem dokładki ({pyramid_status.get('direction')})."
+                )
 
             try:
                 # Fetch multi-timeframe candles
@@ -294,6 +358,15 @@ class SMCScanner:
 
                 # Process final alerts
                 for setup in final_setups:
+                    # If this is a pyramiding scan, filter out counter-trend setups
+                    if is_pyramid:
+                        if setup.direction != pyramid_status.get("direction"):
+                            continue  # Never pyramid against active position
+                        setup.is_pyramid = True
+                        setup.parent_ticket = pyramid_status.get("base_ticket")
+                        setup.pyramid_profit_r = pyramid_status.get("profit_r", 0.0)
+                        setup.setup_type = f"[DOKŁADKA TRENDOWA L{pyramid_status.get('count', 1) + 1}] {setup.setup_type}"
+
                     setup_key = f"{setup.symbol}_{setup.direction}_{setup.strategy_name}_{setup.entry_price:.2f}"
                     if setup_key in self.notified_setups:
                         continue  # Already notified recently
@@ -301,7 +374,11 @@ class SMCScanner:
                     # Prop Firm trade eligibility check before alert
                     if PROP_FIRM_MODE:
                         sl_dist = abs(setup.entry_price - setup.sl_price)
-                        can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol, sl_distance=sl_dist)
+                        can_trade, reason = self.mt5_client.can_open_new_trade(
+                            setup.symbol,
+                            sl_distance=sl_dist,
+                            is_pyramid=setup.is_pyramid,
+                        )
                         if not can_trade:
                             logger.info(f"🛡️ [PROP SHIELD] Pomijam powiadomienie dla {setup.symbol}: {reason}")
                             continue

@@ -21,6 +21,7 @@ from config import (
     PROP_MAX_OPEN_TRADES,
     PROP_RISK_PER_TRADE_PERCENT,
     PROP_SAFETY_BUFFER_PERCENT,
+    PYRAMID_LOCK_PREVIOUS_PROFIT,
     TELEGRAM_ALERT_CHANNEL,
     TELEGRAM_BOT_TOKEN,
 )
@@ -205,10 +206,22 @@ class TelegramBotManager:
 
         recent_lines = ""
         for t in recent:
-            icon = "🟢" if t["realized_r"] > 0 else "🔴"
+            if t.get("status") == "OPEN":
+                icon = "⏳"
+                res_str = "W toku"
+            elif t["realized_r"] > 0:
+                icon = "🟢"
+                res_str = f"{t['realized_r']:+.2f}R"
+            elif t["realized_r"] < 0:
+                icon = "🔴"
+                res_str = f"{t['realized_r']:+.2f}R"
+            else:
+                icon = "🛡️"
+                res_str = "0.0R (BE)"
+            pyr_tag = " 🔥[Pyr L2]" if t.get("is_pyramid") else ""
             recent_lines += (
-                f"• #{t['id']} {t['symbol']} [{t['direction']}]: "
-                f"Wynik: {icon} `{t['realized_r']:+.1f}R` | Max R: `{t['max_r']:.1f}` | Confluence: `{t['confluence_score']}%`\n"
+                f"• #{t['id']} {t['symbol']} [{t['direction']}]{pyr_tag}: "
+                f"{icon} `{res_str}` | Max R: `{t['max_r']:.2f}R` | Confluence: `{t['confluence_score']}%`\n"
             )
 
         notion_status = ""
@@ -411,7 +424,11 @@ class TelegramBotManager:
         if action in ("market", "limit"):
             if PROP_FIRM_MODE:
                 sl_dist = abs(setup.entry_price - setup.sl_price)
-                can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol, sl_distance=sl_dist)
+                can_trade, reason = self.mt5_client.can_open_new_trade(
+                    setup.symbol,
+                    sl_distance=sl_dist,
+                    is_pyramid=getattr(setup, "is_pyramid", False),
+                )
                 if not can_trade:
                     await query.answer(text=reason[:190], show_alert=True)
                     await query.edit_message_caption(
@@ -422,6 +439,10 @@ class TelegramBotManager:
         risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
         lot = self.mt5_client.calculate_lot_size(setup.symbol, risk_pct, setup.sl_price, setup.entry_price)
 
+        is_pyr = 1 if getattr(setup, "is_pyramid", False) else 0
+        parent_t = getattr(setup, "parent_ticket", None)
+        strat_label = f"PYRAMID_{setup.strategy_name}" if is_pyr else setup.setup_type
+
         if action == "market":
             success, msg, ticket = self.mt5_client.execute_market_order(
                 symbol=setup.symbol,
@@ -429,9 +450,15 @@ class TelegramBotManager:
                 volume=lot,
                 sl=setup.sl_price,
                 tp=setup.tp1_price,
-                comment=f"SMC {setup.setup_type[:15]}",
+                comment=f"SMC {'Pyr L2 ' if is_pyr else ''}{setup.setup_type[:10]}",
             )
             if success:
+                trail_msg = ""
+                if is_pyr and parent_t and PYRAMID_LOCK_PREVIOUS_PROFIT:
+                    trail_ok, t_msg = self.mt5_client.trail_sl_to_profit(parent_t, profit_r=0.5)
+                    if trail_ok:
+                        trail_msg = f"\n🔒 **Zabezpieczono zysk bazowy (+0.5R):** {t_msg}"
+
                 self.journal.add_trade(
                     symbol=setup.symbol,
                     direction=setup.direction,
@@ -439,11 +466,13 @@ class TelegramBotManager:
                     sl_price=setup.sl_price,
                     tp_price=setup.tp1_price,
                     realized_r=0.0,
-                    max_r=setup.rr_ratio,
+                    max_r=0.0,
                     confluence_score=setup.confluence_score,
                     status="OPEN",
                     mt5_ticket=ticket,
-                    comment="Market order via Telegram",
+                    comment=f"{'Piramida L2' if is_pyr else 'Market order'} via Telegram | {setup.setup_type}",
+                    parent_ticket=parent_t,
+                    is_pyramid=is_pyr,
                 )
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
@@ -452,11 +481,11 @@ class TelegramBotManager:
                     "sl_price": setup.sl_price,
                     "tp_price": setup.tp1_price,
                     "realized_r": 0.0,
-                    "max_r": setup.rr_ratio,
+                    "max_r": 0.0,
                     "confluence_score": setup.confluence_score,
                     "status": "OPEN",
                     "mt5_ticket": ticket,
-                    "comment": f"Market order via Telegram | {setup.setup_type}",
+                    "comment": f"{strat_label} | via Telegram",
                 }))
                 new_caption = (
                     f"{query.message.caption}\n\n"
@@ -464,6 +493,7 @@ class TelegramBotManager:
                     f"🎫 **Ticket:** `#{ticket}`\n"
                     f"📦 **Wolumen:** `{lot} lot` (Ryzyko: {risk_pct}%)\n"
                     f"🎯 **SL:** `{setup.sl_price}` | **TP:** `{setup.tp1_price}`"
+                    f"{trail_msg}"
                 )
                 await query.edit_message_caption(caption=new_caption, parse_mode="Markdown")
             else:
@@ -479,7 +509,7 @@ class TelegramBotManager:
                 volume=lot,
                 sl=setup.sl_price,
                 tp=setup.tp1_price,
-                comment=f"SMC Limit {setup.setup_type[:15]}",
+                comment=f"SMC Limit {'Pyr ' if is_pyr else ''}{setup.setup_type[:10]}",
             )
             if success:
                 self.journal.add_trade(
@@ -489,11 +519,13 @@ class TelegramBotManager:
                     sl_price=setup.sl_price,
                     tp_price=setup.tp1_price,
                     realized_r=0.0,
-                    max_r=setup.rr_ratio,
+                    max_r=0.0,
                     confluence_score=setup.confluence_score,
                     status="OPEN",
                     mt5_ticket=ticket,
-                    comment="Market order via Telegram",
+                    comment=f"{'Piramida L2 Limit' if is_pyr else 'Limit order'} via Telegram | {setup.setup_type}",
+                    parent_ticket=parent_t,
+                    is_pyramid=is_pyr,
                 )
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
@@ -502,11 +534,11 @@ class TelegramBotManager:
                     "sl_price": setup.sl_price,
                     "tp_price": setup.tp1_price,
                     "realized_r": 0.0,
-                    "max_r": setup.rr_ratio,
+                    "max_r": 0.0,
                     "confluence_score": setup.confluence_score,
                     "status": "OPEN",
                     "mt5_ticket": ticket,
-                    "comment": f"Market order via Telegram | {setup.setup_type}",
+                    "comment": f"{strat_label} (Limit) | via Telegram",
                 }))
                 new_caption = (
                     f"{query.message.caption}\n\n"
@@ -574,9 +606,17 @@ class TelegramBotManager:
             open_count = len(self.mt5_client.get_open_positions())
             prop_risk_line = f"🛡️ **Prop Risk:** `{risk_pct}%` (`~{risk_usd:.2f} {curr}`) | Slot: `{open_count}/{PROP_MAX_OPEN_TRADES}`\n"
 
-        # Strategy title
+        # Strategy title & Pyramiding Scale-In Info
+        is_pyr = getattr(setup, "is_pyramid", False)
         strat_name = getattr(setup, "strategy_name", "SMC")
-        if strat_name == "GOLDEN_COMBO":
+        pyramid_banner = ""
+        if is_pyr:
+            header_title = f"🔥 **DOKŁADKA DO POZYCJI (PIRAMIDA L2): {setup.symbol}**"
+            pyramid_banner = (
+                f"🛡️ **Pozycja bazowa #{setup.parent_ticket}** jest zabezpieczona na BE (`+{setup.pyramid_profit_r:.1f}R`)!\n"
+                f"⚖️ **Ryzyko netto portfela:** `ZEROWE` (Risk-Neutral Compounding)\n\n"
+            )
+        elif strat_name == "GOLDEN_COMBO":
             header_title = f"🔥 **ZŁOTY SETUP (SMC + ZUMIKO): {setup.symbol}**"
         elif strat_name == "ZUMIKO":
             header_title = f"⚡ **ZUMIKO KILLMLM SETUP: {setup.symbol}**"
@@ -602,6 +642,7 @@ class TelegramBotManager:
         caption = (
             f"{header_title}\n"
             f"🎯 **Ocena:** `{setup.confluence_score}%` {grade_emoji}\n\n"
+            f"{pyramid_banner}"
             f"{news_banner}"
             f"📊 **Kierunek:** {dir_emoji}\n"
             f"⏱ **Interwał:** `{setup.timeframe}` (H4: **{setup.htf_trend}**) | {session_badge}\n"
@@ -618,16 +659,26 @@ class TelegramBotManager:
             f"{rr_src}"
         )
 
+        btn_market_text = (
+            f"🟢 Dołóż do pozycji ({risk_pct}% ryzyka)"
+            if is_pyr
+            else f"🟢 Wejdź Market ({risk_pct}% ryzyka)"
+        )
+        btn_limit_text = (
+            f"🟡 Dołóż Limit na {setup.entry_price}"
+            if is_pyr
+            else f"🟡 Złóż Limit na {setup.entry_price}"
+        )
         keyboard = [
             [
                 InlineKeyboardButton(
-                    f"🟢 Wejdź Market ({risk_pct}% ryzyka)",
+                    btn_market_text,
                     callback_data=f"market:{setup_id}",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    f"🟡 Złóż Limit na {setup.entry_price}",
+                    btn_limit_text,
                     callback_data=f"limit:{setup_id}",
                 ),
                 InlineKeyboardButton("❌ Pomiń", callback_data=f"dismiss:{setup_id}"),
