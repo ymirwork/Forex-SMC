@@ -9,7 +9,13 @@ from news_filter import NewsFilter
 from rr_optimizer import RROptimizer
 from session_manager import SessionManager
 from trade_journal import TradeJournal
-from config import DEFAULT_RR_RATIO, MIN_TRADES_FOR_OPTIMAL_RR, TIGHT_SL_MODE, USE_OPTIMAL_RR
+from config import (
+    ADD_SPREAD_TO_SL,
+    DEFAULT_RR_RATIO,
+    MIN_TRADES_FOR_OPTIMAL_RR,
+    TIGHT_SL_MODE,
+    USE_OPTIMAL_RR,
+)
 
 
 @dataclass
@@ -60,6 +66,7 @@ class TradeSetup:
     is_pyramid: bool = False
     parent_ticket: Optional[int] = None
     pyramid_profit_r: float = 0.0
+    spread_used: float = 0.0
 
 
 class SMCDetector:
@@ -190,6 +197,7 @@ class SMCDetector:
         symbol: str,
         df_ltf: pd.DataFrame,
         df_htf: Optional[pd.DataFrame] = None,
+        spread: float = 0.0,
     ) -> List[TradeSetup]:
         setups: List[TradeSetup] = []
         if df_ltf is None or len(df_ltf) < 60:
@@ -251,6 +259,7 @@ class SMCDetector:
                     digits=digits,
                     point_scale=point_scale,
                     buffer=buffer,
+                    spread=spread,
                 )
                 if setup:
                     setups.append(setup)
@@ -277,6 +286,7 @@ class SMCDetector:
         digits: int,
         point_scale: float,
         buffer: float,
+        spread: float = 0.0,
     ) -> Optional[TradeSetup]:
         is_buy = direction == "BUY"
         expected_htf = "BULLISH" if is_buy else "BEARISH"
@@ -291,6 +301,9 @@ class SMCDetector:
         if impulse_range <= (point_scale * 10):
             return None
 
+        spread_buffer = spread if ADD_SPREAD_TO_SL else 0.0
+        effective_buffer = buffer + spread_buffer
+
         if is_buy:
             fibo_50 = impulse_high - (0.500 * impulse_range)
             fibo_618 = impulse_high - (0.618 * impulse_range)
@@ -301,9 +314,9 @@ class SMCDetector:
             entry = current_price
             if TIGHT_SL_MODE:
                 recent_pullback_low = df_ltf.iloc[-5:]["low"].min()
-                sl = min(fibo_786, recent_pullback_low) - buffer
+                sl = min(fibo_786, recent_pullback_low) - effective_buffer
             else:
-                sl = impulse_low - buffer
+                sl = impulse_low - effective_buffer
             risk = entry - sl
             if risk <= (point_scale * 5):
                 return None
@@ -321,9 +334,9 @@ class SMCDetector:
             entry = current_price
             if TIGHT_SL_MODE:
                 recent_pullback_high = df_ltf.iloc[-5:]["high"].max()
-                sl = max(fibo_786, recent_pullback_high) + buffer
+                sl = max(fibo_786, recent_pullback_high) + effective_buffer
             else:
-                sl = impulse_high + buffer
+                sl = impulse_high + effective_buffer
             risk = sl - entry
             if risk <= (point_scale * 5):
                 return None
@@ -438,4 +451,5 @@ class SMCDetector:
             news_warning=news_warn,
             is_optimal_rr=is_optimal_rr,
             rr_source_info=rr_source,
+            spread_used=spread_buffer,
         )

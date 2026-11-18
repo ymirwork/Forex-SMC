@@ -9,7 +9,13 @@ from rr_optimizer import RROptimizer
 from session_manager import SessionManager
 from smc_detector import ConfluenceItem, TradeSetup
 from trade_journal import TradeJournal
-from config import DEFAULT_RR_RATIO, MIN_TRADES_FOR_OPTIMAL_RR, TIGHT_SL_MODE, USE_OPTIMAL_RR
+from config import (
+    ADD_SPREAD_TO_SL,
+    DEFAULT_RR_RATIO,
+    MIN_TRADES_FOR_OPTIMAL_RR,
+    TIGHT_SL_MODE,
+    USE_OPTIMAL_RR,
+)
 
 logger = logging.getLogger("ForexSMC.ZumikoDetector")
 
@@ -171,6 +177,7 @@ class ZumikoDetector:
         df_m15: pd.DataFrame,
         df_h1: Optional[pd.DataFrame] = None,
         df_h4: Optional[pd.DataFrame] = None,
+        spread: float = 0.0,
     ) -> List[TradeSetup]:
         setups: List[TradeSetup] = []
         if df_m15 is None or len(df_m15) < 240:
@@ -244,6 +251,7 @@ class ZumikoDetector:
                 digits=digits,
                 point_scale=point_scale,
                 buffer=buffer,
+                spread=spread,
             )
             if setup:
                 setups.append(setup)
@@ -281,6 +289,7 @@ class ZumikoDetector:
         digits: int,
         point_scale: float,
         buffer: float,
+        spread: float = 0.0,
     ) -> Optional[TradeSetup]:
         is_buy = direction == "BUY"
 
@@ -356,11 +365,14 @@ class ZumikoDetector:
         if total_score < self.min_confluence_score:
             return None
 
+        spread_buffer = spread if ADD_SPREAD_TO_SL else 0.0
+        effective_buffer = buffer + spread_buffer
+
         entry = c
         if is_buy:
             recent_low = df_m15.iloc[-5:]["low"].min()
             sl_ref = min(recent_low, curr_e21) if TIGHT_SL_MODE else (min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer))
-            sl = sl_ref - buffer
+            sl = sl_ref - effective_buffer
             risk = entry - sl
             if risk <= (point_scale * 5):
                 return None
@@ -372,7 +384,7 @@ class ZumikoDetector:
         else:
             recent_high = df_m15.iloc[-5:]["high"].max()
             sl_ref = max(recent_high, curr_e21) if TIGHT_SL_MODE else (max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer))
-            sl = sl_ref + buffer
+            sl = sl_ref + effective_buffer
             risk = sl - entry
             if risk <= (point_scale * 5):
                 return None
@@ -415,4 +427,5 @@ class ZumikoDetector:
             ema_slow=round(curr_e21, digits),
             ema_238=round(curr_e238, digits),
             swing_pattern=swing_pat,
+            spread_used=spread_buffer,
         )

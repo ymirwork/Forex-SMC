@@ -669,6 +669,8 @@ class TelegramBotManager:
         if getattr(setup, "ema_238", 0.0) > 0:
             zumiko_text = f"📈 **Zumiko:** EMA 10/21: `{setup.ema_fast:.{digits}f}/{setup.ema_slow:.{digits}f}` | 🌟 EMA 238: `{setup.ema_238:.{digits}f}` | {setup.swing_pattern}\n"
 
+        spread_info = f" [w tym spread: +{setup.spread_used / point_scale:.1f}p]" if getattr(setup, "spread_used", 0.0) > 0 else ""
+
         caption = (
             f"{header_title}\n"
             f"🎯 **Ocena:** `{setup.confluence_score}%` {grade_emoji}\n\n"
@@ -681,7 +683,7 @@ class TelegramBotManager:
             f"{zumiko_text}"
             f"{fibo_text}"
             f"{confluence_lines}"
-            f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} p)\n"
+            f"📍 **Entry:** `{setup.entry_price:.{digits}f}` | 🛑 **SL:** `{setup.sl_price:.{digits}f}` ({sl_pips:.1f} p{spread_info})\n"
             f"🎯 **TP1:** `{setup.tp1_price:.{digits}f}` (Target 1:{setup.rr_ratio})\n"
             f"🎯 **TP2:** `{setup.tp2_price:.{digits}f}` (Strukturalny szczyt/dołek)\n"
             f"⚖️ **Risk / Reward:** `1 : {setup.rr_ratio}` {rr_badge}\n"

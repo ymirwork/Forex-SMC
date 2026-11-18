@@ -6,7 +6,10 @@ import pandas as pd
 import MetaTrader5 as mt5
 
 from config import (
+    ADD_SPREAD_TO_SL,
+    AUTO_BE_OFFSET_PIPS,
     DEFAULT_RISK_PERCENT,
+    DEFAULT_SPREAD_PIPS,
     ENABLE_PYRAMIDING,
     MAX_PYRAMID_LEVEL,
     MAX_RISK_DEVIATION_TOLERANCE,
@@ -596,9 +599,42 @@ class MT5Client:
 
         return 0.0
 
-    def move_sl_to_breakeven(self, ticket: int) -> Tuple[bool, str]:
+    @staticmethod
+    def get_pip_size(symbol: str) -> float:
         """
-        Moves the Stop Loss of an active position to its entry price (Break-Even).
+        Returns pip value in price units:
+        - Forex standard (5 digits): 0.0001
+        - JPY pairs (3 digits): 0.01
+        - Gold (XAU/GOLD): 0.10 (1 pip = $0.10 / 10 cents)
+        """
+        clean = symbol.upper()
+        if "XAU" in clean or "GOLD" in clean:
+            return 0.10
+        if "JPY" in clean:
+            return 0.01
+        return 0.0001
+
+    def get_symbol_spread(self, symbol: str) -> float:
+        """
+        Returns current live spread in price units (Ask - Bid).
+        Falls back to DEFAULT_SPREAD_PIPS * pip_size if MT5 is unavailable.
+        """
+        if self.ensure_connection():
+            resolved = self.resolve_symbol(symbol)
+            if resolved:
+                s_info = mt5.symbol_info(resolved)
+                if s_info and s_info.ask > 0 and s_info.bid > 0:
+                    spread_price = s_info.ask - s_info.bid
+                    if spread_price > 0:
+                        return spread_price
+
+        pip_size = self.get_pip_size(symbol)
+        return DEFAULT_SPREAD_PIPS * pip_size
+
+    def move_sl_to_breakeven(self, ticket: int, offset_pips: Optional[float] = None) -> Tuple[bool, str]:
+        """
+        Moves the Stop Loss of an active position to its entry price + offset_pips into profit.
+        offset_pips covers broker commission, swap, and spread costs so the trade exits risk-free in slight profit.
         """
         if not self.ensure_connection():
             return False, "Brak połączenia z MT5"
@@ -612,7 +648,32 @@ class MT5Client:
         if not sym_info:
             return False, f"Brak danych symbolu {p.symbol}"
 
-        be_price = round(p.price_open, sym_info.digits)
+        if offset_pips is None:
+            offset_pips = AUTO_BE_OFFSET_PIPS
+
+        pip_size = self.get_pip_size(p.symbol)
+        offset_distance = offset_pips * pip_size
+        is_buy = p.type == mt5.ORDER_TYPE_BUY
+
+        # Calculate BE with profit offset to cover costs
+        if is_buy:
+            be_price = round(p.price_open + offset_distance, sym_info.digits)
+            # Safety checks: cannot place SL at or above current market Bid
+            if be_price >= p.price_current:
+                be_price = round(p.price_open, sym_info.digits)
+        else:
+            be_price = round(p.price_open - offset_distance, sym_info.digits)
+            # Safety checks: cannot place SL at or below current market Ask
+            if be_price <= p.price_current:
+                be_price = round(p.price_open, sym_info.digits)
+
+        # Minimum distance from market check (stops_level)
+        min_stop_points = sym_info.stops_level if sym_info.stops_level > 0 else 5
+        min_dist = (min_stop_points + 2) * sym_info.point
+        if is_buy and (p.price_current - be_price) < min_dist:
+            be_price = round(p.price_open, sym_info.digits)
+        elif not is_buy and (be_price - p.price_current) < min_dist:
+            be_price = round(p.price_open, sym_info.digits)
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
@@ -630,8 +691,9 @@ class MT5Client:
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return False, f"Nie udało się przestawić na BE: retcode={result.retcode} ({result.comment})"
 
-        logger.info(f"Stop Loss for #{ticket} ({p.symbol}) moved to Break-Even: {be_price}")
-        return True, f"✅ Stop Loss dla pozycji #{ticket} ({p.symbol}) przestawiony na Break-Even ({be_price})!"
+        offset_desc = f" (+{offset_pips:.1f} pips na pokrycie kosztów)" if offset_pips > 0 else ""
+        logger.info(f"Stop Loss for #{ticket} ({p.symbol}) moved to Break-Even: {be_price}{offset_desc}")
+        return True, f"✅ Stop Loss dla pozycji #{ticket} ({p.symbol}) przestawiony na Break-Even ({be_price}){offset_desc}!"
 
     @staticmethod
     def _parse_currencies(symbol_clean: str) -> Tuple[str, str]:

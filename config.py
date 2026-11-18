@@ -96,6 +96,12 @@ TIGHT_SL_MODE = os.getenv("TIGHT_SL_MODE", "True").lower() in ("true", "1")
 MAX_RISK_DEVIATION_TOLERANCE = float(os.getenv("MAX_RISK_DEVIATION_TOLERANCE", "1.35"))
 # Automatyczne przestawianie na Break-Even po osiągnięciu zysku +1.0R
 AUTO_BE_AT_1R = os.getenv("AUTO_BE_AT_1R", "True").lower() in ("true", "1")
+# Dodatkowy bufor w pipsach dodawany do Break-Even w stronę zysku (np. +5 pips), aby pokryć prowizje brokera i spread
+AUTO_BE_OFFSET_PIPS = float(os.getenv("AUTO_BE_OFFSET_PIPS", "5.0"))
+# Uwzględnianie spreadu brokera przy kalkulacji Stop Lossa (oddalenie SL o spread)
+ADD_SPREAD_TO_SL = os.getenv("ADD_SPREAD_TO_SL", "True").lower() in ("true", "1")
+# Domyślny spread w pipsach, jeśli MT5 nie zwróci danych
+DEFAULT_SPREAD_PIPS = float(os.getenv("DEFAULT_SPREAD_PIPS", "1.0"))
 
 # ==========================================
 # NOTION TRADE JOURNAL SETTINGS

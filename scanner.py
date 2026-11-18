@@ -6,7 +6,9 @@ from typing import Dict, List, Set
 
 from chart_generator import ChartGenerator
 from config import (
+    ADD_SPREAD_TO_SL,
     AUTO_BE_AT_1R,
+    AUTO_BE_OFFSET_PIPS,
     BLOCK_ON_HIGH_IMPACT_NEWS,
     ENABLE_PYRAMIDING,
     ENABLE_SMC_STRATEGY,
@@ -270,16 +272,17 @@ class SMCScanner:
 
                 # If market moved >= 1.0R in favor of trade
                 if favorable_move >= initial_sl_dist:
-                    ok, msg = self.mt5_client.move_sl_to_breakeven(ticket)
+                    ok, msg = self.mt5_client.move_sl_to_breakeven(ticket, offset_pips=AUTO_BE_OFFSET_PIPS)
                     if ok:
                         self._be_moved_tickets.add(ticket)
                         if self.telegram:
+                            offset_txt = f" +{AUTO_BE_OFFSET_PIPS:.1f} pips na pokrycie kosztów" if AUTO_BE_OFFSET_PIPS > 0 else ""
                             alert_msg = (
                                 f"⚡ **AUTO BREAK-EVEN (+1.0R)!**\n\n"
                                 f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
                                 f"📈 Aktualny zysk: `+{pnl:.2f} USD` (Osiągnięto +1.0R!)\n"
-                                f"🛡️ **Stop Loss przestawiony na wejście ({entry_p})!**\n"
-                                f"🔒 Pozycja jest już wolna od ryzyka (Risk-Free Trade)."
+                                f"🛡️ **Stop Loss przestawiony na wejście{offset_txt}!**\n"
+                                f"🔒 Pozycja jest w 100% bezpieczna (Guaranteed Profit / Risk-Free)."
                             )
                             await self.telegram.send_message(alert_msg)
 
@@ -344,11 +347,14 @@ class SMCScanner:
                 smc_setups: List[TradeSetup] = []
                 zumiko_setups: List[TradeSetup] = []
 
+                # Spread buffer for Stop Loss
+                spread_val = self.mt5_client.get_symbol_spread(sym) if ADD_SPREAD_TO_SL else 0.0
+
                 if ENABLE_SMC_STRATEGY:
-                    smc_setups = self.smc_detector.scan_for_setups(sym, df_m15, df_h4)
+                    smc_setups = self.smc_detector.scan_for_setups(sym, df_m15, df_h4, spread=spread_val)
 
                 if ENABLE_ZUMIKO_STRATEGY:
-                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_m15, df_h1, df_h4)
+                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_m15, df_h1, df_h4, spread=spread_val)
 
                 final_setups: List[TradeSetup] = []
 
