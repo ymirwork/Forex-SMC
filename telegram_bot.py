@@ -14,6 +14,7 @@ from telegram.ext import (
 from config import (
     ALLOWED_CHAT_IDS,
     DEFAULT_RISK_PERCENT,
+    ENABLE_NOTION,
     PROP_FIRM_MODE,
     PROP_INITIAL_BALANCE,
     PROP_MAX_DRAWDOWN_PERCENT,
@@ -24,6 +25,7 @@ from config import (
     TELEGRAM_BOT_TOKEN,
 )
 from mt5_client import MT5Client
+from notion_journal import NotionJournal
 from rr_optimizer import RROptimizer
 from smc_detector import TradeSetup
 from trade_journal import TradeJournal
@@ -50,6 +52,7 @@ class TelegramBotManager:
         self.pending_setups: Dict[str, TradeSetup] = {}
         self.scanner_callback = None  # Reference to manual trigger scan
         self.journal = TradeJournal()
+        self.notion = NotionJournal()
 
     def set_scanner_callback(self, callback):
         self.scanner_callback = callback
@@ -91,6 +94,7 @@ class TelegramBotManager:
             "• `/be` - Przestawienie Stop Loss na Break-Even (cena wejścia)\n"
             "• `/scan` - Wymuś natychmiastowe przeskanowanie rynku\n"
             "• `/journal` - Dziennik zagrań i dotychczasowe statystyki R\n"
+            "• `/notionsync` - Synchronizacja dziennika z Notion Database\n"
             "• `/optimizer` - Optymalizator BEST RR (szukanie idealnego Take Profit)\n"
             "• `/addtrade` - Ręczne dodanie zagrania do dziennika"
         )
@@ -207,6 +211,14 @@ class TelegramBotManager:
                 f"Wynik: {icon} `{t['realized_r']:+.1f}R` | Max R: `{t['max_r']:.1f}` | Confluence: `{t['confluence_score']}%`\n"
             )
 
+        notion_status = ""
+        if ENABLE_NOTION and self.notion.is_configured():
+            notion_status = "🌐 **Notion:** 🟢 Aktywny (Automatyczna synchronizacja)\n\n"
+        elif self.notion.is_configured():
+            notion_status = "🌐 **Notion:** ⚪ Skonfigurowany (Wpisz `/notionsync` lub włącz `ENABLE_NOTION=True`)\n\n"
+        else:
+            notion_status = "🌐 **Notion:** ⚪ Niepołączony (Wpisz `/notionsync` po instrukcję)\n\n"
+
         msg = (
             "📓 **DZIENNIK TRANZAKCJI (SMC JOURNAL)**\n\n"
             f"📊 **Statystyki łączne:**\n"
@@ -214,11 +226,59 @@ class TelegramBotManager:
             f"• Skuteczność (Win Rate): `{stats['winrate']}%`\n"
             f"• Łączny wygenerowany zysk: `{stats['net_r']:+.2f}R`\n"
             f"• Średni zysk na transakcję: `{stats['avg_r']:+.2f}R`\n\n"
+            f"{notion_status}"
             "📋 **Ostatnie transakcje:**\n"
             f"{recent_lines}\n"
-            "💡 Wpisz `/optimizer`, aby obliczyć matematycznie najlepszy poziom Take Profit (BEST RR)!"
+            "💡 Wpisz `/optimizer`, aby obliczyć Take Profit, lub `/notionsync` dla bazy Notion!"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def notionsync_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Syncs all historical or unsynced trades from trades.db to Notion."""
+        if not self._is_authorized(update):
+            return
+
+        if not self.notion.is_configured():
+            help_msg = (
+                "📓 **INTEGRACJA NOTION (TRADE JOURNAL)**\n\n"
+                "System obsługuje automatyczne zapisywanie każdego tradu w Notion (wzorowane na ChatGPT Assistant)!\n\n"
+                "**Aby połączyć Notion w 2 minuty:**\n"
+                "1. Wejdź na: [notion.so/profile/integrations](https://www.notion.so/profile/integrations)\n"
+                "2. Kliknij **'New integration'**, nazwij np. `Forex-SMC` i kliknij **Save**.\n"
+                "3. Skopiuj **'Internal Integration Secret'** (`secret_...`) do `.env` jako:\n"
+                "   `NOTION_API_KEY=secret_twoj_klucz`\n"
+                "4. Stwórz tabelę/bazę w Notion lub użyj gotowego szablonu.\n"
+                "5. W Notion kliknij **••• (prawy górny róg) -> Connections -> Dodaj Forex-SMC**.\n"
+                "6. Skopiuj 32-znakowe ID z linku bazy do `.env` jako:\n"
+                "   `NOTION_DATABASE_ID=twoj_database_id`\n"
+                "7. Ustaw `ENABLE_NOTION=True` w `.env` i wpisz tutaj `/notionsync`!"
+            )
+            await update.message.reply_text(help_msg, parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("🔄 Weryfikuję połączenie z bazą Notion...")
+        ok, msg = await self.notion.verify_connection()
+        if not ok:
+            await update.message.reply_text(f"❌ {msg}\n\nUpewnij się, że dodałeś połączenie (Connection) do swojej bazy w Notion!")
+            return
+
+        await update.message.reply_text(f"✅ {msg}\nRozpoczynam wysyłanie transakcji...")
+
+        trades = self.journal.get_all_trades()
+        synced_count = 0
+        for t in trades:
+            if not t.get("notion_page_id"):
+                success, page_id = await self.notion.log_trade(t)
+                if success and page_id:
+                    self.journal.set_notion_page_id_by_ticket(t.get("mt5_ticket") or t.get("id"), page_id)
+                    synced_count += 1
+                await asyncio.sleep(0.3)  # Respect Notion API rate limits
+
+        await update.message.reply_text(
+            f"🎉 **Synchronizacja zakończona!**\n"
+            f"Wysłano `{synced_count}` nowych transakcji do Notion.\n"
+            f"Wszystkie kolejne zagrania będą zapisywać się w Notion automatycznie!"
+        )
 
     async def optimizer_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -385,6 +445,19 @@ class TelegramBotManager:
                     mt5_ticket=ticket,
                     comment="Market order via Telegram",
                 )
+                asyncio.create_task(self._log_trade_to_notion({
+                    "symbol": setup.symbol,
+                    "direction": setup.direction,
+                    "entry_price": setup.entry_price,
+                    "sl_price": setup.sl_price,
+                    "tp_price": setup.tp1_price,
+                    "realized_r": 0.0,
+                    "max_r": setup.rr_ratio,
+                    "confluence_score": setup.confluence_score,
+                    "status": "OPEN",
+                    "mt5_ticket": ticket,
+                    "comment": f"Market order via Telegram | {setup.setup_type}",
+                }))
                 new_caption = (
                     f"{query.message.caption}\n\n"
                     f"✅ **ZLECENIE WYKONANE W MT5!**\n"
@@ -422,6 +495,19 @@ class TelegramBotManager:
                     mt5_ticket=ticket,
                     comment="Market order via Telegram",
                 )
+                asyncio.create_task(self._log_trade_to_notion({
+                    "symbol": setup.symbol,
+                    "direction": setup.direction,
+                    "entry_price": setup.entry_price,
+                    "sl_price": setup.sl_price,
+                    "tp_price": setup.tp1_price,
+                    "realized_r": 0.0,
+                    "max_r": setup.rr_ratio,
+                    "confluence_score": setup.confluence_score,
+                    "status": "OPEN",
+                    "mt5_ticket": ticket,
+                    "comment": f"Market order via Telegram | {setup.setup_type}",
+                }))
                 new_caption = (
                     f"{query.message.caption}\n\n"
                     f"🟡 **ZLECENIE LIMIT ZŁOŻONE W MT5!**\n"
@@ -597,6 +683,17 @@ class TelegramBotManager:
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")
 
+    async def _log_trade_to_notion(self, trade_dict: dict):
+        """Asynchronously logs an executed trade to Notion in the background."""
+        if not self.notion.is_configured():
+            return
+        try:
+            ok, page_id = await self.notion.log_trade(trade_dict)
+            if ok and page_id and trade_dict.get("mt5_ticket"):
+                self.journal.set_notion_page_id_by_ticket(trade_dict["mt5_ticket"], page_id)
+        except Exception as e:
+            logger.error(f"Error logging trade to Notion in background: {e}")
+
     async def send_message(self, text: str):
         """Sends a markdown text message to the alert channel."""
         if not self.app or not self.alert_channel:
@@ -624,6 +721,7 @@ class TelegramBotManager:
         self.app.add_handler(CommandHandler("be", self.be_cmd))
         self.app.add_handler(CommandHandler("scan", self.scan_cmd))
         self.app.add_handler(CommandHandler("journal", self.journal_cmd))
+        self.app.add_handler(CommandHandler("notionsync", self.notionsync_cmd))
         self.app.add_handler(CommandHandler("optimizer", self.optimizer_cmd))
         self.app.add_handler(CommandHandler("bestrr", self.optimizer_cmd))
         self.app.add_handler(CommandHandler("addtrade", self.addtrade_cmd))

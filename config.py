@@ -97,4 +97,12 @@ MAX_RISK_DEVIATION_TOLERANCE = float(os.getenv("MAX_RISK_DEVIATION_TOLERANCE", "
 # Automatyczne przestawianie na Break-Even po osiągnięciu zysku +1.0R
 AUTO_BE_AT_1R = os.getenv("AUTO_BE_AT_1R", "True").lower() in ("true", "1")
 
+# ==========================================
+# NOTION TRADE JOURNAL SETTINGS
+# ==========================================
+ENABLE_NOTION = os.getenv("ENABLE_NOTION", "False").lower() in ("true", "1")
+NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
+
+
 

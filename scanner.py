@@ -27,6 +27,7 @@ from config import (
     ZUMIKO_TREND_EMA,
 )
 from mt5_client import MT5Client
+from notion_journal import NotionJournal
 from smc_detector import SMCDetector, TradeSetup
 from trade_journal import TradeJournal
 from zumiko_detector import ZumikoDetector
@@ -66,6 +67,7 @@ class SMCScanner:
         self.notified_setups: Dict[str, float] = {}
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
+        self.notion = NotionJournal()
 
     def _cleanup_old_notifications(self, max_age_hours: float = 6.0):
         """Clears old sent setup keys so memory does not leak."""
@@ -128,6 +130,19 @@ class SMCScanner:
 
                 comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD"
                 self.journal.close_trade_by_ticket(ticket, realized_r, status, comment_str)
+
+                # Update trade result in Notion database
+                if self.notion.enabled:
+                    asyncio.create_task(
+                        self.notion.update_closed_trade(
+                            ticket=ticket,
+                            realized_r=realized_r,
+                            status=status,
+                            profit=profit,
+                            comment=comment_str,
+                            page_id=t.get("notion_page_id"),
+                        )
+                    )
 
                 logger.info(
                     f"Trade #{ticket} ({t['symbol']}) closed! Status: {status}, "

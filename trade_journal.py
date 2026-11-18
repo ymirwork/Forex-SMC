@@ -39,9 +39,14 @@ class TradeJournal:
                     status TEXT DEFAULT 'CLOSED',
                     chart_path TEXT,
                     mt5_ticket INTEGER,
-                    comment TEXT
+                    comment TEXT,
+                    notion_page_id TEXT
                 )
             """)
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN notion_page_id TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.commit()
 
         # Check if table is empty, seed initial sample trades if so
@@ -121,6 +126,20 @@ class TradeJournal:
             cur = conn.cursor()
             cur.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY id ASC")
             return [dict(row) for row in cur.fetchall()]
+
+    def set_notion_page_id_by_ticket(self, ticket: int, page_id: str):
+        """Associates an MT5 ticket with its synced Notion Page ID."""
+        with self._get_connection() as conn:
+            conn.execute("UPDATE trades SET notion_page_id = ? WHERE mt5_ticket = ?", (page_id, ticket))
+            conn.commit()
+
+    def get_trade_by_ticket(self, ticket: int) -> Optional[Dict]:
+        """Retrieves a trade record by MT5 ticket."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM trades WHERE mt5_ticket = ?", (ticket,))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
     def close_trade_by_ticket(
         self,
