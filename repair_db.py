@@ -49,11 +49,13 @@ def repair_database(db_path: str = "trades.db", force: bool = False) -> bool:
     except Exception as e:
         print(f"⚠️ Błąd podczas odczytu tabeli: {e}. Uruchamiam auto-recovery...")
         journal._recover_database()
-            print(f"   • Liczba wszystkich transakcji w bazie: {len(all_trades)}")
+        try:
+            open_trades = journal.get_open_trades()
+            all_trades = journal.get_all_trades()
+            print(f"   • Liczba wszystkich transakcji po naprawie: {len(all_trades)}")
             print(f"   • Liczba aktywnych transakcji (OPEN): {len(open_trades)}")
-        except Exception as e:
-            print(f"⚠️ Błąd podczas odczytu tabeli: {e}. Uruchamiam auto-recovery...")
-            journal._recover_database()
+        except Exception as e2:
+            print(f"❌ Błąd odczytu po próbie naprawy: {e2}")
 
     # 3. Podsumowanie
     stats = journal.get_summary_stats()
