@@ -220,6 +220,7 @@ class TestSignalGuards(unittest.TestCase):
         setup = detector._build_smc_setup(
             direction="BUY",
             symbol="EURUSD",
+            htf_trend="BULLISH",
             impulse_low=1.0970,
             impulse_high=1.1030,
             current_candle=pd.Series({"close": 1.0990, "open": 1.0995, "high": 1.0998, "low": 1.0988, "time": datetime.now(timezone.utc)}),
@@ -263,6 +264,169 @@ class TestSignalGuards(unittest.TestCase):
         )
         # Structural SL in HYBRID mode or swing low is at 1.0900 (100 pips risk > 2.5 * 10 pips)
         self.assertIsNone(setup)
+
+    def test_smc_confluence_penalizes_counter_trend_h4(self):
+        """Verify that a counter-trend setup against H4 receives a -20% penalty."""
+        detector = SMCDetector(min_confluence_score=70)
+        # BUY setup against BEARISH H4
+        setup = detector._build_smc_setup(
+            direction="BUY",
+            symbol="EURUSD",
+            htf_trend="BEARISH",
+            impulse_low=1.0970,
+            impulse_high=1.1030,
+            current_candle=pd.Series({"close": 1.0990, "open": 1.0995, "high": 1.0998, "low": 1.0988, "time": datetime.now(timezone.utc)}),
+            df_ltf=pd.DataFrame([
+                {"open": 1.0990, "high": 1.0995, "low": 1.0988, "close": 1.0990}
+            ] * 20),
+            swings_ltf=pd.DataFrame(),
+            broken_level=1.1010,
+            event_name="CHoCH",
+            target_rr=2.0,
+            digits=4,
+            point_scale=0.0001,
+            buffer=0.0005,
+        )
+        # Should be None because penalty brings score below 70%
+        self.assertIsNone(setup)
+
+    def test_smc_confluence_breakdown_factors(self):
+        """Verify that aligned H4 + Killzone awards proper confluence weights."""
+        detector = SMCDetector(min_confluence_score=30)
+        setup = detector._build_smc_setup(
+            direction="BUY",
+            symbol="EURUSD",
+            htf_trend="BULLISH",
+            impulse_low=1.0970,
+            impulse_high=1.1030,
+            current_candle=pd.Series({"close": 1.0990, "open": 1.0995, "high": 1.0998, "low": 1.0988, "time": datetime.now(timezone.utc)}),
+            df_ltf=pd.DataFrame([
+                {"open": 1.0990, "high": 1.0995, "low": 1.0988, "close": 1.0990}
+            ] * 20),
+            swings_ltf=pd.DataFrame(),
+            broken_level=1.1010,
+            event_name="BOS",
+            target_rr=2.0,
+            digits=4,
+            point_scale=0.0001,
+            buffer=0.0005,
+            session_info={"session_name": "London Open Killzone", "is_killzone": True},
+        )
+        self.assertIsNotNone(setup)
+        breakdown_dict = {item.factor: item for item in setup.confluence_breakdown}
+        # H4 trend should award 25%
+        self.assertEqual(breakdown_dict["Zgodność z trendem H4"].weight, 25)
+        self.assertTrue(breakdown_dict["Zgodność z trendem H4"].achieved)
+        # Killzone should award 10%
+        self.assertEqual(breakdown_dict["Timing Sesyjny (Killzone)"].weight, 10)
+        self.assertTrue(breakdown_dict["Timing Sesyjny (Killzone)"].achieved)
+        # Total score: 25 (H4) + 15 (structure) + 10 (killzone) + 5 (fibo 66%) = 55%
+        self.assertEqual(setup.confluence_score, 55)
+
+    def test_zumiko_killmlm_opposing_h4_penalty(self):
+        """Verify that Zumiko KillMLM penalizes opposing H4 with -15% penalty and rejects trade below 70%."""
+        from zumiko_detector import ZumikoDetector
+        detector = ZumikoDetector(min_confluence_score=70)
+
+        dates = pd.date_range(end=datetime(2026, 11, 18, 14, 0), periods=300, freq="15min")
+        closes = np.linspace(1.1000, 1.1050, 300)
+        df_m15 = pd.DataFrame({
+            "time": dates,
+            "open": closes - 0.0005,
+            "high": closes + 0.0010,
+            "low": closes - 0.0010,
+            "close": closes,
+        })
+        e10 = pd.Series(closes)
+        e21 = pd.Series(closes - 0.0005)
+
+        # Call _evaluate_zumiko_direction with BUY but h4_dir="SELL" (opposing)
+        setup = detector._evaluate_zumiko_direction(
+            direction="BUY",
+            symbol="EURUSD",
+            df_m15=df_m15,
+            c=1.1050,
+            h=1.1055,
+            l=1.1040,
+            curr_e10=1.1048,
+            curr_e21=1.1042,
+            curr_e238=1.1010,
+            prev_e10=1.1040,
+            prev_e21=1.1041,
+            e10=e10,
+            e21=e21,
+            last_high_val=1.1060,
+            last_high_type="HH",
+            last_low_val=1.1020,
+            last_low_type="HL",
+            h1_dir="BUY",
+            h4_dir="SELL",  # Opposing!
+            mtf={"M15": "BUY", "H1": "BUY", "H4": "SELL"},
+            target_rr=2.0,
+            is_optimal_rr=False,
+            rr_source="Default",
+            session_info={"session_name": "New York Open Killzone", "is_killzone": True},
+            news_warn=None,
+            current_time=datetime(2026, 11, 18, 14, 0),
+            digits=4,
+            point_scale=0.0001,
+            buffer=0.0002,
+        )
+        # Should be None because H4 penalty (-15%) brings score below 70%
+        self.assertIsNone(setup)
+
+    def test_zumiko_killmlm_full_confluence(self):
+        """Verify that Zumiko KillMLM with aligned H4 + Killzone achieves Grade A+ (100%)."""
+        from zumiko_detector import ZumikoDetector
+        detector = ZumikoDetector(min_confluence_score=70)
+
+        dates = pd.date_range(end=datetime(2026, 11, 18, 14, 0), periods=300, freq="15min")
+        closes = np.linspace(1.1000, 1.1050, 300)
+        df_m15 = pd.DataFrame({
+            "time": dates,
+            "open": closes - 0.0005,
+            "high": closes + 0.0010,
+            "low": closes - 0.0010,
+            "close": closes,
+        })
+        e10 = pd.Series(closes)
+        e21 = pd.Series(closes - 0.0005)
+
+        setup = detector._evaluate_zumiko_direction(
+            direction="BUY",
+            symbol="EURUSD",
+            df_m15=df_m15,
+            c=1.1050,
+            h=1.1055,
+            l=1.1040,
+            curr_e10=1.1048,
+            curr_e21=1.1042,
+            curr_e238=1.1030,
+            prev_e10=1.1040,
+            prev_e21=1.1041,
+            e10=e10,
+            e21=e21,
+            last_high_val=1.1060,
+            last_high_type="HH",
+            last_low_val=1.1020,
+            last_low_type="HL",
+            h1_dir="BUY",
+            h4_dir="BUY",  # Full MTF!
+            mtf={"M15": "BUY", "H1": "BUY", "H4": "BUY"},
+            target_rr=2.0,
+            is_optimal_rr=False,
+            rr_source="Default",
+            session_info={"session_name": "New York Open Killzone", "is_killzone": True},
+            news_warn=None,
+            current_time=datetime(2026, 11, 18, 14, 0),
+            digits=4,
+            point_scale=0.0001,
+            buffer=0.0002,
+        )
+        self.assertIsNotNone(setup)
+        # 30 (MTF) + 20 (EMA238) + 20 (fresh cross) + 15 (HL swing) + 15 (killzone) = 100%
+        self.assertEqual(setup.confluence_score, 100)
+        self.assertEqual(setup.grade, "A+")
 
 
 if __name__ == "__main__":

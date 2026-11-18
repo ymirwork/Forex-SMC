@@ -318,60 +318,111 @@ class ZumikoDetector:
         if not (baseline_ok and momentum_ok and trigger_ok and h1_ok):
             return None
 
+        atr = (df_m15["high"] - df_m15["low"]).tail(14).mean()
         total_score = 0
         breakdown: List[ConfluenceItem] = []
 
-        # Factor 1: Trend Baseline EMA 238
-        cmp_sym = ">" if is_buy else "<"
-        total_score += 25
-        breakdown.append(ConfluenceItem(
-            factor=f"Trend EMA 238 ({direction})",
-            weight=25,
-            achieved=True,
-            detail=f"Cena {c:.{digits}f} {cmp_sym} EMA 238 ({curr_e238:.{digits}f}) (+25%)"
-        ))
-
-        # Factor 2: Przebicie / Odrzucenie EMA 10/21
-        total_score += 25
-        breakdown.append(ConfluenceItem(
-            factor=f"Przebicie / Odrzucenie EMA 10/21 ({direction})",
-            weight=25,
-            achieved=True,
-            detail=f"{trigger_name} (EMA10: {curr_e10:.{digits}f} {cmp_sym} EMA21: {curr_e21:.{digits}f}) (+25%)"
-        ))
-
-        # Factor 3: Market structure
-        has_struct = (last_low_type == "HL") if is_buy else (last_high_type == "LH")
-        w3 = 25 if has_struct else 15
-        total_score += w3
-        struct_label = "HL" if is_buy else "LH"
-        struct_val = last_low_val if is_buy else last_high_val
-        struct_desc = f"Struktura {struct_label} ({struct_val:.{digits}f})" if has_struct else f"Ostatni swing ({struct_val:.{digits}f})"
-        breakdown.append(ConfluenceItem(
-            factor=f"Potwierdzenie Struktury {struct_label} ({direction})",
-            weight=25,
-            achieved=has_struct,
-            detail=f"{struct_desc} (+{w3}%)"
-        ))
-
-        # Factor 4: MTF Confluence
-        mtf_full = (h1_dir == direction and h4_dir == direction)
-        w4 = 25 if mtf_full else 15
-        total_score += w4
-        mtf_desc = f"M15: ({direction}) | H1: ({h1_dir}) | H4: ({h4_dir})"
+        # Factor 1: Multi-Timeframe Alignment (30% max, or -15% penalty for opposing H4)
+        h4_match = h4_dir == direction
+        h4_neutral = h4_dir in ("NEUTRAL", None, "", "NONE")
+        if h4_match and h1_dir == direction:
+            w1 = 30
+            mtf_desc = f"Pełna zgodność MTF: M15/H1/H4 zgodnie w {direction} (+30%)"
+        elif h1_dir == direction and h4_neutral:
+            w1 = 15
+            mtf_desc = f"Zgodność M15/H1 w {direction}, H4 neutralny (+15%)"
+        elif not h4_match and not h4_neutral:
+            w1 = -15
+            mtf_desc = f"H4 przeciwny ({h4_dir}) (-15% KARA)"
+        else:
+            w1 = 10
+            mtf_desc = f"Częściowa zgodność MTF: H1={h1_dir}, H4={h4_dir} (+10%)"
+        total_score += w1
         breakdown.append(ConfluenceItem(
             factor=f"Zgodność Multi-Timeframe ({direction})",
-            weight=25,
-            achieved=mtf_full,
-            detail=f"{mtf_desc} (+{w4}%)"
+            weight=30,
+            achieved=(w1 > 0),
+            detail=mtf_desc
         ))
+
+        # Factor 2: Trend Baseline EMA 238 & Overextension (20%)
+        cmp_sym = ">" if is_buy else "<"
+        dist_e238 = abs(c - curr_e238)
+        is_overextended = (atr > 0 and dist_e238 > (3.0 * atr))
+        if is_overextended:
+            w2 = 10
+            detail_e238 = f"Cena {c:.{digits}f} {cmp_sym} EMA 238 ({curr_e238:.{digits}f}), ale mocne rozciągnięcie >3xATR (+10%)"
+        else:
+            w2 = 20
+            detail_e238 = f"Cena {c:.{digits}f} {cmp_sym} EMA 238 ({curr_e238:.{digits}f}) w optymalnym zasięgu (+20%)"
+        total_score += w2
+        breakdown.append(ConfluenceItem(
+            factor=f"Trend EMA 238 ({direction})",
+            weight=20,
+            achieved=True,
+            detail=detail_e238
+        ))
+
+        # Factor 3: Trigger Momentum EMA 10/21 (20%)
+        if is_fresh_cross:
+            w3 = 20
+            trig_desc = f"Świeży {trigger_name} (początek impulsu) (+20%)"
+        else:
+            w3 = 12
+            trig_desc = f"{trigger_name} (kontynuacja trendu) (+12%)"
+        total_score += w3
+        breakdown.append(ConfluenceItem(
+            factor=f"Trigger Momentum EMA 10/21 ({direction})",
+            weight=20,
+            achieved=True,
+            detail=trig_desc
+        ))
+
+        # Factor 4: Potwierdzenie Struktury Swing (HL / LH) (15%)
+        has_struct = (last_low_type == "HL") if is_buy else (last_high_type == "LH")
+        struct_label = "HL" if is_buy else "LH"
+        struct_val = last_low_val if is_buy else last_high_val
+        if has_struct:
+            w4 = 15
+            struct_desc = f"Potwierdzona struktura {struct_label} ({struct_val:.{digits}f}) (+15%)"
+        else:
+            w4 = 0
+            struct_desc = f"Brak czystej struktury {struct_label} (0%)"
+        total_score += w4
+        breakdown.append(ConfluenceItem(
+            factor=f"Potwierdzenie Struktury {struct_label} ({direction})",
+            weight=15,
+            achieved=has_struct,
+            detail=struct_desc
+        ))
+
+        # Factor 5: Timing Sesyjny (Killzone) (15%)
+        is_killzone = session_info.get("is_killzone", False)
+        session_name = session_info.get("session_name", "Standard")
+        if is_killzone:
+            w5 = 15
+            sess_desc = f"Aktywna sesja {session_name} (+15%)"
+        elif any(k in session_name.lower() for k in ("rollover", "noc", "post-ny")):
+            w5 = 0
+            sess_desc = f"Sesja o niskiej płynności: {session_name} (0%)"
+        else:
+            w5 = 5
+            sess_desc = f"Standardowa sesja dzienna: {session_name} (+5%)"
+        total_score += w5
+        breakdown.append(ConfluenceItem(
+            factor="Timing Sesyjny (Killzone)",
+            weight=15,
+            achieved=is_killzone,
+            detail=sess_desc
+        ))
+
+        total_score = max(0, min(100, total_score))
 
         if total_score < self.min_confluence_score:
             return None
 
         spread_buffer = spread if ADD_SPREAD_TO_SL else 0.0
         effective_buffer = buffer + spread_buffer
-        atr = (df_m15["high"] - df_m15["low"]).tail(14).mean()
 
         entry = c
         if is_buy:
@@ -413,7 +464,7 @@ class ZumikoDetector:
             zone_bottom = curr_e10
             swing_pat = f"LH ({last_high_val:.{digits}f})"
 
-        grade = "A+" if total_score >= 90 else ("A" if total_score >= 75 else "B")
+        grade = "A+" if total_score >= 85 else ("A" if total_score >= 70 else "B")
 
         return TradeSetup(
             symbol=symbol,

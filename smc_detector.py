@@ -458,6 +458,7 @@ class SMCDetector:
                 df_d1=df_d1,
                 df_w1=df_w1,
                 df_h1=df_h1,
+                structure_age=structure_age,
             )
             if setup:
                 setups.append(setup)
@@ -492,6 +493,7 @@ class SMCDetector:
         df_w1: Optional[pd.DataFrame] = None,
         df_h1: Optional[pd.DataFrame] = None,
         leg_df: Optional[pd.DataFrame] = None,
+        structure_age: int = 5,
     ) -> Optional[TradeSetup]:
         if leg_df is not None and (impulse_low is None or impulse_high is None):
             impulse_low = float(leg_df["low"].min())
@@ -664,79 +666,102 @@ class SMCDetector:
         breakdown: List[ConfluenceItem] = []
         total_score = 0
 
-        # 1. H4 Trend Alignment (20%)
+        # 1. H4 Trend Alignment (25% max, or -20% penalty for counter-trend)
         h4_match = htf_trend == expected_htf
-        w1 = 20 if h4_match else (10 if htf_trend == "NEUTRAL" else 0)
+        if h4_match:
+            w1 = 25
+            h4_desc = f"H4 zgodny ({htf_trend}) (+25%)"
+        elif htf_trend == "NEUTRAL":
+            w1 = 10
+            h4_desc = f"H4 neutralny (+10%)"
+        else:
+            w1 = -20
+            h4_desc = f"H4 przeciwny: {htf_trend} (-20% KARA)"
         total_score += w1
         breakdown.append(ConfluenceItem(
             factor="Zgodność z trendem H4",
-            weight=20,
+            weight=25,
             achieved=h4_match,
-            detail=f"H4: {htf_trend} (+{w1}%)"
+            detail=h4_desc
         ))
 
-        # 2. Market Structure Confirmation (CHoCH / BOS) (20%)
-        total_score += 20
-        choch_label = "szczytu" if is_buy else "dołka"
-        event_desc = "Odwrócenie trendu (CHoCH)" if event_name == "CHoCH" else "Kontynuacja trendu (BOS)"
-        breakdown.append(ConfluenceItem(
-            factor=f"Potwierdzenie M15 {event_name}",
-            weight=20,
-            achieved=True,
-            detail=f"{event_desc}: Wybicie {choch_label} {broken_level:.{digits}f} (+20%)"
-        ))
-
-        # 3. Fibonacci Retracement Depth (20%)
-        is_deep_ote = (current_price <= fibo_705) if is_buy else (current_price >= fibo_705)
-        w3 = 20 if is_deep_ote else 15
-        total_score += w3
-        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8% - 70.5%)"
-        breakdown.append(ConfluenceItem(
-            factor="Poziom Fibonacciego",
-            weight=20,
-            achieved=True,
-            detail=f"{fibo_desc} (+{w3}%)"
-        ))
-
-        # 4. Order Block / FVG Confluence (15%)
+        # 2. Institutional POI: Order Block / FVG Confluence (25%)
         ob_fibo_low = min(fibo_786, fibo_618)
         ob_fibo_high = max(fibo_786, fibo_618)
         has_ob_fvg, ob_detail = self._check_ob_and_fvg_confluence(
             df_ltf, swings_ltf, leg_start_idx, ob_fibo_low, ob_fibo_high, direction
         )
-        w4 = 15 if has_ob_fvg else 0
-        total_score += w4
+        w2 = 25 if has_ob_fvg else 0
+        total_score += w2
         breakdown.append(ConfluenceItem(
-            factor="Zbieżność z Order Block / FVG",
-            weight=15,
+            factor="Strefa Instytucjonalna (OB / FVG)",
+            weight=25,
             achieved=has_ob_fvg,
-            detail=f"{ob_detail} (+{w4}%)"
+            detail=f"{ob_detail} (+{w2}%)"
         ))
 
-        # 5. Advanced Liquidity Sweep (15% base + 5% bonus for Multi-Sweep / HTF)
+        # 3. Market Structure Confirmation (CHoCH / BOS) (15%)
+        choch_label = "szczytu" if is_buy else "dołka"
+        event_desc = "Odwrócenie trendu (CHoCH)" if event_name == "CHoCH" else "Kontynuacja trendu (BOS)"
+        is_fresh = structure_age <= 10
+        w3 = 15 if is_fresh else 10
+        total_score += w3
+        fresh_desc = "Świeże wybicie" if is_fresh else f"Wybicie ({structure_age} b. temu)"
+        breakdown.append(ConfluenceItem(
+            factor=f"Potwierdzenie M15 {event_name}",
+            weight=15,
+            achieved=True,
+            detail=f"{event_desc} ({fresh_desc}): {broken_level:.{digits}f} (+{w3}%)"
+        ))
+
+        # 4. Advanced Liquidity Sweep (15% base + 5% bonus for Multi-Sweep / HTF)
         has_sweep = liq_eval.has_sweep
-        w5 = liq_eval.confluence_weight
+        w4 = liq_eval.confluence_weight
         bonus = liq_eval.bonus_weight
-        total_score += (w5 + bonus)
-        total_score = min(100, total_score)
+        total_score += (w4 + bonus)
         breakdown.append(ConfluenceItem(
             factor="Wybicie płynności (Sweep)",
             weight=15,
             achieved=has_sweep,
-            detail=f"{liq_eval.summary_msg} (+{w5 + bonus}%)"
+            detail=f"{liq_eval.summary_msg} (+{w4 + bonus}%)"
         ))
 
-        # 6. Candlestick Wick Rejection (10%)
-        has_rejection, wick_msg = self._check_candle_rejection(current_candle, direction)
-        w6 = 10 if has_rejection else 0
+        # 5. Institutional Session Timing (Killzone) (10%)
+        is_killzone = session_info.get("is_killzone", False)
+        session_name = session_info.get("session_name", "Standard")
+        w5 = 10 if is_killzone else 0
+        total_score += w5
+        breakdown.append(ConfluenceItem(
+            factor="Timing Sesyjny (Killzone)",
+            weight=10,
+            achieved=is_killzone,
+            detail=f"Sesja: {session_name} (+{w5}%)"
+        ))
+
+        # 6. Fibonacci Retracement Depth (Discount / Premium OTE) (10%)
+        is_deep_ote = (current_price <= fibo_705) if is_buy else (current_price >= fibo_705)
+        w6 = 10 if is_deep_ote else 5
         total_score += w6
-        total_score = min(100, total_score)
+        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8% - 70.5%)"
+        breakdown.append(ConfluenceItem(
+            factor="Strefa Fibonacciego (OTE)",
+            weight=10,
+            achieved=True,
+            detail=f"{fibo_desc} (+{w6}%)"
+        ))
+
+        # 7. Candlestick Wick Rejection (5%)
+        has_rejection, wick_msg = self._check_candle_rejection(current_candle, direction)
+        w7 = 5 if has_rejection else 0
+        total_score += w7
         breakdown.append(ConfluenceItem(
             factor="Odrzucenie świecowe (Knot)",
-            weight=10,
+            weight=5,
             achieved=has_rejection,
-            detail=f"{wick_msg} (+{w6}%)"
+            detail=f"{wick_msg} (+{w7}%)"
         ))
+
+        total_score = max(0, min(100, total_score))
 
         if total_score < self.min_confluence_score:
             return None
