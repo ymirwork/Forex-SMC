@@ -350,7 +350,8 @@ class TelegramBotManager:
 
         if action in ("market", "limit"):
             if PROP_FIRM_MODE:
-                can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol)
+                sl_dist = abs(setup.entry_price - setup.sl_price)
+                can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol, sl_distance=sl_dist)
                 if not can_trade:
                     await query.answer(text=reason[:190], show_alert=True)
                     await query.edit_message_caption(

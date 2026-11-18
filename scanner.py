@@ -5,6 +5,7 @@ from typing import Dict, List, Set
 
 from chart_generator import ChartGenerator
 from config import (
+    AUTO_BE_AT_1R,
     ENABLE_SMC_STRATEGY,
     ENABLE_ZUMIKO_STRATEGY,
     HTF_TIMEFRAME,
@@ -64,6 +65,7 @@ class SMCScanner:
         self.is_running = False
         self.notified_setups: Dict[str, float] = {}
         self._prop_warned: bool = False
+        self._be_moved_tickets: Set[int] = set()
 
     def _cleanup_old_notifications(self, max_age_hours: float = 6.0):
         """Clears old sent setup keys so memory does not leak."""
@@ -142,6 +144,46 @@ class SMCScanner:
                         f"📓 Dziennik zaktualizowany. Wpisz `/journal` lub `/optimizer`"
                     )
                     await self.telegram.send_message(msg)
+
+        # 3. Auto Break-Even Assistant (Locks 0 risk when trade reaches +1.0R)
+        if AUTO_BE_AT_1R:
+            open_positions = self.mt5_client.get_open_positions()
+            for p in open_positions:
+                ticket = p["ticket"]
+                if ticket in self._be_moved_tickets:
+                    continue
+
+                entry_p = p["price_open"]
+                sl_p = p["sl"]
+                curr_p = p["price_current"]
+                pnl = p["profit"]
+
+                if sl_p <= 0 or entry_p <= 0:
+                    continue
+
+                initial_sl_dist = abs(entry_p - sl_p)
+                # If SL is already moved to BE (within 15% distance to entry)
+                if abs(entry_p - sl_p) < (initial_sl_dist * 0.15):
+                    self._be_moved_tickets.add(ticket)
+                    continue
+
+                is_buy = p["type"] == "BUY"
+                favorable_move = (curr_p - entry_p) if is_buy else (entry_p - curr_p)
+
+                # If market moved >= 1.0R in favor of trade
+                if favorable_move >= initial_sl_dist:
+                    ok, msg = self.mt5_client.move_sl_to_breakeven(ticket)
+                    if ok:
+                        self._be_moved_tickets.add(ticket)
+                        if self.telegram:
+                            alert_msg = (
+                                f"⚡ **AUTO BREAK-EVEN (+1.0R)!**\n\n"
+                                f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
+                                f"📈 Aktualny zysk: `+{pnl:.2f} USD` (Osiągnięto +1.0R!)\n"
+                                f"🛡️ **Stop Loss przestawiony na wejście ({entry_p})!**\n"
+                                f"🔒 Pozycja jest już wolna od ryzyka (Risk-Free Trade)."
+                            )
+                            await self.telegram.send_message(alert_msg)
 
     async def scan_once(self) -> int:
         """Runs a single scan across all configured symbols."""
@@ -243,7 +285,8 @@ class SMCScanner:
 
                     # Prop Firm trade eligibility check before alert
                     if PROP_FIRM_MODE:
-                        can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol)
+                        sl_dist = abs(setup.entry_price - setup.sl_price)
+                        can_trade, reason = self.mt5_client.can_open_new_trade(setup.symbol, sl_distance=sl_dist)
                         if not can_trade:
                             logger.info(f"🛡️ [PROP SHIELD] Pomijam powiadomienie dla {setup.symbol}: {reason}")
                             continue

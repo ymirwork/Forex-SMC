@@ -87,3 +87,14 @@ PROP_MAX_OPEN_TRADES = int(os.getenv("PROP_MAX_OPEN_TRADES", "6")) # Max 6 concu
 PROP_MAX_SAME_CURRENCY_TRADES = int(os.getenv("PROP_MAX_SAME_CURRENCY_TRADES", "2")) # Max 2 on same currency
 PROP_ENFORCE_NEWS_FILTER = os.getenv("PROP_ENFORCE_NEWS_FILTER", "True").lower() in ("true", "1")
 
+# ==========================================
+# SCALABLE RISK & TIGHT SL MANAGEMENT
+# ==========================================
+# Ciasny SL oparty na świecy reakcyjnej i strefie OTE / EMA 10/21
+TIGHT_SL_MODE = os.getenv("TIGHT_SL_MODE", "True").lower() in ("true", "1")
+# Dopuszczalne odchylenie ryzyka % przy zaokrągleniu do min. lota 0.01 (1.35 = max +35% ponad cel %)
+MAX_RISK_DEVIATION_TOLERANCE = float(os.getenv("MAX_RISK_DEVIATION_TOLERANCE", "1.35"))
+# Automatyczne przestawianie na Break-Even po osiągnięciu zysku +1.0R
+AUTO_BE_AT_1R = os.getenv("AUTO_BE_AT_1R", "True").lower() in ("true", "1")
+
+

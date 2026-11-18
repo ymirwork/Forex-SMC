@@ -8,7 +8,7 @@ from rr_optimizer import RROptimizer
 from session_manager import SessionManager
 from smc_detector import ConfluenceItem, TradeSetup
 from trade_journal import TradeJournal
-from config import DEFAULT_RR_RATIO, MIN_TRADES_FOR_OPTIMAL_RR, USE_OPTIMAL_RR
+from config import DEFAULT_RR_RATIO, MIN_TRADES_FOR_OPTIMAL_RR, TIGHT_SL_MODE, USE_OPTIMAL_RR
 
 logger = logging.getLogger("ForexSMC.ZumikoDetector")
 
@@ -283,8 +283,13 @@ class ZumikoDetector:
 
             if total_score >= self.min_confluence_score:
                 entry = c
-                # Stop loss poniżej ostatniego dołka lub EMA 238
-                sl_ref = min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer)
+                recent_low = df_m15.iloc[-5:]["low"].min()
+                if TIGHT_SL_MODE:
+                    # Tight structural stop: below local EMA 21 or recent candle low (never the distant EMA 238)
+                    sl_ref = min(recent_low, curr_e21)
+                else:
+                    sl_ref = min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer)
+
                 sl = sl_ref - buffer
                 risk = entry - sl
 
@@ -391,8 +396,13 @@ class ZumikoDetector:
 
             if total_score >= self.min_confluence_score:
                 entry = c
-                # Stop loss powyżej ostatniego szczytu lub EMA 238
-                sl_ref = max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer)
+                recent_high = df_m15.iloc[-5:]["high"].max()
+                if TIGHT_SL_MODE:
+                    # Tight structural stop: above local EMA 21 or recent candle high (never the distant EMA 238)
+                    sl_ref = max(recent_high, curr_e21)
+                else:
+                    sl_ref = max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer)
+
                 sl = sl_ref + buffer
                 risk = sl - entry
 

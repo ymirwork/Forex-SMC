@@ -4,6 +4,8 @@ import pandas as pd
 import MetaTrader5 as mt5
 
 from config import (
+    DEFAULT_RISK_PERCENT,
+    MAX_RISK_DEVIATION_TOLERANCE,
     PROP_FIRM_MODE,
     PROP_INITIAL_BALANCE,
     PROP_MAX_DRAWDOWN_PERCENT,
@@ -636,13 +638,14 @@ class MT5Client:
             "risk_per_trade_pct": PROP_RISK_PER_TRADE_PERCENT,
         }
 
-    def can_open_new_trade(self, symbol: str) -> Tuple[bool, str]:
+    def can_open_new_trade(self, symbol: str, sl_distance: float = 0.0) -> Tuple[bool, str]:
         """
-        Enforces Prop Firm risk boundaries:
+        Enforces Prop Firm risk boundaries and Scalable Lot Risk:
         1. Static Max Drawdown Breach
         2. Safety Halt threshold
         3. Max open concurrent trades
         4. Currency correlation limit
+        5. Scalable % Risk vs Minimum Lot Constraint
         """
         if not PROP_FIRM_MODE:
             return True, "OK"
@@ -695,6 +698,32 @@ class MT5Client:
                     False,
                     f"⚠️ Tarcza korelacji: Waluta {quote_curr} występuje już w {quote_count} pozycjach (Max: {PROP_MAX_SAME_CURRENCY_TRADES}).",
                 )
+
+        # 5. Scalable Minimum Lot Risk Check (% scaling)
+        if sl_distance > 0:
+            resolved = self.resolve_symbol(symbol)
+            sym_info = mt5.symbol_info(resolved) if resolved else None
+            acc_info = mt5.account_info()
+            if sym_info and acc_info and acc_info.balance > 0:
+                vol_min = sym_info.volume_min if sym_info.volume_min > 0 else 0.01
+                tick_size = sym_info.trade_tick_size if sym_info.trade_tick_size > 0 else sym_info.point
+                tick_val = sym_info.trade_tick_value if sym_info.trade_tick_value > 0 else 1.0
+
+                ticks = sl_distance / tick_size
+                loss_at_min_lot = ticks * tick_val * vol_min
+
+                target_risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
+                target_risk_usd = acc_info.balance * (target_risk_pct / 100.0)
+                max_tolerated_risk_usd = target_risk_usd * MAX_RISK_DEVIATION_TOLERANCE
+
+                if loss_at_min_lot > max_tolerated_risk_usd:
+                    actual_risk_pct = (loss_at_min_lot / acc_info.balance) * 100.0
+                    return (
+                        False,
+                        f"🛡️ Ryzyko SL zbyt duże dla salda ({acc_info.balance:.0f} {acc_info.currency}): "
+                        f"min. lot ({vol_min}) dałby stratę {loss_at_min_lot:.2f} {acc_info.currency} ({actual_risk_pct:.2f}% kapitału), "
+                        f"przekraczając dopuszczalny limit {target_risk_pct}% (max z tolerancją: {max_tolerated_risk_usd:.2f} {acc_info.currency}).",
+                    )
 
         return True, "OK"
 

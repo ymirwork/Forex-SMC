@@ -8,7 +8,7 @@ from news_filter import NewsFilter
 from rr_optimizer import RROptimizer
 from session_manager import SessionManager
 from trade_journal import TradeJournal
-from config import DEFAULT_RR_RATIO, MIN_TRADES_FOR_OPTIMAL_RR, USE_OPTIMAL_RR
+from config import DEFAULT_RR_RATIO, MIN_TRADES_FOR_OPTIMAL_RR, TIGHT_SL_MODE, USE_OPTIMAL_RR
 
 
 @dataclass
@@ -258,7 +258,13 @@ class SMCDetector:
                     # Condition: Pullback >= 61.8%
                     if (current_price <= fibo_618 + buffer) and (current_price >= impulse_low - buffer):
                         entry = current_price
-                        sl = impulse_low - buffer
+                        if TIGHT_SL_MODE:
+                            # Tight Refined Invalidation: below 78.6% Fibo or local pullback low (last 5 candles)
+                            recent_pullback_low = df_ltf.iloc[-5:]["low"].min()
+                            sl = min(fibo_786, recent_pullback_low) - buffer
+                        else:
+                            sl = impulse_low - buffer
+
                         risk = entry - sl
                         if risk <= (point_scale * 5):
                             continue
@@ -399,7 +405,13 @@ class SMCDetector:
                     # Condition: Pullback >= 61.8%
                     if (current_price >= fibo_618 - buffer) and (current_price <= impulse_high + buffer):
                         entry = current_price
-                        sl = impulse_high + buffer
+                        if TIGHT_SL_MODE:
+                            # Tight Refined Invalidation: above 78.6% Fibo or local pullback high (last 5 candles)
+                            recent_pullback_high = df_ltf.iloc[-5:]["high"].max()
+                            sl = max(fibo_786, recent_pullback_high) + buffer
+                        else:
+                            sl = impulse_high + buffer
+
                         risk = sl - entry
                         if risk <= (point_scale * 5):
                             continue
