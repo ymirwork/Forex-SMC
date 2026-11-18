@@ -81,6 +81,7 @@ class TelegramBotManager:
             f"👤 **Twój Chat ID:** `{update.effective_user.id}`\n\n"
             "**Dostępne komendy:**\n"
             "• `/status` - Stan konta i otwarte pozycje w MT5\n"
+            "• `/be` - Przestawienie Stop Loss na Break-Even (cena wejścia)\n"
             "• `/scan` - Wymuś natychmiastowe przeskanowanie rynku\n"
             "• `/journal` - Dziennik zagrań i dotychczasowe statystyki R\n"
             "• `/optimizer` - Optymalizator BEST RR (szukanie idealnego Take Profit)\n"
@@ -222,6 +223,40 @@ class TelegramBotManager:
         except Exception as e:
             await update.message.reply_text(f"❌ Błąd zapisu: {e}")
 
+    async def be_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Moves Stop Loss of open position to Break-Even."""
+        if not self._is_authorized(update):
+            return
+
+        if context.args:
+            try:
+                ticket_num = int(context.args[0])
+                ok, msg = self.mt5_client.move_sl_to_breakeven(ticket_num)
+                await update.message.reply_text(msg, parse_mode="Markdown")
+                return
+            except ValueError:
+                await update.message.reply_text("❌ Podaj poprawny numer ticketu, np. `/be 105626168`", parse_mode="Markdown")
+                return
+
+        positions = self.mt5_client.get_open_positions()
+        if not positions:
+            await update.message.reply_text("ℹ️ Brak otwartych pozycji do przestawienia na Break-Even.")
+            return
+
+        keyboard = []
+        for p in positions:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🛡️ Przestaw BE: {p['symbol']} #{p['ticket']} (PnL: {p['profit']:+.2f})",
+                    callback_data=f"be:{p['ticket']}",
+                )
+            ])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "Wybierz pozycję, którą chcesz przestawić na Break-Even (SL = cena wejścia):",
+            reply_markup=reply_markup,
+        )
+
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -234,6 +269,17 @@ class TelegramBotManager:
         parts = data.split(":")
         action = parts[0]
         setup_id = parts[1] if len(parts) > 1 else ""
+
+        if action == "be":
+            try:
+                ticket_num = int(setup_id)
+                ok, msg = self.mt5_client.move_sl_to_breakeven(ticket_num)
+                await query.answer(text=msg[:190], show_alert=True)
+                if ok and query.message:
+                    await query.message.reply_text(msg, parse_mode="Markdown")
+            except Exception as e:
+                await query.answer(text=f"Błąd BE: {e}", show_alert=True)
+            return
 
         setup = self.pending_setups.get(setup_id)
 
@@ -472,6 +518,19 @@ class TelegramBotManager:
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")
 
+    async def send_message(self, text: str):
+        """Sends a markdown text message to the alert channel."""
+        if not self.app or not self.alert_channel:
+            return
+        try:
+            await self.app.bot.send_message(
+                chat_id=self.alert_channel,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {e}")
+
     def build_application(self) -> Application:
         """Configures the telegram application."""
         if not self.token:
@@ -482,6 +541,7 @@ class TelegramBotManager:
 
         self.app.add_handler(CommandHandler("start", self.start_cmd))
         self.app.add_handler(CommandHandler("status", self.status_cmd))
+        self.app.add_handler(CommandHandler("be", self.be_cmd))
         self.app.add_handler(CommandHandler("scan", self.scan_cmd))
         self.app.add_handler(CommandHandler("journal", self.journal_cmd))
         self.app.add_handler(CommandHandler("optimizer", self.optimizer_cmd))

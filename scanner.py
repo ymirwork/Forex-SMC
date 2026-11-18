@@ -22,6 +22,7 @@ from config import (
 )
 from mt5_client import MT5Client
 from smc_detector import SMCDetector, TradeSetup
+from trade_journal import TradeJournal
 from zumiko_detector import ZumikoDetector
 
 logger = logging.getLogger("ForexSMC.Scanner")
@@ -33,11 +34,14 @@ class SMCScanner:
     1. Smart Money Concepts (M15 CHoCH + Fibo OTE >= 61.8% + Asian Sweep)
     2. Zumiko KillMLM Strategy (EMA 238 Trend + EMA 10/21 Cross + MTF Alignment)
     3. Golden Combo (Co-incident alignment of both SMC & Zumiko in the same direction)
+    4. Active Position Lock: Automatically locks symbols with open trades / pending orders until closed.
+    5. Real-Time Trade Monitor: Detects TP / SL hits, logs results, and sends notifications.
     """
 
     def __init__(self, mt5_client: MT5Client, telegram_manager=None):
         self.mt5_client = mt5_client
         self.telegram = telegram_manager
+        self.journal = TradeJournal()
         self.smc_detector = SMCDetector(
             swing_length=SWING_LENGTH,
             min_confluence_score=MIN_CONFLUENCE_SCORE,
@@ -62,6 +66,59 @@ class SMCScanner:
         for k in expired:
             del self.notified_setups[k]
 
+    async def monitor_open_trades(self):
+        """
+        Monitors active positions tracked in trades.db.
+        When a position closes (TP, SL, or manual), updates the journal
+        and dispatches a Telegram notification.
+        """
+        open_trades = self.journal.get_open_trades()
+        if not open_trades:
+            return
+
+        for t in open_trades:
+            ticket = t.get("mt5_ticket")
+            if not ticket:
+                continue
+
+            closed_info = self.mt5_client.get_closed_deal_info(ticket)
+            if closed_info:
+                profit = closed_info.get("profit", 0.0)
+                reason = closed_info.get("reason", 0)
+
+                # Determine outcome based on deal reason and profit
+                if reason == 5 or profit > 0:
+                    status = "WIN"
+                    status_desc = "🎯 TAKE PROFIT OSIĄGNIĘTY!"
+                    realized_r = t.get("max_r", 1.8) if t.get("max_r", 0) > 0 else 1.8
+                elif reason == 4 or profit < 0:
+                    status = "LOSS"
+                    status_desc = "🛑 STOP LOSS TRAFIONY"
+                    realized_r = -1.0
+                else:
+                    status = "WIN" if profit > 0 else "LOSS"
+                    status_desc = "✋ ZAMKNIĘCIE RĘCZNE"
+                    realized_r = 0.5 if profit > 0 else -0.5
+
+                comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD"
+                self.journal.close_trade_by_ticket(ticket, realized_r, status, comment_str)
+
+                logger.info(
+                    f"Trade #{ticket} ({t['symbol']}) closed! Status: {status}, "
+                    f"Realized R: {realized_r:+.1f}R, Profit: {profit:+.2f} USD"
+                )
+
+                if self.telegram:
+                    msg = (
+                        f"🏁 **POZYCJA ZAMKNIĘTA: {t['symbol']} [{t['direction']}]**\n\n"
+                        f"🎫 **Ticket:** `#{ticket}`\n"
+                        f"🎯 **Status:** **{status_desc}**\n"
+                        f"💵 **Wynik:** `{profit:+.2f} USD` (`{realized_r:+.1f}R`)\n\n"
+                        f"🔓 **Para {t['symbol']} została odblokowana i wraca do skanera!**\n"
+                        f"📓 Dziennik zaktualizowany. Wpisz `/journal` lub `/optimizer`"
+                    )
+                    await self.telegram.send_message(msg)
+
     async def scan_once(self) -> int:
         """Runs a single scan across all configured symbols."""
         if not self.mt5_client.ensure_connection():
@@ -69,12 +126,23 @@ class SMCScanner:
             return 0
 
         self._cleanup_old_notifications()
+        # Monitor open positions for closures
+        await self.monitor_open_trades()
+
         found_count = 0
+        busy_symbols = self.mt5_client.get_busy_symbols()
+
         logger.info(
-            f"Scanning {len(SYMBOLS)} symbols (SMC: {ENABLE_SMC_STRATEGY}, Zumiko: {ENABLE_ZUMIKO_STRATEGY})..."
+            f"Scanning {len(SYMBOLS)} symbols (SMC: {ENABLE_SMC_STRATEGY}, Zumiko: {ENABLE_ZUMIKO_STRATEGY}). "
+            f"Locked symbols with active trades: {busy_symbols}"
         )
 
         for sym in SYMBOLS:
+            # Active Position Lock: Skip symbol if it currently has an open position or pending order
+            if sym.upper() in busy_symbols:
+                logger.info(f"🔒 [SYMBOL LOCK] {sym} posiada aktywną pozycję/zlecenie w MT5. Pomijam skanowanie do czasu zamknięcia.")
+                continue
+
             try:
                 # Fetch multi-timeframe candles
                 df_m15 = self.mt5_client.fetch_ohlcv(sym, "M15", LOOKBACK_BARS)
@@ -153,17 +221,27 @@ class SMCScanner:
         return found_count
 
     async def run_loop(self):
-        """Main asynchronous scanner loop."""
+        """Main asynchronous scanner loop with real-time trade monitoring."""
         self.is_running = True
         logger.info(f"SMC & Zumiko Multi-Strategy Scanner loop started. Interval: {SCAN_INTERVAL_SECONDS}s")
 
+        last_scan_time = 0.0
+
         while self.is_running:
             try:
-                await self.scan_once()
+                now = time.time()
+                # Fast trade monitoring every 10 seconds for instant TP / SL closing alerts
+                await self.monitor_open_trades()
+
+                # Full market scan every SCAN_INTERVAL_SECONDS (e.g. 60s)
+                if (now - last_scan_time) >= SCAN_INTERVAL_SECONDS:
+                    await self.scan_once()
+                    last_scan_time = now
+
             except Exception as e:
                 logger.error(f"Error in scanner loop: {e}", exc_info=True)
 
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+            await asyncio.sleep(10)
 
     def stop(self):
         self.is_running = False

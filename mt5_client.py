@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
 
@@ -413,7 +413,6 @@ class MT5Client:
             f"Limit {direction} placed on {resolved} at {price}! Ticket: {result.order}, Volume: {volume}"
         )
         return True, f"Limit order #{result.order} placed at {price}", result.order
-        return True, f"Success! Limit Order #{result.order} placed at {price}", result.order
 
     def get_open_positions(self) -> List[Dict]:
         """Retrieves list of active open positions."""
@@ -439,3 +438,114 @@ class MT5Client:
                 "comment": p.comment,
             })
         return res
+
+    def get_busy_symbols(self) -> Set[str]:
+        """
+        Returns set of uppercase symbols (both broker names and clean base names)
+        that currently have an active open position or pending order in MT5.
+        """
+        if not self.ensure_connection():
+            return set()
+
+        busy = set()
+        from config import DEFAULT_SYMBOLS
+
+        # 1. Open market positions
+        positions = mt5.positions_get()
+        if positions:
+            for p in positions:
+                busy.add(p.symbol.upper())
+                clean = p.symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(".", "")
+                for base in DEFAULT_SYMBOLS:
+                    if base.upper() in clean:
+                        busy.add(base.upper())
+
+        # 2. Pending limit / stop orders
+        orders = mt5.orders_get()
+        if orders:
+            for o in orders:
+                busy.add(o.symbol.upper())
+                clean = o.symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(".", "")
+                for base in DEFAULT_SYMBOLS:
+                    if base.upper() in clean:
+                        busy.add(base.upper())
+
+        return busy
+
+    def get_closed_deal_info(self, ticket: int) -> Optional[Dict]:
+        """
+        Checks MT5 deal history for a closed position ticket.
+        Returns deal outcome info if closed, or None if still open.
+        """
+        if not self.ensure_connection():
+            return None
+
+        # Check if still in open positions
+        pos = mt5.positions_get(ticket=ticket)
+        if pos is not None and len(pos) > 0:
+            return None  # Still open
+
+        # Retrieve closing deal from history
+        deals = mt5.history_deals_get(position=ticket)
+        if not deals:
+            return None
+
+        # Find the exit deal (entry == DEAL_ENTRY_OUT)
+        exit_deal = None
+        for d in deals:
+            if getattr(d, "entry", -1) == mt5.DEAL_ENTRY_OUT:
+                exit_deal = d
+                break
+
+        if exit_deal is None and len(deals) >= 2:
+            exit_deal = deals[-1]
+
+        if exit_deal:
+            return {
+                "ticket": ticket,
+                "deal_ticket": exit_deal.ticket,
+                "profit": exit_deal.profit,
+                "price_close": exit_deal.price,
+                "reason": exit_deal.reason,  # 4 is SL, 5 is TP, 0/1/3 is Client/Mobile/Expert
+                "comment": exit_deal.comment,
+                "time": exit_deal.time,
+            }
+
+        return None
+
+    def move_sl_to_breakeven(self, ticket: int) -> Tuple[bool, str]:
+        """
+        Moves the Stop Loss of an active position to its entry price (Break-Even).
+        """
+        if not self.ensure_connection():
+            return False, "Brak połączenia z MT5"
+
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos:
+            return False, f"Pozycja #{ticket} nie została znaleziona w otwartych pozycjach."
+
+        p = pos[0]
+        sym_info = mt5.symbol_info(p.symbol)
+        if not sym_info:
+            return False, f"Brak danych symbolu {p.symbol}"
+
+        be_price = round(p.price_open, sym_info.digits)
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": p.ticket,
+            "symbol": p.symbol,
+            "sl": be_price,
+            "tp": p.tp,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            err = mt5.last_error()
+            return False, f"Błąd modyfikacji: {err}"
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            return False, f"Nie udało się przestawić na BE: retcode={result.retcode} ({result.comment})"
+
+        logger.info(f"Stop Loss for #{ticket} ({p.symbol}) moved to Break-Even: {be_price}")
+        return True, f"✅ Stop Loss dla pozycji #{ticket} ({p.symbol}) przestawiony na Break-Even ({be_price})!"

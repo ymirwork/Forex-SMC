@@ -115,6 +115,31 @@ class TradeJournal:
             """, (realized_r, max_r, status, trade_id))
             conn.commit()
 
+    def get_open_trades(self) -> List[Dict]:
+        """Returns all trades currently tracked as OPEN in the journal."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY id ASC")
+            return [dict(row) for row in cur.fetchall()]
+
+    def close_trade_by_ticket(
+        self,
+        mt5_ticket: int,
+        realized_r: float,
+        status: str = "CLOSED",
+        comment: str = "",
+    ) -> bool:
+        """Closes an open trade record in trades.db by its MT5 ticket number."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades
+                SET realized_r = ?, status = ?, comment = ?
+                WHERE mt5_ticket = ? AND status = 'OPEN'
+            """, (realized_r, status, comment, mt5_ticket))
+            conn.commit()
+            return cur.rowcount > 0
+
     def get_all_trades(self) -> List[Dict]:
         with self._get_connection() as conn:
             cur = conn.cursor()
