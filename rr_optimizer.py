@@ -24,6 +24,34 @@ class RROptimizer:
     """
 
     @staticmethod
+    def get_effective_rr(
+        journal,
+        default_rr: float,
+        use_optimal_rr: bool = True,
+        min_trades: int = 10,
+    ) -> Tuple[float, bool, str]:
+        """
+        Determines the target Risk:Reward dynamically:
+        If enough trades exist (>= min_trades), uses mathematically
+        optimized BEST RR from the journal. Otherwise falls back to default_rr.
+        """
+        if use_optimal_rr and journal is not None:
+            trades = journal.get_all_trades()
+            if len(trades) >= min_trades:
+                opt_res = RROptimizer.calculate_best_rr(trades)
+                if opt_res and opt_res.best_rr >= 1.0:
+                    return (
+                        opt_res.best_rr,
+                        True,
+                        f"Zoptymalizowany Best RR (1:{opt_res.best_rr:.1f} z {len(trades)} zagrań)",
+                    )
+        return (
+            default_rr,
+            False,
+            f"Domyślny RR z .env (1:{default_rr:.1f})",
+        )
+
+    @staticmethod
     def calculate_best_rr(
         trades: List[Dict],
         min_rr: float = 1.0,

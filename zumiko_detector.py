@@ -1,3 +1,4 @@
+from datetime import datetime
 import logging
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -33,36 +34,31 @@ class ZumikoDetector:
         use_optimal_rr: bool = USE_OPTIMAL_RR,
         min_trades_for_optimal: int = MIN_TRADES_FOR_OPTIMAL_RR,
         require_h1_alignment: bool = True,
+        journal: Optional[TradeJournal] = None,
+        news_filter: Optional[NewsFilter] = None,
+        fast_ema: Optional[int] = None,
+        slow_ema: Optional[int] = None,
+        trend_ema: Optional[int] = None,
     ):
-        self.fast_ema_len = fast_ema_len
-        self.slow_ema_len = slow_ema_len
-        self.trend_ema_len = trend_ema_len
+        self.fast_ema_len = fast_ema or fast_ema_len
+        self.slow_ema_len = slow_ema or slow_ema_len
+        self.trend_ema_len = trend_ema or trend_ema_len
         self.swing_len = swing_len
         self.default_rr = default_rr
         self.min_confluence_score = min_confluence_score
         self.use_optimal_rr = use_optimal_rr
         self.min_trades_for_optimal = min_trades_for_optimal
         self.require_h1_alignment = require_h1_alignment
-
-        self.news_filter = NewsFilter()
-        self.journal = TradeJournal()
+        self.news_filter = news_filter or NewsFilter()
+        self.journal = journal or TradeJournal()
 
     def get_effective_rr(self) -> Tuple[float, bool, str]:
-        """Determines target RR dynamically from TradeJournal / RROptimizer or .env."""
-        if self.use_optimal_rr:
-            trades = self.journal.get_all_trades()
-            if len(trades) >= self.min_trades_for_optimal:
-                opt_res = RROptimizer.calculate_best_rr(trades)
-                if opt_res and opt_res.best_rr >= 1.0:
-                    return (
-                        opt_res.best_rr,
-                        True,
-                        f"Zoptymalizowany Best RR (1:{opt_res.best_rr:.1f} z {len(trades)} zagrań)",
-                    )
-        return (
-            self.default_rr,
-            False,
-            f"Domyślny RR z .env (1:{self.default_rr:.1f})",
+        """Determines target RR dynamically using shared RROptimizer logic."""
+        return RROptimizer.get_effective_rr(
+            journal=self.journal,
+            default_rr=self.default_rr,
+            use_optimal_rr=self.use_optimal_rr,
+            min_trades=self.min_trades_for_optimal,
         )
 
     def calculate_mtf_trend(
@@ -217,231 +213,206 @@ class ZumikoDetector:
         # Target RR
         target_rr, is_optimal_rr, rr_source = self.get_effective_rr()
 
-        # ==========================================================
-        # SCENARIO A: BUY (DŁUGA)
-        # ==========================================================
-        # 1. Trend Baseline: Cena powyżej EMA 238
-        is_above_238 = c > curr_e238
-        # 2. Momentum Trigger: EMA 10 > EMA 21
-        is_ema_bullish = curr_e10 > curr_e21
-        # Crossover w ostatnich 3 świecach lub odbicie od strefy EMA 10/21
-        is_fresh_cross = (curr_e10 > curr_e21) and (e10.iloc[-3] <= e21.iloc[-3] or prev_e10 <= prev_e21)
-        is_pullback_bounce = (l <= curr_e21 + buffer) and (c >= curr_e10 - buffer)
-        buy_trigger = is_fresh_cross or is_pullback_bounce
-
-        # 3. MTF Check: H1 musi zgadzać się z BUY (jeśli włączona weryfikacja)
-        h1_ok = (not self.require_h1_alignment) or (h1_dir == "BUY")
-
-        if is_above_238 and is_ema_bullish and buy_trigger and h1_ok:
-            total_score = 0
-            breakdown: List[ConfluenceItem] = []
-
-            # Factor 1: Trend Baseline EMA 238 (BUY)
-            w1 = 25
-            total_score += w1
-            breakdown.append(ConfluenceItem(
-                factor="Trend EMA 238 (BUY)",
-                weight=25,
-                achieved=True,
-                detail=f"Cena {c:.{digits}f} > EMA 238 ({curr_e238:.{digits}f}) (+{w1}%)"
-            ))
-
-            # Factor 2: Przebicie / Odbicie EMA 10/21 (BUY)
-            w2 = 25
-            total_score += w2
-            trigger_name = "Złoty Krzyż EMA 10/21" if is_fresh_cross else "Odbicie od strefy EMA 10/21"
-            breakdown.append(ConfluenceItem(
-                factor="Przebicie / Odbicie EMA 10/21 (BUY)",
-                weight=25,
-                achieved=True,
-                detail=f"{trigger_name} (EMA10: {curr_e10:.{digits}f} > EMA21: {curr_e21:.{digits}f}) (+{w2}%)"
-            ))
-
-            # Factor 3: Potwierdzenie Struktury Rynku (BUY)
-            has_hl = (last_low_type == "HL")
-            w3 = 25 if has_hl else 15
-            total_score += w3
-            struct_desc = f"Wyższy Dołek HL ({last_low_val:.{digits}f})" if has_hl else f"Ostatni dołek ({last_low_val:.{digits}f})"
-            breakdown.append(ConfluenceItem(
-                factor="Potwierdzenie Struktury HL (BUY)",
-                weight=25,
-                achieved=has_hl,
-                detail=f"{struct_desc} (+{w3}%)"
-            ))
-
-            # Factor 4: Zgodność Multi-Timeframe (BUY)
-            mtf_full = (h1_dir == "BUY" and h4_dir == "BUY")
-            w4 = 25 if mtf_full else 15
-            total_score += w4
-            mtf_desc = f"M15: (BUY) | H1: ({h1_dir}) | H4: ({h4_dir})"
-            breakdown.append(ConfluenceItem(
-                factor="Zgodność Multi-Timeframe (BUY)",
-                weight=25,
-                achieved=mtf_full,
-                detail=f"{mtf_desc} (+{w4}%)"
-            ))
-
-            if total_score >= self.min_confluence_score:
-                entry = c
-                recent_low = df_m15.iloc[-5:]["low"].min()
-                if TIGHT_SL_MODE:
-                    # Tight structural stop: below local EMA 21 or recent candle low (never the distant EMA 238)
-                    sl_ref = min(recent_low, curr_e21)
-                else:
-                    sl_ref = min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer)
-
-                sl = sl_ref - buffer
-                risk = entry - sl
-
-                if risk > (point_scale * 5):
-                    tp1 = entry + (risk * target_rr)
-                    tp2 = max(last_high_val, entry + (risk * (target_rr + 1.0)))
-                    grade = "A+" if total_score >= 90 else ("A" if total_score >= 75 else "B")
-
-                    setups.append(TradeSetup(
-                        symbol=symbol,
-                        direction="BUY",
-                        timeframe="M15",
-                        setup_type="Zumiko KillMLM MTF Trend & EMA Pullback",
-                        entry_price=round(entry, digits),
-                        sl_price=round(sl, digits),
-                        tp1_price=round(tp1, digits),
-                        tp2_price=round(tp2, digits),
-                        rr_ratio=round(target_rr, 1),
-                        htf_trend=h4_dir,
-                        zone_top=round(curr_e10, digits),
-                        zone_bottom=round(curr_e21, digits),
-                        reason=f"Zumiko KillMLM {total_score}% Score [{grade}]. MTF: M15/H1/H4 zgodnie w górę.",
-                        timestamp=current_time,
-                        impulse_high=round(last_high_val, digits),
-                        impulse_low=round(last_low_val, digits),
-                        confluence_score=total_score,
-                        grade=grade,
-                        confluence_breakdown=breakdown,
-                        session_name=session_info["session_name"],
-                        is_killzone=session_info["is_killzone"],
-                        news_warning=news_warn,
-                        is_optimal_rr=is_optimal_rr,
-                        rr_source_info=rr_source,
-                        strategy_name="ZUMIKO",
-                        mtf_table=mtf,
-                        ema_fast=round(curr_e10, digits),
-                        ema_slow=round(curr_e21, digits),
-                        ema_238=round(curr_e238, digits),
-                        swing_pattern=f"HL ({last_low_val:.{digits}f})",
-                    ))
-
-        # ==========================================================
-        # SCENARIO B: SELL (KRÓTKA)
-        # ==========================================================
-        # 1. Trend Baseline: Cena poniżej EMA 238
-        is_below_238 = c < curr_e238
-        # 2. Momentum Trigger: EMA 10 < EMA 21
-        is_ema_bearish = curr_e10 < curr_e21
-        is_fresh_cross_sell = (curr_e10 < curr_e21) and (e10.iloc[-3] >= e21.iloc[-3] or prev_e10 >= prev_e21)
-        is_pullback_rejection = (h >= curr_e21 - buffer) and (c <= curr_e10 + buffer)
-        sell_trigger = is_fresh_cross_sell or is_pullback_rejection
-
-        # 3. MTF Check: H1 musi zgadzać się z SELL
-        h1_ok_sell = (not self.require_h1_alignment) or (h1_dir == "SELL")
-
-        if is_below_238 and is_ema_bearish and sell_trigger and h1_ok_sell:
-            total_score = 0
-            breakdown: List[ConfluenceItem] = []
-
-            # Factor 1: Trend Baseline EMA 238 (SELL)
-            w1 = 25
-            total_score += w1
-            breakdown.append(ConfluenceItem(
-                factor="Trend EMA 238 (SELL)",
-                weight=25,
-                achieved=True,
-                detail=f"Cena {c:.{digits}f} < EMA 238 ({curr_e238:.{digits}f}) (+{w1}%)"
-            ))
-
-            # Factor 2: Przebicie / Odrzucenie EMA 10/21 (SELL)
-            w2 = 25
-            total_score += w2
-            trigger_name = "Krzyż Śmierci EMA 10/21" if is_fresh_cross_sell else "Odrzucenie od strefy EMA 10/21"
-            breakdown.append(ConfluenceItem(
-                factor="Przebicie / Odrzucenie EMA 10/21 (SELL)",
-                weight=25,
-                achieved=True,
-                detail=f"{trigger_name} (EMA10: {curr_e10:.{digits}f} < EMA21: {curr_e21:.{digits}f}) (+{w2}%)"
-            ))
-
-            # Factor 3: Potwierdzenie Struktury Rynku (SELL)
-            has_lh = (last_high_type == "LH")
-            w3 = 25 if has_lh else 15
-            total_score += w3
-            struct_desc = f"Niższy Szczyt LH ({last_high_val:.{digits}f})" if has_lh else f"Ostatni szczyt ({last_high_val:.{digits}f})"
-            breakdown.append(ConfluenceItem(
-                factor="Potwierdzenie Struktury LH (SELL)",
-                weight=25,
-                achieved=has_lh,
-                detail=f"{struct_desc} (+{w3}%)"
-            ))
-
-            # Factor 4: Zgodność Multi-Timeframe (SELL)
-            mtf_full = (h1_dir == "SELL" and h4_dir == "SELL")
-            w4 = 25 if mtf_full else 15
-            total_score += w4
-            mtf_desc = f"M15: (SELL) | H1: ({h1_dir}) | H4: ({h4_dir})"
-            breakdown.append(ConfluenceItem(
-                factor="Zgodność Multi-Timeframe (SELL)",
-                weight=25,
-                achieved=mtf_full,
-                detail=f"{mtf_desc} (+{w4}%)"
-            ))
-
-            if total_score >= self.min_confluence_score:
-                entry = c
-                recent_high = df_m15.iloc[-5:]["high"].max()
-                if TIGHT_SL_MODE:
-                    # Tight structural stop: above local EMA 21 or recent candle high (never the distant EMA 238)
-                    sl_ref = max(recent_high, curr_e21)
-                else:
-                    sl_ref = max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer)
-
-                sl = sl_ref + buffer
-                risk = sl - entry
-
-                if risk > (point_scale * 5):
-                    tp1 = entry - (risk * target_rr)
-                    tp2 = min(last_low_val, entry - (risk * (target_rr + 1.0)))
-                    grade = "A+" if total_score >= 90 else ("A" if total_score >= 75 else "B")
-
-                    setups.append(TradeSetup(
-                        symbol=symbol,
-                        direction="SELL",
-                        timeframe="M15",
-                        setup_type="Zumiko KillMLM MTF Trend & EMA Pullback",
-                        entry_price=round(entry, digits),
-                        sl_price=round(sl, digits),
-                        tp1_price=round(tp1, digits),
-                        tp2_price=round(tp2, digits),
-                        rr_ratio=round(target_rr, 1),
-                        htf_trend=h4_dir,
-                        zone_top=round(curr_e21, digits),
-                        zone_bottom=round(curr_e10, digits),
-                        reason=f"Zumiko KillMLM {total_score}% Score [{grade}]. MTF: M15/H1/H4 zgodnie w dół.",
-                        timestamp=current_time,
-                        impulse_high=round(last_high_val, digits),
-                        impulse_low=round(last_low_val, digits),
-                        confluence_score=total_score,
-                        grade=grade,
-                        confluence_breakdown=breakdown,
-                        session_name=session_info["session_name"],
-                        is_killzone=session_info["is_killzone"],
-                        news_warning=news_warn,
-                        is_optimal_rr=is_optimal_rr,
-                        rr_source_info=rr_source,
-                        strategy_name="ZUMIKO",
-                        mtf_table=mtf,
-                        ema_fast=round(curr_e10, digits),
-                        ema_slow=round(curr_e21, digits),
-                        ema_238=round(curr_e238, digits),
-                        swing_pattern=f"LH ({last_high_val:.{digits}f})",
-                    ))
+        for direction in ("BUY", "SELL"):
+            setup = self._evaluate_zumiko_direction(
+                direction=direction,
+                symbol=symbol,
+                df_m15=df_m15,
+                c=c,
+                h=h,
+                l=l,
+                curr_e10=curr_e10,
+                curr_e21=curr_e21,
+                curr_e238=curr_e238,
+                prev_e10=prev_e10,
+                prev_e21=prev_e21,
+                e10=e10,
+                e21=e21,
+                last_high_val=last_high_val,
+                last_high_type=last_high_type,
+                last_low_val=last_low_val,
+                last_low_type=last_low_type,
+                h1_dir=h1_dir,
+                h4_dir=h4_dir,
+                mtf=mtf,
+                target_rr=target_rr,
+                is_optimal_rr=is_optimal_rr,
+                rr_source=rr_source,
+                session_info=session_info,
+                news_warn=news_warn,
+                current_time=current_time,
+                digits=digits,
+                point_scale=point_scale,
+                buffer=buffer,
+            )
+            if setup:
+                setups.append(setup)
 
         return setups
+
+    def _evaluate_zumiko_direction(
+        self,
+        direction: str,
+        symbol: str,
+        df_m15: pd.DataFrame,
+        c: float,
+        h: float,
+        l: float,
+        curr_e10: float,
+        curr_e21: float,
+        curr_e238: float,
+        prev_e10: float,
+        prev_e21: float,
+        e10: pd.Series,
+        e21: pd.Series,
+        last_high_val: float,
+        last_high_type: str,
+        last_low_val: float,
+        last_low_type: str,
+        h1_dir: str,
+        h4_dir: str,
+        mtf: dict,
+        target_rr: float,
+        is_optimal_rr: bool,
+        rr_source: str,
+        session_info: dict,
+        news_warn: Optional[str],
+        current_time: datetime,
+        digits: int,
+        point_scale: float,
+        buffer: float,
+    ) -> Optional[TradeSetup]:
+        is_buy = direction == "BUY"
+
+        # 1. Baseline
+        baseline_ok = (c > curr_e238) if is_buy else (c < curr_e238)
+        # 2. Momentum
+        momentum_ok = (curr_e10 > curr_e21) if is_buy else (curr_e10 < curr_e21)
+        # 3. Trigger
+        if is_buy:
+            is_fresh_cross = (curr_e10 > curr_e21) and (e10.iloc[-3] <= e21.iloc[-3] or prev_e10 <= prev_e21)
+            is_pullback = (l <= curr_e21 + buffer) and (c >= curr_e10 - buffer)
+            trigger_name = "Złoty Krzyż EMA 10/21" if is_fresh_cross else "Odbicie od strefy EMA 10/21"
+        else:
+            is_fresh_cross = (curr_e10 < curr_e21) and (e10.iloc[-3] >= e21.iloc[-3] or prev_e10 >= prev_e21)
+            is_pullback = (h >= curr_e21 - buffer) and (c <= curr_e10 + buffer)
+            trigger_name = "Krzyż Śmierci EMA 10/21" if is_fresh_cross else "Odrzucenie od strefy EMA 10/21"
+        trigger_ok = is_fresh_cross or is_pullback
+
+        # 4. H1 check
+        h1_ok = (not self.require_h1_alignment) or (h1_dir == direction)
+
+        if not (baseline_ok and momentum_ok and trigger_ok and h1_ok):
+            return None
+
+        total_score = 0
+        breakdown: List[ConfluenceItem] = []
+
+        # Factor 1: Trend Baseline EMA 238
+        cmp_sym = ">" if is_buy else "<"
+        total_score += 25
+        breakdown.append(ConfluenceItem(
+            factor=f"Trend EMA 238 ({direction})",
+            weight=25,
+            achieved=True,
+            detail=f"Cena {c:.{digits}f} {cmp_sym} EMA 238 ({curr_e238:.{digits}f}) (+25%)"
+        ))
+
+        # Factor 2: Przebicie / Odrzucenie EMA 10/21
+        total_score += 25
+        breakdown.append(ConfluenceItem(
+            factor=f"Przebicie / Odrzucenie EMA 10/21 ({direction})",
+            weight=25,
+            achieved=True,
+            detail=f"{trigger_name} (EMA10: {curr_e10:.{digits}f} {cmp_sym} EMA21: {curr_e21:.{digits}f}) (+25%)"
+        ))
+
+        # Factor 3: Market structure
+        has_struct = (last_low_type == "HL") if is_buy else (last_high_type == "LH")
+        w3 = 25 if has_struct else 15
+        total_score += w3
+        struct_label = "HL" if is_buy else "LH"
+        struct_val = last_low_val if is_buy else last_high_val
+        struct_desc = f"Struktura {struct_label} ({struct_val:.{digits}f})" if has_struct else f"Ostatni swing ({struct_val:.{digits}f})"
+        breakdown.append(ConfluenceItem(
+            factor=f"Potwierdzenie Struktury {struct_label} ({direction})",
+            weight=25,
+            achieved=has_struct,
+            detail=f"{struct_desc} (+{w3}%)"
+        ))
+
+        # Factor 4: MTF Confluence
+        mtf_full = (h1_dir == direction and h4_dir == direction)
+        w4 = 25 if mtf_full else 15
+        total_score += w4
+        mtf_desc = f"M15: ({direction}) | H1: ({h1_dir}) | H4: ({h4_dir})"
+        breakdown.append(ConfluenceItem(
+            factor=f"Zgodność Multi-Timeframe ({direction})",
+            weight=25,
+            achieved=mtf_full,
+            detail=f"{mtf_desc} (+{w4}%)"
+        ))
+
+        if total_score < self.min_confluence_score:
+            return None
+
+        entry = c
+        if is_buy:
+            recent_low = df_m15.iloc[-5:]["low"].min()
+            sl_ref = min(recent_low, curr_e21) if TIGHT_SL_MODE else (min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer))
+            sl = sl_ref - buffer
+            risk = entry - sl
+            if risk <= (point_scale * 5):
+                return None
+            tp1 = entry + (risk * target_rr)
+            tp2 = max(last_high_val, entry + (risk * (target_rr + 1.0)))
+            zone_top = curr_e10
+            zone_bottom = curr_e21
+            swing_pat = f"HL ({last_low_val:.{digits}f})"
+        else:
+            recent_high = df_m15.iloc[-5:]["high"].max()
+            sl_ref = max(recent_high, curr_e21) if TIGHT_SL_MODE else (max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer))
+            sl = sl_ref + buffer
+            risk = sl - entry
+            if risk <= (point_scale * 5):
+                return None
+            tp1 = entry - (risk * target_rr)
+            tp2 = min(last_low_val, entry - (risk * (target_rr + 1.0)))
+            zone_top = curr_e21
+            zone_bottom = curr_e10
+            swing_pat = f"LH ({last_high_val:.{digits}f})"
+
+        grade = "A+" if total_score >= 90 else ("A" if total_score >= 75 else "B")
+
+        return TradeSetup(
+            symbol=symbol,
+            direction=direction,
+            timeframe="M15",
+            setup_type="Zumiko KillMLM MTF Trend & EMA Pullback",
+            entry_price=round(entry, digits),
+            sl_price=round(sl, digits),
+            tp1_price=round(tp1, digits),
+            tp2_price=round(tp2, digits),
+            rr_ratio=round(target_rr, 1),
+            htf_trend=h4_dir,
+            zone_top=round(zone_top, digits),
+            zone_bottom=round(zone_bottom, digits),
+            reason=f"Zumiko KillMLM {total_score}% Score [{grade}]. MTF: M15/H1/H4 zgodnie w {direction}.",
+            timestamp=current_time,
+            impulse_high=round(last_high_val, digits),
+            impulse_low=round(last_low_val, digits),
+            confluence_score=total_score,
+            grade=grade,
+            confluence_breakdown=breakdown,
+            session_name=session_info["session_name"],
+            is_killzone=session_info["is_killzone"],
+            news_warning=news_warn,
+            is_optimal_rr=is_optimal_rr,
+            rr_source_info=rr_source,
+            strategy_name="ZUMIKO",
+            mtf_table=mtf,
+            ema_fast=round(curr_e10, digits),
+            ema_slow=round(curr_e21, digits),
+            ema_238=round(curr_e238, digits),
+            swing_pattern=swing_pat,
+        )

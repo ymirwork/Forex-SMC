@@ -57,35 +57,6 @@ class TradeJournal:
                 pass
             conn.commit()
 
-    def _seed_initial_data_if_empty(self):
-        """Pre-seeds the initial 11 historical trades from user's trading sheet if database is fresh."""
-        with self._get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM trades")
-            count = cur.fetchone()[0]
-            if count == 0:
-                sample_data = [
-                    ("XAUUSD", "SELL", 3850.0, 3860.0, 3830.0, -1.0, 0.0, 75, "LOSS", "Initial test"),
-                    ("XAUUSD", "BUY",  3835.0, 3825.0, 3855.0,  1.0, 1.8, 85, "WIN",  "M15 CHoCH pullback"),
-                    ("XAUUSD", "BUY",  3840.0, 3830.0, 3860.0,  1.0, 2.0, 80, "WIN",  "Golden Pocket OTE"),
-                    ("XAUUSD", "BUY",  3845.0, 3835.0, 3875.0,  1.0, 2.8, 90, "WIN",  "Asian Sweep + Fibo"),
-                    ("XAUUSD", "SELL", 3865.0, 3875.0, 3845.0, -1.0, 0.0, 70, "LOSS", "CHoCH failure"),
-                    ("XAUUSD", "BUY",  3850.0, 3840.0, 3870.0,  1.0, 1.0, 75, "WIN",  "Quick scalp target"),
-                    ("XAUUSD", "BUY",  3842.0, 3832.0, 3876.0,  1.0, 3.4, 85, "WIN",  "High confluence run"),
-                    ("XAUUSD", "BUY",  3838.0, 3828.0, 3865.0,  0.6, 2.78, 80, "WIN",  "Early manual exit"),
-                    ("XAUUSD", "SELL", 3870.0, 3880.0, 3850.0, -1.0, 0.0, 70, "LOSS", "Stopped out"),
-                    ("XAUUSD", "BUY",  3840.0, 3830.0, 3890.0,  1.3, 5.0, 95, "WIN",  "Massive runner"),
-                    ("XAUUSD", "BUY",  3848.0, 3838.0, 3868.0,  1.0, 1.0, 75, "WIN",  "TP1 reached"),
-                ]
-                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                for item in sample_data:
-                    cur.execute("""
-                        INSERT INTO trades (timestamp, symbol, direction, entry_price, sl_price, tp_price, realized_r, max_r, confluence_score, status, comment)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (now_str, item[0], item[1], item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9]))
-                conn.commit()
-                logger.info(f"Seeded {len(sample_data)} benchmark trades into trades.db")
-
     def add_trade(
         self,
         symbol: str,

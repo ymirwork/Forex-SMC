@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -81,6 +82,8 @@ class SMCDetector:
         strict_htf_alignment: bool = False,
         use_optimal_rr: bool = USE_OPTIMAL_RR,
         min_trades_for_optimal: int = MIN_TRADES_FOR_OPTIMAL_RR,
+        journal: Optional[TradeJournal] = None,
+        news_filter: Optional[NewsFilter] = None,
     ):
         self.swing_length = swing_length
         self.default_rr = default_rr
@@ -88,29 +91,16 @@ class SMCDetector:
         self.strict_htf_alignment = strict_htf_alignment
         self.use_optimal_rr = use_optimal_rr
         self.min_trades_for_optimal = min_trades_for_optimal
-        self.news_filter = NewsFilter()
-        self.journal = TradeJournal()
+        self.news_filter = news_filter or NewsFilter()
+        self.journal = journal or TradeJournal()
 
     def get_effective_rr(self) -> Tuple[float, bool, str]:
-        """
-        Determines the target Risk:Reward dynamically:
-        If enough trades exist (>= min_trades_for_optimal), uses mathematically
-        optimized BEST RR from the journal. Otherwise falls back to default_rr from .env.
-        """
-        if self.use_optimal_rr:
-            trades = self.journal.get_all_trades()
-            if len(trades) >= self.min_trades_for_optimal:
-                opt_res = RROptimizer.calculate_best_rr(trades)
-                if opt_res and opt_res.best_rr >= 1.0:
-                    return (
-                        opt_res.best_rr,
-                        True,
-                        f"Zoptymalizowany Best RR (1:{opt_res.best_rr:.1f} z {len(trades)} zagrań)"
-                    )
-        return (
-            self.default_rr,
-            False,
-            f"Domyślny RR z .env (1:{self.default_rr:.1f})"
+        """Determines target RR dynamically using shared RROptimizer logic."""
+        return RROptimizer.get_effective_rr(
+            journal=self.journal,
+            default_rr=self.default_rr,
+            use_optimal_rr=self.use_optimal_rr,
+            min_trades=self.min_trades_for_optimal,
         )
 
     def determine_htf_trend(self, df_htf: pd.DataFrame) -> str:
@@ -239,297 +229,213 @@ class SMCDetector:
                 leg_start_idx = max(0, choch_bar_idx - 20)
                 leg_df = df_ltf.iloc[leg_start_idx:]
 
-                if choch_dir == 1:
-                    # ==========================================
-                    # BULLISH SETUP (BUY)
-                    # ==========================================
-                    trend_ok = (not self.strict_htf_alignment) or (htf_trend in ["BULLISH", "NEUTRAL"])
-                    if not trend_ok:
-                        continue
+                dir_str = "BUY" if choch_dir == 1 else ("SELL" if choch_dir == -1 else None)
+                if not dir_str:
+                    continue
 
-                    impulse_low = leg_df["low"].min()
-                    impulse_high = leg_df["high"].max()
-                    impulse_range = impulse_high - impulse_low
-                    if impulse_range <= (point_scale * 10):
-                        continue
-
-                    fibo_50 = impulse_high - (0.500 * impulse_range)
-                    fibo_618 = impulse_high - (0.618 * impulse_range)
-                    fibo_705 = impulse_high - (0.705 * impulse_range)
-                    fibo_786 = impulse_high - (0.786 * impulse_range)
-
-                    # Condition: Pullback >= 61.8%
-                    if (current_price <= fibo_618 + buffer) and (current_price >= impulse_low - buffer):
-                        entry = current_price
-                        if TIGHT_SL_MODE:
-                            # Tight Refined Invalidation: below 78.6% Fibo or local pullback low (last 5 candles)
-                            recent_pullback_low = df_ltf.iloc[-5:]["low"].min()
-                            sl = min(fibo_786, recent_pullback_low) - buffer
-                        else:
-                            sl = impulse_low - buffer
-
-                        risk = entry - sl
-                        if risk <= (point_scale * 5):
-                            continue
-
-                        # TP1 calculated according to adaptive target_rr (e.g. 1.8R or default 2.0R)
-                        tp1 = entry + (risk * target_rr)
-                        # TP2 targets the structural swing high (or further expansion)
-                        tp2 = max(impulse_high, entry + (risk * (target_rr + 1.0)))
-                        actual_rr = round(target_rr, 1)
-
-                        # CONFLUENCE WEIGHTS CALCULATION (0 - 100%)
-                        breakdown: List[ConfluenceItem] = []
-                        total_score = 0
-
-                        # 1. H4 Trend Alignment (20%)
-                        h4_match = htf_trend == "BULLISH"
-                        w1 = 20 if h4_match else (10 if htf_trend == "NEUTRAL" else 0)
-                        total_score += w1
-                        breakdown.append(ConfluenceItem(
-                            factor="Zgodność z trendem H4",
-                            weight=20,
-                            achieved=h4_match,
-                            detail=f"H4: {htf_trend} (+{w1}%)"
-                        ))
-
-                        # 2. M15 CHoCH Confirmation (20%)
-                        total_score += 20
-                        breakdown.append(ConfluenceItem(
-                            factor="Potwierdzenie M15 CHoCH",
-                            weight=20,
-                            achieved=True,
-                            detail=f"Wybicie szczytu {broken_level:.{digits}f} (+20%)"
-                        ))
-
-                        # 3. Fibonacci Retracement Depth (20%)
-                        is_deep_ote = current_price <= fibo_705
-                        w3 = 20 if is_deep_ote else 15
-                        total_score += w3
-                        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8%)"
-                        breakdown.append(ConfluenceItem(
-                            factor="Poziom Fibonacciego",
-                            weight=20,
-                            achieved=True,
-                            detail=f"{fibo_desc} (+{w3}%)"
-                        ))
-
-                        # 4. Order Block / FVG Confluence (15%)
-                        has_ob, ob_detail = self._check_order_block_overlap(df_ltf, swings_ltf, fibo_786, fibo_618, "BUY")
-                        w4 = 15 if has_ob else 0
-                        total_score += w4
-                        breakdown.append(ConfluenceItem(
-                            factor="Zbieżność z Order Block / FVG",
-                            weight=15,
-                            achieved=has_ob,
-                            detail=f"{ob_detail} (+{w4}%)"
-                        ))
-
-                        # 5. Session Liquidity Sweep (15%)
-                        has_sweep, sweep_msg = SessionManager.check_asian_sweep(df_ltf, "BUY")
-                        w5 = 15 if has_sweep else 0
-                        total_score += w5
-                        breakdown.append(ConfluenceItem(
-                            factor="Wybicie płynności (Sweep)",
-                            weight=15,
-                            achieved=has_sweep,
-                            detail=f"{sweep_msg} (+{w5}%)"
-                        ))
-
-                        # 6. Candlestick Wick Rejection (10%)
-                        has_rejection, wick_msg = self._check_candle_rejection(current_candle, "BUY")
-                        w6 = 10 if has_rejection else 0
-                        total_score += w6
-                        breakdown.append(ConfluenceItem(
-                            factor="Odrzucenie świecowe (Knot)",
-                            weight=10,
-                            achieved=has_rejection,
-                            detail=f"{wick_msg} (+{w6}%)"
-                        ))
-
-                        # Filter by minimum score threshold
-                        if total_score < self.min_confluence_score:
-                            continue
-
-                        grade = "A+" if total_score >= 85 else ("A" if total_score >= 70 else "B")
-
-                        setup = TradeSetup(
-                            symbol=symbol,
-                            direction="BUY",
-                            timeframe="M15",
-                            setup_type="M15 CHoCH + Fibo >= 61.8% Pullback (OTE)",
-                            entry_price=round(entry, digits),
-                            sl_price=round(sl, digits),
-                            tp1_price=round(tp1, digits),
-                            tp2_price=round(tp2, digits),
-                            rr_ratio=actual_rr,
-                            htf_trend=htf_trend,
-                            zone_top=round(fibo_618, digits),
-                            zone_bottom=round(fibo_786, digits),
-                            reason=f"M15 CHoCH + Fibo OTE ({total_score}% Confluence [{grade}]). {sweep_msg}.",
-                            timestamp=current_time,
-                            fibo_50=round(fibo_50, digits),
-                            fibo_618=round(fibo_618, digits),
-                            fibo_786=round(fibo_786, digits),
-                            impulse_high=round(impulse_high, digits),
-                            impulse_low=round(impulse_low, digits),
-                            choch_level=round(broken_level, digits),
-                            confluence_score=total_score,
-                            grade=grade,
-                            confluence_breakdown=breakdown,
-                            session_name=session_info["session_name"],
-                            is_killzone=session_info["is_killzone"],
-                            news_warning=news_warn,
-                            is_optimal_rr=is_optimal_rr,
-                            rr_source_info=rr_source,
-                        )
-                        setups.append(setup)
-                        break
-
-                elif choch_dir == -1:
-                    # ==========================================
-                    # BEARISH SETUP (SELL)
-                    # ==========================================
-                    trend_ok = (not self.strict_htf_alignment) or (htf_trend in ["BEARISH", "NEUTRAL"])
-                    if not trend_ok:
-                        continue
-
-                    impulse_high = leg_df["high"].max()
-                    impulse_low = leg_df["low"].min()
-                    impulse_range = impulse_high - impulse_low
-                    if impulse_range <= (point_scale * 10):
-                        continue
-
-                    fibo_50 = impulse_low + (0.500 * impulse_range)
-                    fibo_618 = impulse_low + (0.618 * impulse_range)
-                    fibo_705 = impulse_low + (0.705 * impulse_range)
-                    fibo_786 = impulse_low + (0.786 * impulse_range)
-
-                    # Condition: Pullback >= 61.8%
-                    if (current_price >= fibo_618 - buffer) and (current_price <= impulse_high + buffer):
-                        entry = current_price
-                        if TIGHT_SL_MODE:
-                            # Tight Refined Invalidation: above 78.6% Fibo or local pullback high (last 5 candles)
-                            recent_pullback_high = df_ltf.iloc[-5:]["high"].max()
-                            sl = max(fibo_786, recent_pullback_high) + buffer
-                        else:
-                            sl = impulse_high + buffer
-
-                        risk = sl - entry
-                        if risk <= (point_scale * 5):
-                            continue
-
-                        # TP1 calculated according to adaptive target_rr (e.g. 1.8R or default 2.0R)
-                        tp1 = entry - (risk * target_rr)
-                        # TP2 targets the structural swing low (or further expansion)
-                        tp2 = min(impulse_low, entry - (risk * (target_rr + 1.0)))
-                        actual_rr = round(target_rr, 1)
-
-                        # CONFLUENCE WEIGHTS CALCULATION
-                        breakdown: List[ConfluenceItem] = []
-                        total_score = 0
-
-                        # 1. H4 Trend (20%)
-                        h4_match = htf_trend == "BEARISH"
-                        w1 = 20 if h4_match else (10 if htf_trend == "NEUTRAL" else 0)
-                        total_score += w1
-                        breakdown.append(ConfluenceItem(
-                            factor="Zgodność z trendem H4",
-                            weight=20,
-                            achieved=h4_match,
-                            detail=f"H4: {htf_trend} (+{w1}%)"
-                        ))
-
-                        # 2. M15 CHoCH (20%)
-                        total_score += 20
-                        breakdown.append(ConfluenceItem(
-                            factor="Potwierdzenie M15 CHoCH",
-                            weight=20,
-                            achieved=True,
-                            detail=f"Wybicie dołka {broken_level:.{digits}f} (+20%)"
-                        ))
-
-                        # 3. Fibo OTE Depth (20%)
-                        is_deep_ote = current_price >= fibo_705
-                        w3 = 20 if is_deep_ote else 15
-                        total_score += w3
-                        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8%)"
-                        breakdown.append(ConfluenceItem(
-                            factor="Poziom Fibonacciego",
-                            weight=20,
-                            achieved=True,
-                            detail=f"{fibo_desc} (+{w3}%)"
-                        ))
-
-                        # 4. Order Block / FVG (15%)
-                        has_ob, ob_detail = self._check_order_block_overlap(df_ltf, swings_ltf, fibo_618, fibo_786, "SELL")
-                        w4 = 15 if has_ob else 0
-                        total_score += w4
-                        breakdown.append(ConfluenceItem(
-                            factor="Zbieżność z Order Block / FVG",
-                            weight=15,
-                            achieved=has_ob,
-                            detail=f"{ob_detail} (+{w4}%)"
-                        ))
-
-                        # 5. Session Liquidity Sweep (15%)
-                        has_sweep, sweep_msg = SessionManager.check_asian_sweep(df_ltf, "SELL")
-                        w5 = 15 if has_sweep else 0
-                        total_score += w5
-                        breakdown.append(ConfluenceItem(
-                            factor="Wybicie płynności (Sweep)",
-                            weight=15,
-                            achieved=has_sweep,
-                            detail=f"{sweep_msg} (+{w5}%)"
-                        ))
-
-                        # 6. Candle Rejection (10%)
-                        has_rejection, wick_msg = self._check_candle_rejection(current_candle, "SELL")
-                        w6 = 10 if has_rejection else 0
-                        total_score += w6
-                        breakdown.append(ConfluenceItem(
-                            factor="Odrzucenie świecowe (Knot)",
-                            weight=10,
-                            achieved=has_rejection,
-                            detail=f"{wick_msg} (+{w6}%)"
-                        ))
-
-                        if total_score < self.min_confluence_score:
-                            continue
-
-                        grade = "A+" if total_score >= 85 else ("A" if total_score >= 70 else "B")
-
-                        setup = TradeSetup(
-                            symbol=symbol,
-                            direction="SELL",
-                            timeframe="M15",
-                            setup_type="M15 CHoCH + Fibo >= 61.8% Pullback (OTE)",
-                            entry_price=round(entry, digits),
-                            sl_price=round(sl, digits),
-                            tp1_price=round(tp1, digits),
-                            tp2_price=round(tp2, digits),
-                            rr_ratio=actual_rr,
-                            htf_trend=htf_trend,
-                            zone_top=round(fibo_786, digits),
-                            zone_bottom=round(fibo_618, digits),
-                            reason=f"M15 CHoCH + Fibo OTE ({total_score}% Confluence [{grade}]). {sweep_msg}.",
-                            timestamp=current_time,
-                            fibo_50=round(fibo_50, digits),
-                            fibo_618=round(fibo_618, digits),
-                            fibo_786=round(fibo_786, digits),
-                            impulse_high=round(impulse_high, digits),
-                            impulse_low=round(impulse_low, digits),
-                            choch_level=round(broken_level, digits),
-                            confluence_score=total_score,
-                            grade=grade,
-                            confluence_breakdown=breakdown,
-                            session_name=session_info["session_name"],
-                            is_killzone=session_info["is_killzone"],
-                            news_warning=news_warn,
-                            is_optimal_rr=is_optimal_rr,
-                            rr_source_info=rr_source,
-                        )
-                        setups.append(setup)
-                        break
+                setup = self._build_smc_setup(
+                    direction=dir_str,
+                    symbol=symbol,
+                    leg_df=leg_df,
+                    df_ltf=df_ltf,
+                    swings_ltf=swings_ltf,
+                    current_candle=current_candle,
+                    htf_trend=htf_trend,
+                    broken_level=broken_level,
+                    target_rr=target_rr,
+                    is_optimal_rr=is_optimal_rr,
+                    rr_source=rr_source,
+                    session_info=session_info,
+                    news_warn=news_warn,
+                    current_time=current_time,
+                    digits=digits,
+                    point_scale=point_scale,
+                    buffer=buffer,
+                )
+                if setup:
+                    setups.append(setup)
+                    break
 
         return setups
+
+    def _build_smc_setup(
+        self,
+        direction: str,
+        symbol: str,
+        leg_df: pd.DataFrame,
+        df_ltf: pd.DataFrame,
+        swings_ltf: pd.DataFrame,
+        current_candle: pd.Series,
+        htf_trend: str,
+        broken_level: float,
+        target_rr: float,
+        is_optimal_rr: bool,
+        rr_source: str,
+        session_info: dict,
+        news_warn: Optional[str],
+        current_time: datetime,
+        digits: int,
+        point_scale: float,
+        buffer: float,
+    ) -> Optional[TradeSetup]:
+        is_buy = direction == "BUY"
+        expected_htf = "BULLISH" if is_buy else "BEARISH"
+        trend_ok = (not self.strict_htf_alignment) or (htf_trend in [expected_htf, "NEUTRAL"])
+        if not trend_ok:
+            return None
+
+        current_price = current_candle["close"]
+        impulse_low = leg_df["low"].min()
+        impulse_high = leg_df["high"].max()
+        impulse_range = impulse_high - impulse_low
+        if impulse_range <= (point_scale * 10):
+            return None
+
+        if is_buy:
+            fibo_50 = impulse_high - (0.500 * impulse_range)
+            fibo_618 = impulse_high - (0.618 * impulse_range)
+            fibo_705 = impulse_high - (0.705 * impulse_range)
+            fibo_786 = impulse_high - (0.786 * impulse_range)
+            if not ((current_price <= fibo_618 + buffer) and (current_price >= impulse_low - buffer)):
+                return None
+            entry = current_price
+            if TIGHT_SL_MODE:
+                recent_pullback_low = df_ltf.iloc[-5:]["low"].min()
+                sl = min(fibo_786, recent_pullback_low) - buffer
+            else:
+                sl = impulse_low - buffer
+            risk = entry - sl
+            if risk <= (point_scale * 5):
+                return None
+            tp1 = entry + (risk * target_rr)
+            tp2 = max(impulse_high, entry + (risk * (target_rr + 1.0)))
+            zone_top = fibo_618
+            zone_bottom = fibo_786
+        else:
+            fibo_50 = impulse_low + (0.500 * impulse_range)
+            fibo_618 = impulse_low + (0.618 * impulse_range)
+            fibo_705 = impulse_low + (0.705 * impulse_range)
+            fibo_786 = impulse_low + (0.786 * impulse_range)
+            if not ((current_price >= fibo_618 - buffer) and (current_price <= impulse_high + buffer)):
+                return None
+            entry = current_price
+            if TIGHT_SL_MODE:
+                recent_pullback_high = df_ltf.iloc[-5:]["high"].max()
+                sl = max(fibo_786, recent_pullback_high) + buffer
+            else:
+                sl = impulse_high + buffer
+            risk = sl - entry
+            if risk <= (point_scale * 5):
+                return None
+            tp1 = entry - (risk * target_rr)
+            tp2 = min(impulse_low, entry - (risk * (target_rr + 1.0)))
+            zone_top = fibo_786
+            zone_bottom = fibo_618
+
+        actual_rr = round(target_rr, 1)
+        breakdown: List[ConfluenceItem] = []
+        total_score = 0
+
+        # 1. H4 Trend Alignment (20%)
+        h4_match = htf_trend == expected_htf
+        w1 = 20 if h4_match else (10 if htf_trend == "NEUTRAL" else 0)
+        total_score += w1
+        breakdown.append(ConfluenceItem(
+            factor="Zgodność z trendem H4",
+            weight=20,
+            achieved=h4_match,
+            detail=f"H4: {htf_trend} (+{w1}%)"
+        ))
+
+        # 2. M15 CHoCH Confirmation (20%)
+        total_score += 20
+        choch_label = "szczytu" if is_buy else "dołka"
+        breakdown.append(ConfluenceItem(
+            factor="Potwierdzenie M15 CHoCH",
+            weight=20,
+            achieved=True,
+            detail=f"Wybicie {choch_label} {broken_level:.{digits}f} (+20%)"
+        ))
+
+        # 3. Fibonacci Retracement Depth (20%)
+        is_deep_ote = (current_price <= fibo_705) if is_buy else (current_price >= fibo_705)
+        w3 = 20 if is_deep_ote else 15
+        total_score += w3
+        fibo_desc = "Głębokie OTE (70.5% - 78.6%)" if is_deep_ote else "Golden Pocket (61.8%)"
+        breakdown.append(ConfluenceItem(
+            factor="Poziom Fibonacciego",
+            weight=20,
+            achieved=True,
+            detail=f"{fibo_desc} (+{w3}%)"
+        ))
+
+        # 4. Order Block / FVG Confluence (15%)
+        ob_fibo_low = min(fibo_786, fibo_618)
+        ob_fibo_high = max(fibo_786, fibo_618)
+        has_ob, ob_detail = self._check_order_block_overlap(df_ltf, swings_ltf, ob_fibo_low, ob_fibo_high, direction)
+        w4 = 15 if has_ob else 0
+        total_score += w4
+        breakdown.append(ConfluenceItem(
+            factor="Zbieżność z Order Block / FVG",
+            weight=15,
+            achieved=has_ob,
+            detail=f"{ob_detail} (+{w4}%)"
+        ))
+
+        # 5. Session Liquidity Sweep (15%)
+        has_sweep, sweep_msg = SessionManager.check_asian_sweep(df_ltf, direction)
+        w5 = 15 if has_sweep else 0
+        total_score += w5
+        breakdown.append(ConfluenceItem(
+            factor="Wybicie płynności (Sweep)",
+            weight=15,
+            achieved=has_sweep,
+            detail=f"{sweep_msg} (+{w5}%)"
+        ))
+
+        # 6. Candlestick Wick Rejection (10%)
+        has_rejection, wick_msg = self._check_candle_rejection(current_candle, direction)
+        w6 = 10 if has_rejection else 0
+        total_score += w6
+        breakdown.append(ConfluenceItem(
+            factor="Odrzucenie świecowe (Knot)",
+            weight=10,
+            achieved=has_rejection,
+            detail=f"{wick_msg} (+{w6}%)"
+        ))
+
+        if total_score < self.min_confluence_score:
+            return None
+
+        grade = "A+" if total_score >= 85 else ("A" if total_score >= 70 else "B")
+
+        return TradeSetup(
+            symbol=symbol,
+            direction=direction,
+            timeframe="M15",
+            setup_type="M15 CHoCH + Fibo >= 61.8% Pullback (OTE)",
+            entry_price=round(entry, digits),
+            sl_price=round(sl, digits),
+            tp1_price=round(tp1, digits),
+            tp2_price=round(tp2, digits),
+            rr_ratio=actual_rr,
+            htf_trend=htf_trend,
+            zone_top=round(zone_top, digits),
+            zone_bottom=round(zone_bottom, digits),
+            reason=f"M15 CHoCH + Fibo OTE ({total_score}% Confluence [{grade}]). {sweep_msg}.",
+            timestamp=current_time,
+            fibo_50=round(fibo_50, digits),
+            fibo_618=round(fibo_618, digits),
+            fibo_786=round(fibo_786, digits),
+            impulse_high=round(impulse_high, digits),
+            impulse_low=round(impulse_low, digits),
+            choch_level=round(broken_level, digits),
+            confluence_score=total_score,
+            grade=grade,
+            confluence_breakdown=breakdown,
+            session_name=session_info["session_name"],
+            is_killzone=session_info["is_killzone"],
+            news_warning=news_warn,
+            is_optimal_rr=is_optimal_rr,
+            rr_source_info=rr_source,
+        )

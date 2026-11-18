@@ -1,4 +1,6 @@
+from datetime import datetime
 import logging
+import time
 from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
@@ -48,6 +50,7 @@ class MT5Client:
         self.server = server
         self.is_connected = False
         self._symbol_cache: Dict[str, str] = {}
+        self._all_broker_symbols = None
 
     def connect(self) -> bool:
         """Connects to MetaTrader 5 terminal."""
@@ -89,6 +92,7 @@ class MT5Client:
         if self.is_connected:
             mt5.shutdown()
             self.is_connected = False
+            self._all_broker_symbols = None
             logger.info("MT5 disconnected.")
 
     def ensure_connection(self) -> bool:
@@ -121,8 +125,10 @@ class MT5Client:
             self._symbol_cache[base_symbol] = base_symbol
             return base_symbol
 
-        # 2. Search matching symbols from broker list
-        all_symbols = mt5.symbols_get()
+        # 2. Search matching symbols from broker list (cached per session)
+        if self._all_broker_symbols is None:
+            self._all_broker_symbols = mt5.symbols_get()
+        all_symbols = self._all_broker_symbols
         if not all_symbols:
             logger.error("Failed to retrieve symbol list from MT5.")
             return None

@@ -18,7 +18,7 @@ async def test_all():
     print("=" * 60)
 
     # 1. MT5 Connection
-    print("\n[1/4] Test połączenia z MetaTrader 5...")
+    print("\n[1/5] Test połączenia z MetaTrader 5...")
     client = MT5Client()
     connected = client.connect()
     if not connected:
@@ -38,7 +38,7 @@ async def test_all():
         print("⚠️ Połączono z terminalem, ale brak aktywnego konta.")
 
     # 2. Symbol Resolution & Live Candles
-    print(f"\n[2/4] Test pobierania danych dla par ({LTF_TIMEFRAME} / {HTF_TIMEFRAME})...")
+    print(f"\n[2/5] Test pobierania danych dla par ({LTF_TIMEFRAME} / {HTF_TIMEFRAME})...")
     for sym in SYMBOLS:
         resolved = client.resolve_symbol(sym)
         if resolved:

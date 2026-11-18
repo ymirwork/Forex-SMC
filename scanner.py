@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import os
 import time
 from typing import Dict, List, Set
 
 from chart_generator import ChartGenerator
 from config import (
     AUTO_BE_AT_1R,
+    BLOCK_ON_HIGH_IMPACT_NEWS,
     ENABLE_PYRAMIDING,
     ENABLE_SMC_STRATEGY,
     ENABLE_ZUMIKO_STRATEGY,
@@ -14,6 +16,7 @@ from config import (
     LTF_TIMEFRAME,
     MAX_PYRAMID_LEVEL,
     MIN_CONFLUENCE_SCORE,
+    PROP_ENFORCE_NEWS_FILTER,
     PROP_FIRM_MODE,
     PROP_MAX_DRAWDOWN_PERCENT,
     PROP_MAX_OPEN_TRADES,
@@ -31,6 +34,7 @@ from config import (
     ZUMIKO_TREND_EMA,
 )
 from mt5_client import MT5Client
+from news_filter import NewsFilter
 from notion_journal import NotionJournal
 from smc_detector import SMCDetector, TradeSetup
 from trade_journal import TradeJournal
@@ -49,22 +53,27 @@ class SMCScanner:
     5. Real-Time Trade Monitor: Detects TP / SL hits, logs results, and sends notifications.
     """
 
-    def __init__(self, mt5_client: MT5Client, telegram_manager=None):
+    def __init__(self, mt5_client: MT5Client, telegram_manager=None, journal=None, news_filter=None):
         self.mt5_client = mt5_client
         self.telegram = telegram_manager
-        self.journal = TradeJournal()
+        self.journal = journal or TradeJournal()
+        self.news_filter = news_filter or NewsFilter()
         self.smc_detector = SMCDetector(
             swing_length=SWING_LENGTH,
             min_confluence_score=MIN_CONFLUENCE_SCORE,
             strict_htf_alignment=False,
+            journal=self.journal,
+            news_filter=self.news_filter,
         )
         self.zumiko_detector = ZumikoDetector(
-            fast_ema_len=ZUMIKO_FAST_EMA,
-            slow_ema_len=ZUMIKO_SLOW_EMA,
-            trend_ema_len=ZUMIKO_TREND_EMA,
+            fast_ema=ZUMIKO_FAST_EMA,
+            slow_ema=ZUMIKO_SLOW_EMA,
+            trend_ema=ZUMIKO_TREND_EMA,
             swing_len=ZUMIKO_SWING_LEN,
             min_confluence_score=MIN_CONFLUENCE_SCORE,
             require_h1_alignment=ZUMIKO_REQUIRE_H1,
+            journal=self.journal,
+            news_filter=self.news_filter,
         )
         self.chart_gen = ChartGenerator()
         self.is_running = False
@@ -73,12 +82,32 @@ class SMCScanner:
         self._be_moved_tickets: Set[int] = set()
         self.notion = NotionJournal()
 
+    def _cleanup_old_charts(self, max_days: int = 7):
+        """Removes generated chart PNGs older than max_days to prevent disk accumulation."""
+        charts_dir = getattr(self.chart_gen, "output_dir", "charts")
+        if not os.path.exists(charts_dir):
+            return
+        now = time.time()
+        max_age_seconds = max_days * 86400
+        try:
+            for fname in os.listdir(charts_dir):
+                if fname.lower().endswith(".png"):
+                    fpath = os.path.join(charts_dir, fname)
+                    if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
+                        try:
+                            os.remove(fpath)
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"Error during chart cleanup: {e}")
+
     def _cleanup_old_notifications(self, max_age_hours: float = 6.0):
         """Clears old sent setup keys so memory does not leak."""
         now = time.time()
         expired = [k for k, ts in self.notified_setups.items() if (now - ts) > (max_age_hours * 3600)]
         for k in expired:
             del self.notified_setups[k]
+        self._cleanup_old_charts()
 
     async def monitor_open_trades(self):
         """
@@ -261,8 +290,6 @@ class SMCScanner:
             return 0
 
         self._cleanup_old_notifications()
-        # Monitor open positions for closures
-        await self.monitor_open_trades()
 
         # Prop Firm checks before scanning
         if PROP_FIRM_MODE:
@@ -370,6 +397,14 @@ class SMCScanner:
                     setup_key = f"{setup.symbol}_{setup.direction}_{setup.strategy_name}_{setup.entry_price:.2f}"
                     if setup_key in self.notified_setups:
                         continue  # Already notified recently
+
+                    # Macroeconomic High-Impact News Filter Check
+                    should_block_news = BLOCK_ON_HIGH_IMPACT_NEWS or (PROP_FIRM_MODE and PROP_ENFORCE_NEWS_FILTER)
+                    if should_block_news and setup.news_warning:
+                        logger.warning(
+                            f"🚫 [NEWS SHIELD] Wstrzymuję alert dla {setup.symbol} z powodu nadchodzących wiadomości: {setup.news_warning}"
+                        )
+                        continue
 
                     # Prop Firm trade eligibility check before alert
                     if PROP_FIRM_MODE:

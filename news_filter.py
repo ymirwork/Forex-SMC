@@ -24,7 +24,14 @@ class NewsFilter:
 
     def _extract_currencies(self, symbol: str) -> List[str]:
         """Extracts relevant currency codes from symbol (e.g. EURUSD -> ['EUR', 'USD'], XAUUSD -> ['USD'])."""
-        clean = symbol.upper().replace(".F", "").replace("P", "").replace("_", "").replace("-", "")
+        clean = symbol.upper()
+        for suffix in [".PRO", ".RAW", ".ECN", ".F", "_PRO", "_RAW"]:
+            clean = clean.replace(suffix, "")
+        clean = clean.rstrip("._-+")
+        # If symbol has a single-character broker suffix like 'EURUSDp' or 'EURUSDm'
+        if len(clean) == 7 and clean.endswith(("P", "M", "C", "I", "S")):
+            clean = clean[:-1]
+
         if "XAU" in clean or "GOLD" in clean:
             return ["USD"]
         if len(clean) >= 6:

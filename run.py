@@ -4,8 +4,10 @@ import signal
 import sys
 from config import TELEGRAM_ALERT_CHANNEL, TELEGRAM_BOT_TOKEN
 from mt5_client import MT5Client
+from news_filter import NewsFilter
 from scanner import SMCScanner
 from telegram_bot import TelegramBotManager
+from trade_journal import TradeJournal
 
 # Logging setup
 logging.basicConfig(
@@ -30,13 +32,22 @@ async def main():
         logger.error("Failed to connect to MetaTrader 5 terminal. Exiting.")
         return
 
+    # Shared Single-Instance Resources (TradeJournal & NewsFilter)
+    shared_journal = TradeJournal()
+    shared_news_filter = NewsFilter()
+
     # 2. Telegram Bot Manager
     telegram_mgr = None
     telegram_task = None
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "twoj_token_z_botfather":
         try:
-            telegram_mgr = TelegramBotManager(mt5_client, TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHANNEL)
+            telegram_mgr = TelegramBotManager(
+                mt5_client=mt5_client,
+                token=TELEGRAM_BOT_TOKEN,
+                alert_channel=TELEGRAM_ALERT_CHANNEL,
+                journal=shared_journal,
+            )
             app = telegram_mgr.build_application()
             await app.initialize()
             await app.start()
@@ -50,8 +61,13 @@ async def main():
         print("   Skaner uruchamia się w trybie konsolowym (alerty i wykresy będą zapisywane w charts/).")
         print("   Aby odbierać alerty na telefonie i klikać zlecenia, wpisz token w pliku .env!\n")
 
-    # 3. Initialize Scanner
-    scanner = SMCScanner(mt5_client, telegram_mgr)
+    # 3. Initialize Scanner with Shared Resources
+    scanner = SMCScanner(
+        mt5_client=mt5_client,
+        telegram_manager=telegram_mgr,
+        journal=shared_journal,
+        news_filter=shared_news_filter,
+    )
     if telegram_mgr:
         telegram_mgr.set_scanner_callback(scanner.scan_once)
 
@@ -70,8 +86,11 @@ async def main():
         try:
             loop.add_signal_handler(sig, signal_handler)
         except NotImplementedError:
-            # On Windows, add_signal_handler may not be supported for all signals
-            pass
+            # On Windows, add_signal_handler is not implemented by ProactorEventLoop
+            try:
+                signal.signal(sig, lambda s, f: signal_handler())
+            except Exception:
+                pass
 
     try:
         await stop_event.wait()

@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from typing import Dict, Optional
 import os
+import time
+from typing import Dict, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -43,6 +44,7 @@ class TelegramBotManager:
         token: str = TELEGRAM_BOT_TOKEN,
         alert_channel: int = TELEGRAM_ALERT_CHANNEL,
         allowed_ids: Optional[list] = None,
+        journal: Optional[TradeJournal] = None,
     ):
         self.mt5_client = mt5_client
         self.token = token
@@ -51,9 +53,18 @@ class TelegramBotManager:
         self.allowed_chat_ids = allowed_ids if allowed_ids is not None else ALLOWED_CHAT_IDS
         self.app: Optional[Application] = None
         self.pending_setups: Dict[str, TradeSetup] = {}
+        self.pending_setups_time: Dict[str, float] = {}
         self.scanner_callback = None  # Reference to manual trigger scan
-        self.journal = TradeJournal()
+        self.journal = journal or TradeJournal()
         self.notion = NotionJournal()
+
+    def _cleanup_expired_setups(self, max_age_hours: float = 6.0):
+        """Cleans up setups in pending_setups older than max_age_hours to prevent memory leaks."""
+        now = time.time()
+        expired = [sid for sid, ts in self.pending_setups_time.items() if (now - ts) > (max_age_hours * 3600)]
+        for sid in expired:
+            self.pending_setups.pop(sid, None)
+            self.pending_setups_time.pop(sid, None)
 
     def set_scanner_callback(self, callback):
         self.scanner_callback = callback
@@ -308,7 +319,7 @@ class TelegramBotManager:
         await update.message.reply_text(report_msg, parse_mode="Markdown")
 
     async def addtrade_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Allows manual addition of trades from phone: /addtrade XAUUSD YES 1.0 2.8"""
+        """Allows manual addition of trades from phone: /addtrade XAUUSD BUY YES 1.0 2.8"""
         if not self._is_authorized(update):
             return
 
@@ -316,24 +327,39 @@ class TelegramBotManager:
         if not args or len(args) < 4:
             help_msg = (
                 "ℹ️ **Instrukcja dodawania transakcji:**\n"
-                "`/addtrade <SYMBOL> <YES/NO> <REALIZED_R> <MAX_R>`\n\n"
+                "`/addtrade <SYMBOL> <BUY/SELL> <YES/NO> <REALIZED_R> <MAX_R>`\n\n"
                 "**Przykład:**\n"
-                "`/addtrade XAUUSD YES 1.0 2.8`\n"
-                "*(Oznacza wygraną pozycję na złocie zamkniętą przy 1.0R, gdzie rynek maksymalnie dał 2.8R)*"
+                "`/addtrade XAUUSD BUY YES 1.0 2.8`\n"
+                "*(Wygrana długa pozycja na złocie zamknięta przy +1.0R, max peak MFE 2.8R)*"
             )
             await update.message.reply_text(help_msg, parse_mode="Markdown")
             return
 
         try:
             symbol = args[0].upper()
-            is_win = args[1].upper() in ("YES", "Y", "TAK", "WIN", "1")
-            realized_r = float(args[2].replace(",", "."))
-            max_r = float(args[3].replace(",", "."))
+            if len(args) >= 5:
+                direction = "BUY" if "B" in args[1].upper() else "SELL"
+                is_win = args[2].upper() in ("YES", "Y", "TAK", "WIN", "1")
+                realized_r = float(args[3].replace(",", "."))
+                max_r = float(args[4].replace(",", "."))
+            else:
+                # 4 arguments backward compatibility
+                if args[1].upper() in ("BUY", "SELL"):
+                    direction = args[1].upper()
+                    realized_r = float(args[2].replace(",", "."))
+                    max_r = float(args[3].replace(",", "."))
+                    is_win = realized_r > 0
+                else:
+                    direction = "MANUAL"
+                    is_win = args[1].upper() in ("YES", "Y", "TAK", "WIN", "1")
+                    realized_r = float(args[2].replace(",", "."))
+                    max_r = float(args[3].replace(",", "."))
+
             status = "WIN" if is_win else "LOSS"
 
             trade_id = self.journal.add_trade(
                 symbol=symbol,
-                direction="BUY" if is_win else "SELL",
+                direction=direction,
                 entry_price=0.0,
                 sl_price=0.0,
                 tp_price=0.0,
@@ -341,11 +367,11 @@ class TelegramBotManager:
                 max_r=max_r,
                 confluence_score=80,
                 status=status,
-                comment="Dodano ręcznie przez Telegram",
+                comment=f"Dodano ręcznie przez Telegram [{direction}]",
             )
             await update.message.reply_text(
                 f"✅ Dodano transakcję #{trade_id} do dziennika!\n"
-                f"• {symbol} [{status}]: Wynik `{realized_r:+.1f}R` | Max R: `{max_r:.1f}R`\n\n"
+                f"• {symbol} [{direction}] [{status}]: Wynik `{realized_r:+.1f}R` | Max R: `{max_r:.1f}R`\n\n"
                 f"Wpisz `/optimizer`, aby zobaczyć zaktualizowany Best RR!"
             )
         except Exception as e:
@@ -415,6 +441,7 @@ class TelegramBotManager:
             await query.edit_message_caption(caption=f"{query.message.caption}\n\n❌ **Setup odrzucony przez użytkownika.**")
             if setup_id in self.pending_setups:
                 del self.pending_setups[setup_id]
+            self.pending_setups_time.pop(setup_id, None)
             return
 
         if not setup:
@@ -555,6 +582,7 @@ class TelegramBotManager:
 
         if setup_id in self.pending_setups:
             del self.pending_setups[setup_id]
+        self.pending_setups_time.pop(setup_id, None)
 
     async def send_setup_alert(self, setup: TradeSetup, chart_path: str, setup_id: str):
         """Sends rich alert with chart image and interactive execution buttons."""
@@ -562,7 +590,9 @@ class TelegramBotManager:
             logger.warning("Telegram Bot application not running or alert channel not set.")
             return
 
+        self._cleanup_expired_setups()
         self.pending_setups[setup_id] = setup
+        self.pending_setups_time[setup_id] = time.time()
 
         dir_emoji = "🟢 BUY (DŁUGA)" if setup.direction == "BUY" else "🔴 SELL (KRÓTKA)"
         digits = 2 if "JPY" in setup.symbol or "XAU" in setup.symbol else 4
