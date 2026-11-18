@@ -15,18 +15,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("ForexSMC.Sync")
 
 
-async def sync_all():
+async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJournal] = None):
     print("=" * 65)
     print("    SYNCHRONIZACJA DANYCH: MT5 <--> TRADES.DB <--> NOTION")
     print("=" * 65)
 
-    # 1. Initialize MT5 Client
-    client = MT5Client()
-    if not client.connect():
-        print("❌ BŁĄD: Nie można połączyć z MetaTrader 5.")
-        return
+    created_client = False
+    if client is None:
+        client = MT5Client()
+        if not client.connect():
+            print("❌ BŁĄD: Nie można połączyć z MetaTrader 5.")
+            return
+        created_client = True
 
-    journal = TradeJournal()
+    if journal is None:
+        journal = TradeJournal()
     notion = NotionJournal() if ENABLE_NOTION else None
 
     # 2. Get Open Positions from MT5
@@ -132,6 +135,41 @@ async def sync_all():
             )
             print(f"  ➕ Dodano brakującą otwartą pozycję #{ticket} ({raw_sym}) do trades.db (ID: {tid})")
 
+    # C) Backfill missing closed deals into trades.db
+    for ticket, d in closed_deals_mt5.items():
+        if ticket not in db_by_ticket and ticket not in open_tickets_mt5:
+            raw_sym = d["symbol"].replace(".pro", "").replace(".raw", "").replace(".PRO", "").replace(".RAW", "")
+            profit = d["profit"]
+            reason = d["reason"]
+            if profit > 0:
+                status = "WIN"
+                realized_r = 1.8
+            elif profit < 0:
+                status = "LOSS"
+                realized_r = -1.0
+            else:
+                status = "BE"
+                realized_r = 0.0
+
+            tid = journal.add_trade(
+                symbol=raw_sym,
+                direction="BUY" if "BUY" in (d.get("comment") or "").upper() else "SELL",
+                entry_price=0.0,
+                sl_price=0.0,
+                tp_price=0.0,
+                realized_r=realized_r,
+                max_r=realized_r if realized_r > 0 else 0.0,
+                confluence_score=80,
+                status=status,
+                chart_path=None,
+                mt5_ticket=ticket,
+                comment=f"{d.get('comment') or 'Historia MT5'}",
+                is_pyramid=False,
+                strategy="SMC",
+                exit_reason=("TP" if status == "WIN" else ("SL" if status == "LOSS" else "BE")),
+            )
+            print(f"  ➕ Dodano pozycję archiwalną #{ticket} ({raw_sym}) do trades.db -> {status} (PnL: {profit:+.2f} USD)")
+
     # Refresh db_trades
     db_trades = journal.get_all_trades()
     db_by_ticket = {t.get("mt5_ticket"): t for t in db_trades if t.get("mt5_ticket")}
@@ -227,7 +265,8 @@ async def sync_all():
     else:
         print("\n[4/4] Notion nie jest włączony lub brak konfiguracji w .env")
 
-    client.disconnect()
+    if created_client:
+        client.disconnect()
     print("\n" + "=" * 65)
     print("    SYNCHRONIZACJA ZAKOŃCZONA POMYŚLNIE!")
     print("=" * 65)

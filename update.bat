@@ -167,6 +167,9 @@ if %ERRORLEVEL% equ 0 (
 
 :DEPS_DONE
 echo Zaleznosci sa aktualne.
+echo.
+echo Weryfikacja i naprawa bazy danych trades.db...
+.venv\Scripts\python.exe repair_db.py
 
 :FINISH_UPDATE
 echo.

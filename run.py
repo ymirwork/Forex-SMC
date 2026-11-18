@@ -32,17 +32,17 @@ async def main():
         logger.error("Failed to connect to MetaTrader 5 terminal. Exiting.")
         return
 
+    # Shared Single-Instance Resources (TradeJournal & NewsFilter)
+    shared_journal = TradeJournal()
+    shared_news_filter = NewsFilter()
+
     # Auto-reconcile MT5, trades.db and Notion on startup
     try:
         from sync_journal import sync_all
         logger.info("Reconciling MT5, trades.db and Notion...")
-        await sync_all()
+        await sync_all(client=mt5_client, journal=shared_journal)
     except Exception as e:
         logger.warning(f"Startup trade reconciliation warning: {e}")
-
-    # Shared Single-Instance Resources (TradeJournal & NewsFilter)
-    shared_journal = TradeJournal()
-    shared_news_filter = NewsFilter()
 
     # 2. Telegram Bot Manager
     telegram_mgr = None
@@ -148,6 +148,8 @@ async def main():
                 await telegram_mgr.app.shutdown()
             except Exception as e:
                 logger.warning(f"Error shutting down Telegram app: {e}")
+        if shared_journal:
+            shared_journal.checkpoint()
         mt5_client.disconnect()
         logger.info("All services cleanly terminated.")
 

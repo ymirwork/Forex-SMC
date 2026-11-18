@@ -146,7 +146,12 @@ class SMCScanner:
                     self._prop_warned = False  # Reset once equity recovers
 
         # 2. Closed Trades Monitor
-        open_trades = self.journal.get_open_trades()
+        try:
+            open_trades = self.journal.get_open_trades()
+        except Exception as e:
+            logger.error(f"Failed to query open trades from journal: {e}")
+            open_trades = []
+
         if not open_trades:
             return
 
@@ -534,18 +539,20 @@ class SMCScanner:
         last_scan_time = 0.0
 
         while self.is_running:
+            now = time.time()
             try:
-                now = time.time()
                 # Fast trade monitoring every TRADE_MONITOR_INTERVAL_SECONDS for instant TP / SL closing alerts
                 await self.monitor_open_trades()
+            except Exception as e:
+                logger.error(f"Error in trade monitor loop: {e}", exc_info=True)
 
-                # Full market scan every SCAN_INTERVAL_SECONDS (e.g. 60s)
-                if (now - last_scan_time) >= SCAN_INTERVAL_SECONDS:
+            # Full market scan every SCAN_INTERVAL_SECONDS (e.g. 60s)
+            if (now - last_scan_time) >= SCAN_INTERVAL_SECONDS:
+                try:
                     await self.scan_once()
                     last_scan_time = now
-
-            except Exception as e:
-                logger.error(f"Error in scanner loop: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Error during scan_once: {e}", exc_info=True)
 
             await asyncio.sleep(TRADE_MONITOR_INTERVAL_SECONDS)
 
