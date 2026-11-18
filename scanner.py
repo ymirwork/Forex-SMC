@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 from chart_generator import ChartGenerator
 from config import (
@@ -319,6 +319,9 @@ class SMCScanner:
             return 0
 
         self._cleanup_old_notifications()
+
+        # Refresh macroeconomic news calendar asynchronously
+        await self.news_filter.fetch_calendar_async()
 
         # Prop Firm checks before scanning
         if PROP_FIRM_MODE:

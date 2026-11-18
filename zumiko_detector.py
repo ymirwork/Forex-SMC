@@ -7,11 +7,12 @@ import pandas as pd
 from news_filter import NewsFilter
 from rr_optimizer import RROptimizer
 from session_manager import SessionManager
-from smc_detector import ConfluenceItem, TradeSetup
+from smc_detector import ConfluenceItem, TradeSetup, calculate_stop_loss
 from trade_journal import TradeJournal
 from config import (
     ADD_SPREAD_TO_SL,
     DEFAULT_RR_RATIO,
+    LTF_TIMEFRAME,
     MIN_TRADES_FOR_OPTIMAL_RR,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
@@ -377,23 +378,15 @@ class ZumikoDetector:
             recent_low = df_m15.iloc[-5:]["low"].min()
             sl_ref = min(recent_low, curr_e21) if TIGHT_SL_MODE else (min(last_low_val, curr_e238) if last_low_val > 0 else (curr_e238 - buffer))
             structural_sl = sl_ref - effective_buffer
-            structural_risk = entry - structural_sl
-            atr_risk = atr * SL_ATR_MULTIPLIER
-
-            if SL_CALCULATION_MODE == "ATR":
-                sl = entry - (atr_risk + spread_buffer)
-                applied_sl_mode = "ATR"
-            elif SL_CALCULATION_MODE == "HYBRID":
-                min_risk = atr * SL_HYBRID_MIN_ATR_MULT
-                final_risk = max(structural_risk, min_risk)
-                sl = entry - final_risk
-                applied_sl_mode = "HYBRID"
-            else:
-                sl = structural_sl
-                applied_sl_mode = "STRUCTURE"
-
-            risk = entry - sl
-            if risk <= (point_scale * 5):
+            sl, risk, applied_sl_mode = calculate_stop_loss(
+                entry=entry,
+                structural_sl=structural_sl,
+                atr=atr,
+                is_buy=True,
+                spread_buffer=spread_buffer,
+                point_scale=point_scale,
+            )
+            if sl is None or risk is None:
                 return None
             tp1 = entry + (risk * target_rr)
             tp2 = max(last_high_val, entry + (risk * (target_rr + 1.0)))
@@ -404,23 +397,15 @@ class ZumikoDetector:
             recent_high = df_m15.iloc[-5:]["high"].max()
             sl_ref = max(recent_high, curr_e21) if TIGHT_SL_MODE else (max(last_high_val, curr_e238) if last_high_val > 0 else (curr_e238 + buffer))
             structural_sl = sl_ref + effective_buffer
-            structural_risk = structural_sl - entry
-            atr_risk = atr * SL_ATR_MULTIPLIER
-
-            if SL_CALCULATION_MODE == "ATR":
-                sl = entry + (atr_risk + spread_buffer)
-                applied_sl_mode = "ATR"
-            elif SL_CALCULATION_MODE == "HYBRID":
-                min_risk = atr * SL_HYBRID_MIN_ATR_MULT
-                final_risk = max(structural_risk, min_risk)
-                sl = entry + final_risk
-                applied_sl_mode = "HYBRID"
-            else:
-                sl = structural_sl
-                applied_sl_mode = "STRUCTURE"
-
-            risk = sl - entry
-            if risk <= (point_scale * 5):
+            sl, risk, applied_sl_mode = calculate_stop_loss(
+                entry=entry,
+                structural_sl=structural_sl,
+                atr=atr,
+                is_buy=False,
+                spread_buffer=spread_buffer,
+                point_scale=point_scale,
+            )
+            if sl is None or risk is None:
                 return None
             tp1 = entry - (risk * target_rr)
             tp2 = min(last_low_val, entry - (risk * (target_rr + 1.0)))
@@ -433,7 +418,7 @@ class ZumikoDetector:
         return TradeSetup(
             symbol=symbol,
             direction=direction,
-            timeframe="M15",
+            timeframe=LTF_TIMEFRAME,
             setup_type="Zumiko KillMLM MTF Trend & EMA Pullback",
             entry_price=round(entry, digits),
             sl_price=round(sl, digits),

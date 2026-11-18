@@ -130,5 +130,94 @@ class TestAntiSpamAndSLModes(unittest.TestCase):
         self.assertGreater(config.DISMISS_MUTE_HOURS, 0.0)
 
 
+class TestStopLossCalculation(unittest.TestCase):
+    def test_stop_loss_modes(self):
+        import smc_detector
+        from smc_detector import calculate_stop_loss
+        
+        orig_mode = smc_detector.SL_CALCULATION_MODE
+        orig_mult = smc_detector.SL_ATR_MULTIPLIER
+        orig_hybrid = smc_detector.SL_HYBRID_MIN_ATR_MULT
+        try:
+            smc_detector.SL_ATR_MULTIPLIER = 1.5
+            smc_detector.SL_HYBRID_MIN_ATR_MULT = 0.8
+            entry = 1.1000
+            atr = 0.0010  # 10 pips
+            spread = 0.0001  # 1 pip
+
+            # 1. STRUCTURE MODE
+            smc_detector.SL_CALCULATION_MODE = "STRUCTURE"
+            sl, risk, mode = calculate_stop_loss(entry=entry, structural_sl=1.0980, atr=atr, is_buy=True, spread_buffer=spread)
+            self.assertEqual(mode, "STRUCTURE")
+            self.assertAlmostEqual(sl, 1.0980)
+            self.assertAlmostEqual(risk, 0.0020)
+
+            # 2. ATR MODE (BUY): entry - (1.5 * 0.0010 + 0.0001) = 1.1000 - 0.0016 = 1.0984
+            smc_detector.SL_CALCULATION_MODE = "ATR"
+            sl, risk, mode = calculate_stop_loss(entry=entry, structural_sl=1.0980, atr=atr, is_buy=True, spread_buffer=spread)
+            self.assertEqual(mode, "ATR")
+            self.assertAlmostEqual(sl, 1.0984)
+            self.assertAlmostEqual(risk, 0.0016)
+
+            # 3. HYBRID MODE (BUY - Structural is wider than min ATR):
+            # min ATR risk = (0.8 * 0.0010) + 0.0001 = 0.0009. Structural risk = 0.0020.
+            # max(0.0020, 0.0009) = 0.0020. sl = 1.0980
+            smc_detector.SL_CALCULATION_MODE = "HYBRID"
+            sl, risk, mode = calculate_stop_loss(entry=entry, structural_sl=1.0980, atr=atr, is_buy=True, spread_buffer=spread)
+            self.assertEqual(mode, "HYBRID")
+            self.assertAlmostEqual(sl, 1.0980)
+            self.assertAlmostEqual(risk, 0.0020)
+
+            # 4. HYBRID MODE (BUY - Structural is tighter than min ATR):
+            # structural_sl = 1.0995 (5 pips risk). min ATR risk = 9 pips (0.0009).
+            # max(0.0005, 0.0009) = 0.0009. sl = 1.1000 - 0.0009 = 1.0991
+            sl, risk, mode = calculate_stop_loss(entry=entry, structural_sl=1.0995, atr=atr, is_buy=True, spread_buffer=spread)
+            self.assertEqual(mode, "HYBRID")
+            self.assertAlmostEqual(sl, 1.0991)
+            self.assertAlmostEqual(risk, 0.0009)
+
+            # 5. HYBRID MODE (SELL - Structural is tighter than min ATR):
+            # entry = 1.1000. structural_sl = 1.1005 (5 pips).
+            # sl = 1.1000 + 0.0009 = 1.1009
+            sl, risk, mode = calculate_stop_loss(entry=entry, structural_sl=1.1005, atr=atr, is_buy=False, spread_buffer=spread)
+            self.assertEqual(mode, "HYBRID")
+            self.assertAlmostEqual(sl, 1.1009)
+            self.assertAlmostEqual(risk, 0.0009)
+
+            # 6. Invalid risk (too tight <= 5 points)
+            sl, risk, mode = calculate_stop_loss(entry=entry, structural_sl=1.09999, atr=0.00001, is_buy=True, spread_buffer=0.0)
+            self.assertIsNone(sl)
+            self.assertIsNone(risk)
+        finally:
+            smc_detector.SL_CALCULATION_MODE = orig_mode
+            smc_detector.SL_ATR_MULTIPLIER = orig_mult
+            smc_detector.SL_HYBRID_MIN_ATR_MULT = orig_hybrid
+
+
+class TestAuthorizationSecurity(unittest.TestCase):
+    def test_unauthorized_channel_member_callback_rejected(self):
+        from unittest.mock import MagicMock
+        from telegram_bot import TelegramBotManager
+
+        # Trader configures their personal user ID (123456) and a broadcast channel (-100999999)
+        bot = TelegramBotManager(None, token="dummy", alert_channel=-100999999, allowed_ids=[123456, -100999999])
+
+        # Authorized user clicking button
+        update_auth = MagicMock()
+        update_auth.callback_query = MagicMock()
+        update_auth.effective_user.id = 123456
+        update_auth.effective_chat.id = -100999999
+        update_auth.callback_query.message.chat.id = -100999999
+        self.assertTrue(bot._is_authorized(update_auth))
+
+        # Random member in the channel clicking button (user ID 999999 not in allowed_chat_ids)
+        update_unauth = MagicMock()
+        update_unauth.callback_query = MagicMock()
+        update_unauth.effective_user.id = 999999
+        update_unauth.effective_chat.id = -100999999
+        update_unauth.callback_query.message.chat.id = -100999999
+        self.assertFalse(bot._is_authorized(update_unauth))
+
+
 if __name__ == "__main__":
     unittest.main()

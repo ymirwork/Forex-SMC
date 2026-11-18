@@ -35,7 +35,6 @@ class SessionManager:
         is_london_killzone = dtime(7, 0) <= t <= dtime(10, 0)
         is_ny_killzone = dtime(12, 0) <= t <= dtime(15, 0)
         is_asian_session = dtime(0, 0) <= t < dtime(7, 0)
-        is_post_ny = dtime(20, 0) <= t or t < dtime(0, 0)
 
         if is_london_killzone:
             session_name = "London Open Killzone"

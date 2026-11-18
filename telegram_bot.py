@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -92,21 +92,34 @@ class TelegramBotManager:
         self.scanner_callback = callback
 
     def _is_authorized(self, update: Update) -> bool:
-        """Enforces security whitelist: checks user, channel, or message chat ID."""
+        """Enforces security whitelist: strictly authorizes personal user ID for trades/callbacks."""
         if not self.allowed_chat_ids:
             return True
         user_id = update.effective_user.id if update.effective_user else 0
         chat_id = update.effective_chat.id if update.effective_chat else 0
-        msg_chat_id = (
-            update.callback_query.message.chat.id
-            if update.callback_query and update.callback_query.message
-            else 0
-        )
+
+        # For action callbacks (executing trades, BE, dismiss), strictly require positive user ID in whitelist
+        if update.callback_query:
+            return user_id > 0 and user_id in self.allowed_chat_ids
+
+        # For commands and messages: check user ID or whitelisted chat ID
         return (
-            (user_id in self.allowed_chat_ids)
-            or (chat_id in self.allowed_chat_ids)
-            or (msg_chat_id in self.allowed_chat_ids)
+            (user_id > 0 and user_id in self.allowed_chat_ids)
+            or (chat_id > 0 and chat_id in self.allowed_chat_ids)
         )
+
+    @staticmethod
+    async def _safe_edit_message(query, text: str, parse_mode: str = "Markdown"):
+        """Safely edits message caption (for photo alerts) or message text (for text alerts)."""
+        if not query.message:
+            return
+        try:
+            if query.message.caption is not None:
+                await query.edit_message_caption(caption=text, parse_mode=parse_mode)
+            else:
+                await query.edit_message_text(text=text, parse_mode=parse_mode)
+        except Exception as e:
+            logger.debug(f"Error in _safe_edit_message: {e}")
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -438,7 +451,7 @@ class TelegramBotManager:
         await query.answer()
 
         if not self._is_authorized(update):
-            await query.edit_message_caption(caption="⛔ Brak uprawnień do wykonania tego zlecenia.")
+            await self._safe_edit_message(query, "⛔ Brak uprawnień do wykonania tego zlecenia.")
             return
 
         data = query.data or ""
@@ -458,6 +471,11 @@ class TelegramBotManager:
             return
 
         setup = self.pending_setups.get(setup_id)
+        orig_caption = (
+            query.message.caption
+            if (query.message and query.message.caption is not None)
+            else (query.message.text if query.message else "")
+        )
 
         if action == "dismiss":
             mute_txt = ""
@@ -465,26 +483,27 @@ class TelegramBotManager:
                 self.mute_symbol(setup.symbol, setup.direction, hours=DISMISS_MUTE_HOURS)
                 mute_txt = f"\n\n🔇 **Powiadomienia dla {setup.symbol} [{setup.direction}] wyciszone na {DISMISS_MUTE_HOURS:.1f}h.**"
 
-            await query.edit_message_caption(caption=f"{query.message.caption}\n\n❌ **Setup odrzucony przez użytkownika.**{mute_txt}")
+            await self._safe_edit_message(query, f"{orig_caption}\n\n❌ **Setup odrzucony przez użytkownika.**{mute_txt}")
             if setup_id in self.pending_setups:
                 del self.pending_setups[setup_id]
             self.pending_setups_time.pop(setup_id, None)
             return
 
         if not setup:
-            await query.edit_message_caption(caption=f"{query.message.caption}\n\n⚠️ **Ten setup wygasł lub został już przetworzony.**")
+            await self._safe_edit_message(query, f"{orig_caption}\n\n⚠️ **Ten setup wygasł lub został już przetworzony.**")
             return
 
         if action in ("market", "limit"):
             from config import BLOCK_ON_HIGH_IMPACT_NEWS, PROP_ENFORCE_NEWS_FILTER
             should_block_news = BLOCK_ON_HIGH_IMPACT_NEWS or (PROP_FIRM_MODE and PROP_ENFORCE_NEWS_FILTER)
             if should_block_news:
-                # Live news verification at the exact time of order placement
-                has_news, news_warn, _ = self.news_filter.check_news(setup.symbol)
+                # Live news verification at the exact time of order placement (async non-blocking)
+                has_news, news_warn, _ = await self.news_filter.check_news_async(setup.symbol)
                 if has_news and news_warn:
                     await query.answer(text="Zablokowano: zbliżają się wiadomości High-Impact!", show_alert=True)
-                    await query.edit_message_caption(
-                        caption=f"{query.message.caption}\n\n🛑 **Zlecenie zablokowane na żywo (Filtr Wiadomości High-Impact):**\n{news_warn}"
+                    await self._safe_edit_message(
+                        query,
+                        f"{orig_caption}\n\n🛑 **Zlecenie zablokowane na żywo (Filtr Wiadomości High-Impact):**\n{news_warn}"
                     )
                     return
 
@@ -497,8 +516,9 @@ class TelegramBotManager:
                 )
                 if not can_trade:
                     await query.answer(text=reason[:190], show_alert=True)
-                    await query.edit_message_caption(
-                        caption=f"{query.message.caption}\n\n🛑 **Zlecenie zablokowane (Prop Firm Guardian):**\n{reason}"
+                    await self._safe_edit_message(
+                        query,
+                        f"{orig_caption}\n\n🛑 **Zlecenie zablokowane (Prop Firm Guardian):**\n{reason}"
                     )
                     return
 
@@ -555,7 +575,7 @@ class TelegramBotManager:
                     "comment": f"{strat_label} | via Telegram",
                 }))
                 new_caption = (
-                    f"{query.message.caption}\n\n"
+                    f"{orig_caption}\n\n"
                     f"✅ **ZLECENIE WYKONANE W MT5!**\n"
                     f"🎫 **Ticket:** `#{ticket}`\n"
                     f"📍 **Cena egzekucji:** `{actual_entry}`\n"
@@ -563,10 +583,11 @@ class TelegramBotManager:
                     f"🎯 **SL:** `{setup.sl_price}` | **TP:** `{setup.tp1_price}`"
                     f"{trail_msg}"
                 )
-                await query.edit_message_caption(caption=new_caption, parse_mode="Markdown")
+                await self._safe_edit_message(query, new_caption)
             else:
-                await query.edit_message_caption(
-                    caption=f"{query.message.caption}\n\n❌ **Błąd wykonania w MT5:** {msg}"
+                await self._safe_edit_message(
+                    query,
+                    f"{orig_caption}\n\n❌ **Błąd wykonania w MT5:** {msg}"
                 )
 
         elif action == "limit":
@@ -609,16 +630,17 @@ class TelegramBotManager:
                     "comment": f"{strat_label} (Limit) | via Telegram",
                 }))
                 new_caption = (
-                    f"{query.message.caption}\n\n"
+                    f"{orig_caption}\n\n"
                     f"🟡 **ZLECENIE LIMIT ZŁOŻONE W MT5!**\n"
                     f"🎫 **Ticket:** `#{ticket}`\n"
                     f"📍 **Cena Limit:** `{setup.entry_price}`\n"
                     f"📦 **Wolumen:** `{lot} lot`"
                 )
-                await query.edit_message_caption(caption=new_caption, parse_mode="Markdown")
+                await self._safe_edit_message(query, new_caption)
             else:
-                await query.edit_message_caption(
-                    caption=f"{query.message.caption}\n\n❌ **Błąd zlecenia limit w MT5:** {msg}"
+                await self._safe_edit_message(
+                    query,
+                    f"{orig_caption}\n\n❌ **Błąd zlecenia limit w MT5:** {msg}"
                 )
 
         if setup_id in self.pending_setups:

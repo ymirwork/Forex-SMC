@@ -12,6 +12,7 @@ from trade_journal import TradeJournal
 from config import (
     ADD_SPREAD_TO_SL,
     DEFAULT_RR_RATIO,
+    LTF_TIMEFRAME,
     MIN_TRADES_FOR_OPTIMAL_RR,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
@@ -19,6 +20,61 @@ from config import (
     TIGHT_SL_MODE,
     USE_OPTIMAL_RR,
 )
+
+
+def calculate_stop_loss(
+    entry: float,
+    structural_sl: float,
+    atr: float,
+    is_buy: bool,
+    spread_buffer: float = 0.0,
+    point_scale: float = 0.0001,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Calculates Stop Loss price and risk amount according to configured SL mode:
+    - "STRUCTURE": Pure structural swing / OTE / EMA invalidation level.
+    - "ATR": Entry +/- (ATR * multiplier + spread_buffer).
+    - "HYBRID": Structural SL, but guarantees a minimum risk buffer of (ATR * hybrid_mult + spread_buffer).
+    Returns (sl, risk, applied_sl_mode). Returns (None, None, applied_sl_mode) if risk <= 5 * point_scale.
+    """
+    atr_val = atr if (atr is not None and atr > 0) else 0.0
+    atr_risk = atr_val * SL_ATR_MULTIPLIER
+
+    if is_buy:
+        structural_risk = entry - structural_sl
+        if SL_CALCULATION_MODE == "ATR":
+            sl = entry - (atr_risk + spread_buffer)
+            applied_sl_mode = "ATR"
+        elif SL_CALCULATION_MODE == "HYBRID":
+            min_risk = (atr_val * SL_HYBRID_MIN_ATR_MULT) + spread_buffer
+            final_risk = max(structural_risk, min_risk)
+            sl = entry - final_risk
+            applied_sl_mode = "HYBRID"
+        else:
+            sl = structural_sl
+            applied_sl_mode = "STRUCTURE"
+
+        risk = entry - sl
+    else:
+        structural_risk = structural_sl - entry
+        if SL_CALCULATION_MODE == "ATR":
+            sl = entry + (atr_risk + spread_buffer)
+            applied_sl_mode = "ATR"
+        elif SL_CALCULATION_MODE == "HYBRID":
+            min_risk = (atr_val * SL_HYBRID_MIN_ATR_MULT) + spread_buffer
+            final_risk = max(structural_risk, min_risk)
+            sl = entry + final_risk
+            applied_sl_mode = "HYBRID"
+        else:
+            sl = structural_sl
+            applied_sl_mode = "STRUCTURE"
+
+        risk = sl - entry
+
+    if risk <= (point_scale * 5):
+        return None, None, applied_sl_mode
+
+    return sl, risk, applied_sl_mode
 
 
 @dataclass
@@ -323,24 +379,17 @@ class SMCDetector:
             else:
                 structural_sl = impulse_low - effective_buffer
 
-            structural_risk = entry - structural_sl
-            atr_risk = atr * SL_ATR_MULTIPLIER
-
-            if SL_CALCULATION_MODE == "ATR":
-                sl = entry - (atr_risk + spread_buffer)
-                applied_sl_mode = "ATR"
-            elif SL_CALCULATION_MODE == "HYBRID":
-                min_risk = atr * SL_HYBRID_MIN_ATR_MULT
-                final_risk = max(structural_risk, min_risk)
-                sl = entry - final_risk
-                applied_sl_mode = "HYBRID"
-            else:
-                sl = structural_sl
-                applied_sl_mode = "STRUCTURE"
-
-            risk = entry - sl
-            if risk <= (point_scale * 5):
+            sl, risk, applied_sl_mode = calculate_stop_loss(
+                entry=entry,
+                structural_sl=structural_sl,
+                atr=atr,
+                is_buy=True,
+                spread_buffer=spread_buffer,
+                point_scale=point_scale,
+            )
+            if sl is None or risk is None:
                 return None
+
             tp1 = entry + (risk * target_rr)
             tp2 = max(impulse_high, entry + (risk * (target_rr + 1.0)))
             zone_top = fibo_618
@@ -359,24 +408,17 @@ class SMCDetector:
             else:
                 structural_sl = impulse_high + effective_buffer
 
-            structural_risk = structural_sl - entry
-            atr_risk = atr * SL_ATR_MULTIPLIER
-
-            if SL_CALCULATION_MODE == "ATR":
-                sl = entry + (atr_risk + spread_buffer)
-                applied_sl_mode = "ATR"
-            elif SL_CALCULATION_MODE == "HYBRID":
-                min_risk = atr * SL_HYBRID_MIN_ATR_MULT
-                final_risk = max(structural_risk, min_risk)
-                sl = entry + final_risk
-                applied_sl_mode = "HYBRID"
-            else:
-                sl = structural_sl
-                applied_sl_mode = "STRUCTURE"
-
-            risk = sl - entry
-            if risk <= (point_scale * 5):
+            sl, risk, applied_sl_mode = calculate_stop_loss(
+                entry=entry,
+                structural_sl=structural_sl,
+                atr=atr,
+                is_buy=False,
+                spread_buffer=spread_buffer,
+                point_scale=point_scale,
+            )
+            if sl is None or risk is None:
                 return None
+
             tp1 = entry - (risk * target_rr)
             tp2 = min(impulse_low, entry - (risk * (target_rr + 1.0)))
             zone_top = fibo_786
@@ -462,8 +504,8 @@ class SMCDetector:
         return TradeSetup(
             symbol=symbol,
             direction=direction,
-            timeframe="M15",
-            setup_type="M15 CHoCH + Fibo >= 61.8% Pullback (OTE)",
+            timeframe=LTF_TIMEFRAME,
+            setup_type=f"{LTF_TIMEFRAME} CHoCH + Fibo >= 61.8% Pullback (OTE)",
             entry_price=round(entry, digits),
             sl_price=round(sl, digits),
             tp1_price=round(tp1, digits),
