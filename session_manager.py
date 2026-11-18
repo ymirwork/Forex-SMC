@@ -88,7 +88,8 @@ class SessionManager:
         if df is None or df.empty:
             return None, None
 
-        df_copy = df.copy()
+        # Slice recent bars to avoid unnecessary full-history copy
+        df_copy = df.tail(80).copy()
         if "time" not in df_copy.columns:
             return None, None
 

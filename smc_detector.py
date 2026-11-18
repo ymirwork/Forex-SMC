@@ -19,6 +19,7 @@ from config import (
     LTF_TIMEFRAME,
     MAX_SL_ATR_MULTIPLIER,
     MIN_TRADES_FOR_OPTIMAL_RR,
+    OPTIMAL_RR_MIN_FLOOR,
     REQUIRE_STRUCTURAL_SPACE_FOR_RR,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
@@ -572,11 +573,12 @@ class SMCDetector:
             structural_space = impulse_high - entry
             structural_rr = (structural_space / risk) if risk > 0 else 0.0
 
-            # Filter: Require at least 1.0R structural room to external liquidity
-            if REQUIRE_STRUCTURAL_SPACE_FOR_RR and structural_rr < 1.0:
+            # Filter: Require at least OPTIMAL_RR_MIN_FLOOR (min 2.0R) structural room to external liquidity
+            min_allowed_rr = max(OPTIMAL_RR_MIN_FLOOR, 1.5)
+            if REQUIRE_STRUCTURAL_SPACE_FOR_RR and structural_rr < min_allowed_rr:
                 logger.info(
                     f"🛡️ [FILTER] Odrzucono setup {symbol} BUY: Zbyt mała przestrzeń do szczytu fali BSL "
-                    f"({structural_rr:.2f}R < 1.0R)."
+                    f"({structural_rr:.2f}R < {min_allowed_rr:.1f}R)."
                 )
                 return None
 
@@ -637,11 +639,12 @@ class SMCDetector:
             structural_space = entry - impulse_low
             structural_rr = (structural_space / risk) if risk > 0 else 0.0
 
-            # Filter: Require at least 1.0R structural room to external liquidity
-            if REQUIRE_STRUCTURAL_SPACE_FOR_RR and structural_rr < 1.0:
+            # Filter: Require at least OPTIMAL_RR_MIN_FLOOR (min 2.0R) structural room to external liquidity
+            min_allowed_rr = max(OPTIMAL_RR_MIN_FLOOR, 1.5)
+            if REQUIRE_STRUCTURAL_SPACE_FOR_RR and structural_rr < min_allowed_rr:
                 logger.info(
                     f"🛡️ [FILTER] Odrzucono setup {symbol} SELL: Zbyt mała przestrzeń do dołka fali SSL "
-                    f"({structural_rr:.2f}R < 1.0R)."
+                    f"({structural_rr:.2f}R < {min_allowed_rr:.1f}R)."
                 )
                 return None
 

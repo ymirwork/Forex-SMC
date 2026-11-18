@@ -239,6 +239,31 @@ class TestSignalGuards(unittest.TestCase):
         self.assertEqual(setup.tp1_price, 1.1030)
         self.assertEqual(setup.setup_type, "M15 BOS + Fibo >= 61.8% Pullback (OTE)")
 
+    def test_max_sl_atr_multiplier_filter(self):
+        """Verify that when risk exceeds MAX_SL_ATR_MULTIPLIER * ATR, setup is rejected."""
+        detector = SMCDetector(min_confluence_score=40)
+        # ATR is (high - low) = 0.0010 (10 pips). Max allowed SL is 2.5 * ATR = 25 pips.
+        # Here SL is 0.0035 (35 pips > 25 pips). Must be rejected!
+        setup = detector._build_smc_setup(
+            direction="BUY",
+            symbol="EURUSD",
+            impulse_low=1.0900,
+            impulse_high=1.1100,
+            current_candle=pd.Series({"close": 1.1000, "open": 1.1005, "high": 1.1008, "low": 1.0998, "time": datetime.now(timezone.utc)}),
+            df_ltf=pd.DataFrame([
+                {"open": 1.1000, "high": 1.1005, "low": 1.0995, "close": 1.1000}
+            ] * 20),
+            swings_ltf=pd.DataFrame(),
+            broken_level=1.1050,
+            event_name="BOS",
+            target_rr=2.0,
+            digits=4,
+            point_scale=0.0001,
+            buffer=0.0002,
+        )
+        # Structural SL in HYBRID mode or swing low is at 1.0900 (100 pips risk > 2.5 * 10 pips)
+        self.assertIsNone(setup)
+
 
 if __name__ == "__main__":
     unittest.main()

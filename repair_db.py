@@ -26,43 +26,29 @@ def repair_database(db_path: str = "trades.db", force: bool = False) -> bool:
         print("✅ Pomyślnie utworzono nową strukturę bazy danych.")
         return True
 
-    # 1. Sprawdzenie integralności SQLite
-    print("\n[1/3] Weryfikacja integralności struktury SQLite (PRAGMA integrity_check)...")
-    is_corrupt = False
-    check_results = []
-    try:
-        conn = sqlite3.connect(db_path, timeout=10.0)
-        check_results = conn.execute("PRAGMA integrity_check;").fetchall()
-        conn.close()
-        if not check_results or check_results[0][0] != "ok":
-            is_corrupt = True
-            print(f"⚠️ Wykryto uszkodzenie bazy danych: {check_results}")
-        else:
-            print("✅ Integralność bazy danych: OK (brak uszkodzeń fizycznych).")
-    except sqlite3.DatabaseError as e:
-        is_corrupt = True
-        print(f"❌ Krytyczny błąd SQLite (malformed/corrupt): {e}")
-
-    # 2. Naprawa lub wymuszenie rekonstrukcji
-    if is_corrupt or force:
-        if force and not is_corrupt:
-            print("\n[2/3] Wymuszono procedurę naprawczą (--force)...")
-        else:
-            print("\n[2/3] Rozpoczynanie automatycznej procedury odzyskiwania bazy...")
-
-        journal = TradeJournal(db_path)
-        repaired = journal._recover_database()
-        if repaired:
-            print("✅ Baza danych została pomyślnie naprawiona i zrekonstruowana!")
-        else:
-            print("❌ Nie udało się automatycznie zrekonstruować bazy danych.")
-            return False
+    # 1. Weryfikacja integralności struktury SQLite
+    print("\n[1/3] Weryfikacja i naprawa bazy przez TradeJournal...")
+    journal = TradeJournal(db_path)
+    if force:
+        print("   • Wymuszono rekonstrukcję bazy danych (--force)...")
+        journal._recover_database()
     else:
-        print("\n[2/3] Baza danych jest zdrowa. Przeprowadzam szybki test odczytu tabeli trades...")
-        journal = TradeJournal(db_path)
-        try:
-            open_trades = journal.get_open_trades()
-            all_trades = journal.get_all_trades()
+        ok = journal.check_and_repair()
+        if ok:
+            print("✅ Integralność bazy danych: OK (brak uszkodzeń fizycznych).")
+        else:
+            print("⚠️ Baza została automatycznie naprawiona.")
+
+    # 2. Test odczytu tabeli trades
+    print("\n[2/3] Test odczytu tabeli trades...")
+    try:
+        open_trades = journal.get_open_trades()
+        all_trades = journal.get_all_trades()
+        print(f"   • Liczba wszystkich transakcji w bazie: {len(all_trades)}")
+        print(f"   • Liczba aktywnych transakcji (OPEN): {len(open_trades)}")
+    except Exception as e:
+        print(f"⚠️ Błąd podczas odczytu tabeli: {e}. Uruchamiam auto-recovery...")
+        journal._recover_database()
             print(f"   • Liczba wszystkich transakcji w bazie: {len(all_trades)}")
             print(f"   • Liczba aktywnych transakcji (OPEN): {len(open_trades)}")
         except Exception as e:

@@ -257,7 +257,33 @@ class MT5Client:
             return sym.volume_min
 
         tick_size = sym.trade_tick_size if sym.trade_tick_size > 0 else sym.point
-        tick_value = sym.trade_tick_value if sym.trade_tick_value > 0 else 1.0
+        tick_val_attr = getattr(sym, "trade_tick_value", 0.0)
+        loss_val_attr = getattr(sym, "trade_tick_value_loss", 0.0)
+        try:
+            val_loss = float(loss_val_attr) if loss_val_attr is not None else 0.0
+            val_base = float(tick_val_attr) if tick_val_attr is not None else 0.0
+            tick_value = val_loss if val_loss > 0 else val_base
+        except (TypeError, ValueError):
+            try:
+                tick_value = float(tick_val_attr) if tick_val_attr is not None else 1.0
+            except (TypeError, ValueError):
+                tick_value = 1.0
+
+        if tick_value <= 0:
+            # Refresh symbol info and ensure selection in MarketWatch to load conversion rates
+            mt5.symbol_select(resolved, True)
+            fresh_sym = mt5.symbol_info(resolved)
+            if fresh_sym:
+                f_tick = getattr(fresh_sym, "trade_tick_value", 0.0)
+                f_loss = getattr(fresh_sym, "trade_tick_value_loss", 0.0)
+                try:
+                    vf_loss = float(f_loss) if f_loss is not None else 0.0
+                    vf_base = float(f_tick) if f_tick is not None else 0.0
+                    tick_value = vf_loss if vf_loss > 0 else vf_base
+                except (TypeError, ValueError):
+                    pass
+        if tick_value <= 0:
+            tick_value = 1.0
 
         ticks = sl_distance / tick_size
         loss_per_one_lot = ticks * tick_value

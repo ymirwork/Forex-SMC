@@ -564,7 +564,23 @@ class TelegramBotManager:
             return
 
         if action in ("market", "limit"):
-            from config import BLOCK_ON_HIGH_IMPACT_NEWS, PROP_ENFORCE_NEWS_FILTER
+            from config import BLOCK_ON_HIGH_IMPACT_NEWS, BLOCK_ROLLOVER_SESSION, PROP_ENFORCE_NEWS_FILTER
+            from session_manager import SessionManager
+
+            if BLOCK_ROLLOVER_SESSION and action == "market":
+                curr_session = SessionManager.get_current_session()
+                if "Rollover" in curr_session.get("session_name", ""):
+                    await query.answer(
+                        text="⛔ Zablokowano: Sesja Rollover (niska płynność i szerokie spready)!",
+                        show_alert=True,
+                    )
+                    await self._safe_edit_message(
+                        query,
+                        f"{orig_caption}\n\n🛑 **Zlecenie Market zablokowane (Sesja Rollover / Low Liquidity):**\n"
+                        f"Wstrzymano natychmiastowe wejście rynkowe ze względu na brokerski rollover i rozszerzone spready."
+                    )
+                    return
+
             should_block_news = BLOCK_ON_HIGH_IMPACT_NEWS or (PROP_FIRM_MODE and PROP_ENFORCE_NEWS_FILTER)
             if should_block_news:
                 # Live news verification at the exact time of order placement (async non-blocking)
