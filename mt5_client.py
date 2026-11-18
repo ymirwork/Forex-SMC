@@ -21,8 +21,13 @@ from config import (
     PROP_MAX_SAME_CURRENCY_TRADES,
     PROP_RISK_PER_TRADE_PERCENT,
     PROP_SAFETY_BUFFER_PERCENT,
+    PYRAMID_GRADE_WEIGHTS,
+    PYRAMID_LEVEL_DECAY,
     PYRAMID_LOCK_PREVIOUS_PROFIT,
+    PYRAMID_MAX_RISK_FINANCE_RATIO,
     PYRAMID_MIN_PROFIT_R,
+    PYRAMID_MIN_RR_TO_TP,
+    clean_symbol,
 )
 
 logger = logging.getLogger("ForexSMC.MT5Client")
@@ -585,7 +590,11 @@ class MT5Client:
             return float(orders[0].sl)
         pos = mt5.positions_get(ticket=ticket)
         if pos and len(pos) > 0:
-            return float(pos[0].sl)
+            p0 = pos[0]
+            val = getattr(p0, "sl", None)
+            if val is None and isinstance(p0, dict):
+                val = p0.get("sl", 0.0)
+            return float(val or 0.0)
         return 0.0
 
     def get_position_mfe(
@@ -928,73 +937,295 @@ class MT5Client:
 
         return True, "OK"
 
-    def get_pyramid_status(self, symbol: str) -> dict:
+    def get_pyramid_cluster_status(self, symbol: str) -> dict:
         """
-        Checks if an active position on `symbol` qualifies for risk-neutral pyramiding:
-        1. Open positions on this symbol < MAX_PYRAMID_LEVEL (e.g. 1 position open).
-        2. The active base position has reached at least +1.0R in profit.
-        3. The active base position has its SL at or better than Break-Even (0 risk).
+        Checks if an active position cluster on `symbol` qualifies for risk-neutral pyramiding:
+        1. Open positions count < MAX_PYRAMID_LEVEL.
+        2. No pending orders for this symbol (avoids duplicate scale-in entries).
+        3. Every existing position in the cluster has reached at least +PYRAMID_MIN_PROFIT_R
+           and has its SL at or better than Break-Even (0 risk).
         """
         if not ENABLE_PYRAMIDING or not self.ensure_connection():
             return {"is_eligible": False, "count": 0}
 
-        clean_sym = symbol.upper().replace(".PRO", "").replace(".RAW", "")
+        clean_sym = clean_symbol(symbol)
         open_positions = self.get_open_positions()
 
         sym_positions = [
             p for p in open_positions
-            if p["symbol"].upper().replace(".PRO", "").replace(".RAW", "") == clean_sym
+            if clean_symbol(p["symbol"]) == clean_sym
         ]
+
+        # Check pending orders for this symbol (Audit & Review fix)
+        pending_orders = mt5.orders_get()
+        if pending_orders:
+            sym_pending = [
+                o for o in pending_orders
+                if clean_symbol(o.symbol) == clean_sym
+            ]
+            if sym_pending:
+                return {
+                    "is_eligible": False,
+                    "count": len(sym_positions),
+                    "has_pending": True,
+                    "pending_ticket": sym_pending[0].ticket,
+                    "reason": f"Oczekuje na realizację zlecenia limit/stop #{sym_pending[0].ticket}",
+                }
 
         count = len(sym_positions)
         if count == 0:
             return {"is_eligible": False, "count": 0}
 
         if count >= MAX_PYRAMID_LEVEL:
-            return {"is_eligible": False, "count": count, "reason": f"Osiągnięto limit piramidy ({count}/{MAX_PYRAMID_LEVEL})"}
-
-        base_pos = sym_positions[0]
-        base_ticket = base_pos["ticket"]
-        entry = base_pos["price_open"]
-        curr = base_pos["price_current"]
-        sl = base_pos["sl"]
-        is_buy = base_pos["type"] == "BUY"
-
-        orig_sl = self.get_initial_sl(base_ticket)
-        if orig_sl <= 0 and sl > 0:
-            orig_sl = sl
-
-        if orig_sl <= 0 or entry <= 0:
-            return {"is_eligible": False, "count": count, "reason": "Brak SL na pozycji bazowej"}
-
-        initial_sl_dist = abs(entry - orig_sl)
-        if initial_sl_dist <= 0:
-            return {"is_eligible": False, "count": count, "reason": "Nieprawidłowy dystans SL"}
-
-        favorable_move = (curr - entry) if is_buy else (entry - curr)
-        profit_r = favorable_move / initial_sl_dist
-
-        # Check if SL is moved to BE (within 10% tolerance) or in profit
-        is_be = self.is_position_at_be(entry, sl, is_buy, initial_sl_dist, tolerance_ratio=0.10)
-
-        if profit_r >= PYRAMID_MIN_PROFIT_R and is_be:
             return {
-                "is_eligible": True,
+                "is_eligible": False,
                 "count": count,
-                "direction": base_pos["type"],
-                "base_ticket": base_pos["ticket"],
-                "profit_r": round(profit_r, 2),
-                "profit_usd": base_pos["profit"],
+                "reason": f"Osiągnięto limit piramidy ({count}/{MAX_PYRAMID_LEVEL})"
             }
 
+        # Sort positions chronologically by open time (L1 = base)
+        sym_positions.sort(key=lambda p: p.get("time", 0))
+
+        base_pos = sym_positions[0]
+        direction = base_pos["type"]
+        is_buy = direction == "BUY"
+
+        # Verify all existing positions meet profit and BE requirements
+        for idx, pos in enumerate(sym_positions):
+            ticket = pos["ticket"]
+            entry = pos["price_open"]
+            curr = pos["price_current"]
+            sl = pos["sl"]
+
+            orig_sl = self.get_initial_sl(ticket)
+            if orig_sl <= 0 and sl > 0:
+                orig_sl = sl
+            if orig_sl <= 0 or entry <= 0:
+                return {"is_eligible": False, "count": count, "reason": f"Brak SL na pozycji L{idx+1} #{ticket}"}
+
+            initial_sl_dist = abs(entry - orig_sl)
+            if initial_sl_dist <= 0:
+                return {"is_eligible": False, "count": count, "reason": f"Nieprawidłowy dystans SL na #{ticket}"}
+
+            favorable_move = (curr - entry) if is_buy else (entry - curr)
+            pos_profit_r = favorable_move / initial_sl_dist
+            pos["profit_r"] = round(pos_profit_r, 2)
+
+            is_be = self.is_position_at_be(entry, sl, is_buy, initial_sl_dist, tolerance_ratio=0.15)
+            if pos_profit_r < PYRAMID_MIN_PROFIT_R or not is_be:
+                return {
+                    "is_eligible": False,
+                    "count": count,
+                    "direction": direction,
+                    "profit_r": round(pos_profit_r, 2),
+                    "is_be": is_be,
+                    "reason": f"Pozycja L{idx+1} #{ticket} ({pos_profit_r:.1f}R, BE={is_be}) < wymagane {PYRAMID_MIN_PROFIT_R}R na BE",
+                }
+
+        # Master TP: take from base trade if set, else furthest TP in profit direction
+        master_tp = base_pos.get("tp", 0.0)
+        if master_tp <= 0:
+            all_tps = [p.get("tp", 0.0) for p in sym_positions if p.get("tp", 0.0) > 0]
+            if all_tps:
+                master_tp = max(all_tps) if is_buy else min(all_tps)
+
+        cluster_tickets = [p["ticket"] for p in sym_positions]
+        total_profit_usd = sum(p["profit"] for p in sym_positions)
+
         return {
-            "is_eligible": False,
+            "is_eligible": True,
             "count": count,
-            "direction": base_pos["type"],
-            "profit_r": round(profit_r, 2),
-            "is_be": is_be,
-            "reason": f"Zysk ({profit_r:.1f}R) < wymagane {PYRAMID_MIN_PROFIT_R}R lub brak BE",
+            "current_level": count,
+            "next_level": count + 1,
+            "direction": direction,
+            "base_ticket": base_pos["ticket"],
+            "base_entry": base_pos["price_open"],
+            "base_sl": base_pos["sl"],
+            "master_tp": master_tp,
+            "cluster_tickets": cluster_tickets,
+            "positions": sym_positions,
+            "profit_r": sym_positions[0]["profit_r"],
+            "profit_usd": total_profit_usd,
         }
+
+    def get_pyramid_status(self, symbol: str) -> dict:
+        """Backward-compatibility alias for get_pyramid_cluster_status."""
+        return self.get_pyramid_cluster_status(symbol)
+
+    def calculate_pyramid_position_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        sl_price: float,
+        setup_grade: str,
+        cluster_status: dict,
+    ) -> Tuple[float, float, float, str]:
+        """
+        Calculates mathematically risk-neutral lot size for scale-in:
+        1. Evaluates new locked profit when earlier positions are trailed to sl_price (new_sl).
+        2. Requires new_sl to strictly protect base entry (for BUY: new_sl > base_entry + buffer).
+        3. Caps risk at PYRAMID_MAX_RISK_FINANCE_RATIO (75%) of locked profit.
+        4. Scales by level decay (L2=50%, L3=25%) and setup grade (A+=100%, A=75%, B=50%).
+        Returns: (lot, locked_profit_usd, allowed_risk_usd, reason)
+        """
+        if not self.ensure_connection():
+            return 0.0, 0.0, 0.0, "Brak połączenia z MT5"
+
+        resolved = self.resolve_symbol(symbol)
+        sym_info = mt5.symbol_info(resolved)
+        acc_info = mt5.account_info()
+        if not sym_info or not acc_info:
+            return 0.0, 0.0, 0.0, "Brak danych symbolu lub konta"
+
+        positions = cluster_status.get("positions", [])
+        if not positions:
+            return 0.0, 0.0, 0.0, "Brak pozycji klastra"
+
+        is_buy = cluster_status.get("direction") == "BUY"
+        pip_size = self.get_pip_size(resolved)
+        buffer = pip_size * AUTO_BE_OFFSET_PIPS
+
+        # Check: new_sl must protect base entry! (Review finding 2)
+        base_pos = positions[0]
+        base_entry = base_pos["price_open"]
+        if is_buy and sl_price <= (base_entry + buffer * 0.5):
+            return 0.0, 0.0, 0.0, f"Nowy SL ({sl_price}) nie chroni wejścia pozycji bazowej ({base_entry})"
+        elif not is_buy and sl_price >= (base_entry - buffer * 0.5):
+            return 0.0, 0.0, 0.0, f"Nowy SL ({sl_price}) nie chroni wejścia pozycji bazowej ({base_entry})"
+
+        # Calculate locked profit across positions when trailed to sl_price (Review finding 1)
+        total_locked_usd = 0.0
+        tick_value = getattr(sym_info, "trade_tick_value", 1.0) or 1.0
+        tick_size = getattr(sym_info, "trade_tick_size", sym_info.point) or sym_info.point
+        point = sym_info.point
+
+        for p in positions:
+            p_entry = p["price_open"]
+            p_vol = p["volume"]
+            if is_buy:
+                gain_pts = max(0.0, sl_price - p_entry)
+            else:
+                gain_pts = max(0.0, p_entry - sl_price)
+            if tick_size > 0:
+                p_locked_usd = (gain_pts / tick_size) * tick_value * p_vol
+            else:
+                p_locked_usd = (gain_pts / point) * tick_value * p_vol
+            total_locked_usd += p_locked_usd
+
+        max_risk_usd = total_locked_usd * PYRAMID_MAX_RISK_FINANCE_RATIO
+
+        # Target risk based on account equity, decay and grade
+        level = cluster_status.get("next_level", 2)
+        decay = PYRAMID_LEVEL_DECAY.get(level, 0.25)
+        grade_weight = PYRAMID_GRADE_WEIGHTS.get(setup_grade.upper(), 0.75)
+
+        base_risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
+        standard_risk_usd = (acc_info.balance * (base_risk_pct / 100.0))
+        target_risk_usd = standard_risk_usd * decay * grade_weight
+
+        allowed_risk_usd = min(max_risk_usd, target_risk_usd)
+        if allowed_risk_usd <= 0:
+            return 0.0, total_locked_usd, 0.0, "Zablokowany zysk nie wystarcza na sfinansowanie ryzyka dokładki"
+
+        # Convert allowed_risk_usd to lot size
+        sl_distance = abs(entry_price - sl_price)
+        if sl_distance <= 0:
+            return 0.0, total_locked_usd, allowed_risk_usd, "Nieprawidłowy dystans SL"
+
+        if tick_size > 0:
+            loss_per_lot = (sl_distance / tick_size) * tick_value
+        else:
+            loss_per_lot = (sl_distance / point) * tick_value
+
+        if loss_per_lot <= 0:
+            return 0.0, total_locked_usd, allowed_risk_usd, "Błąd kalkulacji straty na lot"
+
+        calc_lot = allowed_risk_usd / loss_per_lot
+
+        # Round to broker lot step
+        vol_min = sym_info.volume_min
+        vol_max = sym_info.volume_max
+        vol_step = sym_info.volume_step if sym_info.volume_step > 0 else 0.01
+
+        calc_lot = round(calc_lot / vol_step) * vol_step
+        calc_lot = max(vol_min, min(vol_max, calc_lot))
+        calc_lot = round(calc_lot, 2)
+
+        return calc_lot, round(total_locked_usd, 2), round(allowed_risk_usd, 2), "OK"
+
+    def sync_cluster_stop_loss(
+        self,
+        symbol: str,
+        new_sl: float,
+        cluster_tickets: Optional[List[int]] = None,
+    ) -> List[Tuple[int, bool, str]]:
+        """
+        Synchronizes Stop Loss across all open positions in a pyramid cluster:
+        - Checks stops_level to avoid rejection near market price.
+        - Moves SL only if new_sl strictly improves the trade's protection.
+        """
+        results = []
+        if not self.ensure_connection():
+            return [(0, False, "Brak połączenia z MT5")]
+
+        clean_sym = clean_symbol(symbol)
+        open_positions = self.get_open_positions()
+        sym_positions = [
+            p for p in open_positions
+            if clean_symbol(p["symbol"]) == clean_sym
+        ]
+
+        if cluster_tickets:
+            sym_positions = [p for p in sym_positions if p["ticket"] in cluster_tickets]
+
+        if not sym_positions:
+            return [(0, True, "Brak pozycji do synchronizacji")]
+
+        for p in sym_positions:
+            ticket = p["ticket"]
+            sym_info = mt5.symbol_info(p["symbol"])
+            if not sym_info:
+                results.append((ticket, False, f"Brak danych symbolu {p['symbol']}"))
+                continue
+
+            is_buy = p["type"] == "BUY"
+            curr_sl = p["sl"]
+            curr_price = p["price_current"]
+            target_sl = round(new_sl, sym_info.digits)
+
+            # Check if target_sl improves protection
+            should_update = (target_sl > curr_sl) if is_buy else (target_sl < curr_sl or curr_sl <= 0)
+            if not should_update:
+                results.append((ticket, True, "SL jest już na lepszym poziomie"))
+                continue
+
+            # Verify stops_level minimum distance from current market price (Review finding 5)
+            stops_level = getattr(sym_info, "trade_stops_level", 0) or getattr(sym_info, "stops_level", 0) or 5
+            min_dist = (stops_level + 2) * sym_info.point
+            if is_buy and (curr_price - target_sl) < min_dist:
+                results.append((ticket, False, f"Zbyt blisko ceny rynkowej (min. {stops_level} pkt)"))
+                continue
+            elif not is_buy and (target_sl - curr_price) < min_dist:
+                results.append((ticket, False, f"Zbyt blisko ceny rynkowej (min. {stops_level} pkt)"))
+                continue
+
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "symbol": p["symbol"],
+                "sl": target_sl,
+                "tp": p["tp"],
+            }
+            res = mt5.order_send(request)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info(f"🔒 [CLUSTER SYNC] Pozycja #{ticket} ({p['symbol']}) SL zsynchronizowany na {target_sl}")
+                results.append((ticket, True, f"SL przestawiony na {target_sl}"))
+            else:
+                err_msg = res.comment if res else str(mt5.last_error())
+                logger.warning(f"Błąd synchronizacji SL #{ticket}: {err_msg}")
+                results.append((ticket, False, err_msg))
+
+        return results
 
     def trail_sl_to_profit(self, ticket: int, profit_r: float = 0.5) -> Tuple[bool, str]:
         """

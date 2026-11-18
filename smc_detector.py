@@ -125,7 +125,12 @@ class TradeSetup:
     swing_pattern: str = ""
     is_pyramid: bool = False
     parent_ticket: Optional[int] = None
+    pyramid_level: int = 1
     pyramid_profit_r: float = 0.0
+    cluster_tickets: List[int] = field(default_factory=list)
+    master_tp: float = 0.0
+    cluster_locked_profit_usd: float = 0.0
+    cluster_locked_profit_r: float = 0.0
     spread_used: float = 0.0
     sl_mode: str = "STRUCTURE"
     swept_levels: List[Dict] = field(default_factory=list)

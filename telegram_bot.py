@@ -30,6 +30,7 @@ from config import (
     PYRAMID_LOCK_PREVIOUS_PROFIT,
     TELEGRAM_ALERT_CHANNEL,
     TELEGRAM_BOT_TOKEN,
+    clean_symbol,
 )
 from mt5_client import MT5Client
 from news_filter import NewsFilter
@@ -71,13 +72,13 @@ class TelegramBotManager:
 
     def mute_symbol(self, symbol: str, direction: str, hours: float = DISMISS_MUTE_HOURS):
         """Mutes alerts for this symbol & direction for a specified duration after dismissal."""
-        key = (symbol.upper().replace(".PRO", "").replace(".RAW", ""), direction.upper())
+        key = (clean_symbol(symbol), direction.upper())
         self.muted_symbols[key] = time.time() + (hours * 3600)
         logger.info(f"Muted {key[0]} {key[1]} alerts for {hours:.1f} hours.")
 
     def is_symbol_muted(self, symbol: str, direction: str) -> bool:
         """Checks if alerts for this symbol & direction are currently muted."""
-        key = (symbol.upper().replace(".PRO", "").replace(".RAW", ""), direction.upper())
+        key = (clean_symbol(symbol), direction.upper())
         exp = self.muted_symbols.get(key)
         if exp:
             if time.time() < exp:
@@ -191,14 +192,33 @@ class TelegramBotManager:
         total_pnl = 0.0
 
         if positions:
-            pos_text = "\n\n📈 **Otwarte pozycje:**\n"
+            pos_text = "\n\n📈 **Otwarte pozycje i klastry:**\n"
+            from collections import defaultdict
+            by_sym = defaultdict(list)
             for p in positions:
-                total_pnl += p["profit"]
-                emoji = "🟢" if p["profit"] >= 0 else "🔴"
-                pos_text += (
-                    f"• {p['symbol']} [{p['type']}] #{p['ticket']}: "
-                    f"Lot {p['volume']} @ {p['price_open']} | PnL: {emoji} `{p['profit']:.2f} {acc['currency']}`\n"
-                )
+                by_sym[clean_symbol(p["symbol"])].append(p)
+
+            for sym_clean, plist in by_sym.items():
+                if len(plist) > 1:
+                    cluster_pnl = sum(p["profit"] for p in plist)
+                    c_emoji = "🟢" if cluster_pnl >= 0 else "🔴"
+                    pos_text += f"\n🔥 **Klaster Piramidy {sym_clean}** (PnL klastra: {c_emoji} `{cluster_pnl:+.2f} {acc['currency']}`):\n"
+                    for idx, p in enumerate(plist):
+                        total_pnl += p["profit"]
+                        p_emoji = "🟢" if p["profit"] >= 0 else "🔴"
+                        tier_label = f"L{idx+1}"
+                        pos_text += (
+                            f"  └ [{tier_label}] #{p['ticket']} [{p['type']}] "
+                            f"Lot {p['volume']} @ {p['price_open']} | SL: {p['sl']} | PnL: {p_emoji} `{p['profit']:+.2f} {acc['currency']}`\n"
+                        )
+                else:
+                    p = plist[0]
+                    total_pnl += p["profit"]
+                    emoji = "🟢" if p["profit"] >= 0 else "🔴"
+                    pos_text += (
+                        f"• {p['symbol']} [{p['type']}] #{p['ticket']}: "
+                        f"Lot {p['volume']} @ {p['price_open']} | SL: {p['sl']} | PnL: {emoji} `{p['profit']:+.2f} {acc['currency']}`\n"
+                    )
         else:
             pos_text = "\n\n📈 **Brak otwartych pozycji.**"
 
@@ -294,7 +314,7 @@ class TelegramBotManager:
             else:
                 icon = "🛡️"
                 res_str = "0.0R (BE)"
-            pyr_tag = " 🔥[Pyr L2]" if t.get("is_pyramid") else ""
+            pyr_tag = f" 🔥[Pyr L{t.get('pyramid_level', 2)}]" if t.get("is_pyramid") else ""
             recent_lines += (
                 f"• #{t['id']} {t['symbol']} [{t['direction']}]{pyr_tag}: "
                 f"{icon} `{res_str}` | Max R: `{t['max_r']:.2f}R` | Confluence: `{t['confluence_score']}%`\n"
@@ -577,11 +597,28 @@ class TelegramBotManager:
         if hasattr(setup, "_risk_multiplier") and setup._risk_multiplier < 1.0 and setup._risk_multiplier > 0:
             risk_pct = risk_pct * setup._risk_multiplier
             logger.info(f"Edge filter reduced risk to {risk_pct:.2f}% for {setup.symbol}")
-        lot = self.mt5_client.calculate_lot_size(setup.symbol, risk_pct, setup.sl_price, setup.entry_price)
 
         is_pyr = 1 if getattr(setup, "is_pyramid", False) else 0
         parent_t = getattr(setup, "parent_ticket", None)
-        strat_label = f"PYRAMID_{setup.strategy_name}" if is_pyr else setup.setup_type
+        pyr_level = getattr(setup, "pyramid_level", 2) if is_pyr else 1
+
+        # Strict Risk-Neutral volume sizing for pyramiding
+        if is_pyr and hasattr(setup, "_pyramid_lot") and setup._pyramid_lot > 0:
+            lot = setup._pyramid_lot
+        elif is_pyr:
+            pyr_status = self.mt5_client.get_pyramid_cluster_status(setup.symbol)
+            calc_lot, _, _, _ = self.mt5_client.calculate_pyramid_position_size(
+                symbol=setup.symbol,
+                entry_price=setup.entry_price,
+                sl_price=setup.sl_price,
+                setup_grade=getattr(setup, "grade", "A"),
+                cluster_status=pyr_status,
+            )
+            lot = calc_lot if calc_lot > 0 else self.mt5_client.calculate_lot_size(setup.symbol, risk_pct, setup.sl_price, setup.entry_price)
+        else:
+            lot = self.mt5_client.calculate_lot_size(setup.symbol, risk_pct, setup.sl_price, setup.entry_price)
+
+        strat_label = f"PYRAMID_L{pyr_level}_{setup.strategy_name}" if is_pyr else setup.setup_type
 
         raw_strat = getattr(setup, "strategy_name", "SMC")
         strat_upper = str(raw_strat).upper()
@@ -603,21 +640,25 @@ class TelegramBotManager:
                 grade_val = "A+" if setup.confluence_score >= 85 else ("A" if setup.confluence_score >= 70 else "B")
 
         if action == "market":
+            comment_str = f"{strat_prefix} {'Pyr L' + str(pyr_level) + ' ' if is_pyr else ''}{setup.setup_type[:10]}"[:31]
             success, msg, ticket, fill_price = self.mt5_client.execute_market_order(
                 symbol=setup.symbol,
                 direction=setup.direction,
                 volume=lot,
                 sl=setup.sl_price,
                 tp=setup.tp1_price,
-                comment=f"{strat_prefix} {'Pyr L2 ' if is_pyr else ''}{setup.setup_type[:10]}"[:31],
+                comment=comment_str,
             )
             if success:
                 actual_entry = fill_price if fill_price > 0 else setup.entry_price
                 trail_msg = ""
-                if is_pyr and parent_t and PYRAMID_LOCK_PREVIOUS_PROFIT:
-                    trail_ok, t_msg = self.mt5_client.trail_sl_to_profit(parent_t, profit_r=0.5)
-                    if trail_ok:
-                        trail_msg = f"\n🔒 **Zabezpieczono zysk bazowy (+0.5R):** {t_msg}"
+                if is_pyr and PYRAMID_LOCK_PREVIOUS_PROFIT:
+                    sync_results = self.mt5_client.sync_cluster_stop_loss(
+                        symbol=setup.symbol,
+                        new_sl=setup.sl_price,
+                    )
+                    synced_count = sum(1 for _, ok, _ in sync_results if ok)
+                    trail_msg = f"\n🔒 **Zsynchronizowano Stop Loss klastra:** {synced_count} pozycji przestawionych na `{setup.sl_price}`"
 
                 self.journal.add_trade(
                     symbol=setup.symbol,
@@ -630,9 +671,10 @@ class TelegramBotManager:
                     confluence_score=setup.confluence_score,
                     status="OPEN",
                     mt5_ticket=ticket,
-                    comment=f"{'Piramida L2' if is_pyr else 'Market order'} via Telegram | {setup.setup_type}",
+                    comment=f"{'Piramida L' + str(pyr_level) if is_pyr else 'Market order'} via Telegram | {setup.setup_type}",
                     parent_ticket=parent_t,
                     is_pyramid=is_pyr,
+                    pyramid_level=pyr_level,
                     strategy=strat_name_db,
                     setup_type=setup.setup_type,
                     grade=grade_val,
@@ -670,6 +712,7 @@ class TelegramBotManager:
                 )
 
         elif action == "limit":
+            comment_str = f"{strat_prefix} Limit {'Pyr L' + str(pyr_level) + ' ' if is_pyr else ''}{setup.setup_type[:10]}"[:31]
             success, msg, ticket, _ = self.mt5_client.execute_limit_order(
                 symbol=setup.symbol,
                 direction=setup.direction,
@@ -677,9 +720,10 @@ class TelegramBotManager:
                 volume=lot,
                 sl=setup.sl_price,
                 tp=setup.tp1_price,
-                comment=f"{strat_prefix} Limit {'Pyr ' if is_pyr else ''}{setup.setup_type[:10]}"[:31],
+                comment=comment_str,
             )
             if success:
+                # Audit fix: Pending limit orders start as PENDING in journal!
                 self.journal.add_trade(
                     symbol=setup.symbol,
                     direction=setup.direction,
@@ -689,11 +733,12 @@ class TelegramBotManager:
                     realized_r=0.0,
                     max_r=0.0,
                     confluence_score=setup.confluence_score,
-                    status="OPEN",
+                    status="PENDING",
                     mt5_ticket=ticket,
-                    comment=f"{'Piramida L2 Limit' if is_pyr else 'Limit order'} via Telegram | {setup.setup_type}",
+                    comment=f"{'Piramida L' + str(pyr_level) + ' Limit' if is_pyr else 'Limit order'} via Telegram | {setup.setup_type}",
                     parent_ticket=parent_t,
                     is_pyramid=is_pyr,
+                    pyramid_level=pyr_level,
                     strategy=strat_name_db,
                     setup_type=setup.setup_type,
                     grade=grade_val,
@@ -787,12 +832,18 @@ class TelegramBotManager:
         # Strategy title & Pyramiding Scale-In Info
         is_pyr = getattr(setup, "is_pyramid", False)
         strat_name = getattr(setup, "strategy_name", "SMC")
+        pyr_level = getattr(setup, "pyramid_level", 2) if is_pyr else 1
         pyramid_banner = ""
         if is_pyr:
-            header_title = f"🔥 **DOKŁADKA DO POZYCJI (PIRAMIDA L2): {setup.symbol}**"
+            header_title = f"🔥 **DOKŁADKA DO POZYCJI (PIRAMIDA L{pyr_level}): {setup.symbol}**"
+            locked_usd = getattr(setup, "cluster_locked_profit_usd", 0.0)
+            pyr_lot_info = f" | Obliczony wolumen: `{setup._pyramid_lot:.2f} lot`" if hasattr(setup, "_pyramid_lot") else ""
             pyramid_banner = (
-                f"🛡️ **Pozycja bazowa #{setup.parent_ticket}** jest zabezpieczona na BE (`+{setup.pyramid_profit_r:.1f}R`)!\n"
-                f"⚖️ **Ryzyko netto portfela:** `ZEROWE` (Risk-Neutral Compounding)\n\n"
+                f"🛡️ **Klaster Piramidy Poziom L{pyr_level}** (Baza: #{setup.parent_ticket})\n"
+                f"🔒 **Zablokowany zysk klastra:** `+{setup.pyramid_profit_r:.1f}R` (`+${locked_usd:.2f}`){pyr_lot_info}\n"
+                f"📍 **Nowy zsynchronizowany SL:** `{setup.sl_price:.{digits}f}` (Dla wszystkich pozycji)\n"
+                f"🎯 **Master TP:** `{setup.tp1_price:.{digits}f}` (Wspólny cel klastra)\n"
+                f"⚖️ **Ryzyko netto portfela:** `ZEROWE` (Strict Risk-Neutral Scale-In)\n\n"
             )
         elif strat_name == "GOLDEN_COMBO":
             header_title = f"🔥 **ZŁOTY SETUP (SMC + ZUMIKO): {setup.symbol}**"
@@ -863,14 +914,14 @@ class TelegramBotManager:
         )
 
         btn_market_text = (
-            f"🟢 Dołóż do pozycji ({risk_pct}% ryzyka)"
+            f"🔥 Wejdź MARKET (Dokładka L{pyr_level})"
             if is_pyr
             else f"🟢 Wejdź Market ({risk_pct}% ryzyka)"
         )
         btn_limit_text = (
-            f"🟡 Dołóż Limit na {setup.entry_price}"
+            f"⏳ Zlecenie LIMIT (Dokładka L{pyr_level})"
             if is_pyr
-            else f"🟡 Złóż Limit na {setup.entry_price}"
+            else f"🟡 Złóż Limit na {setup.entry_price:.{digits}f}"
         )
         keyboard = [
             [

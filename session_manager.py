@@ -5,6 +5,24 @@ import pandas as pd
 from config import BROKER_UTC_OFFSET_HOURS
 
 
+def get_broker_utc_offset() -> int:
+    """
+    Detects broker server timezone offset from UTC dynamically using MT5 tick time,
+    or falls back to BROKER_UTC_OFFSET_HOURS from config (Audit finding 5).
+    """
+    try:
+        import MetaTrader5 as mt5
+        tick = mt5.symbol_info_tick("EURUSD") or mt5.symbol_info_tick("XAUUSD")
+        if tick and tick.time > 0:
+            now_utc = int(datetime.now(timezone.utc).timestamp())
+            diff_hours = round((tick.time - now_utc) / 3600.0)
+            if -12 <= diff_hours <= 14:
+                return int(diff_hours)
+    except Exception:
+        pass
+    return BROKER_UTC_OFFSET_HOURS
+
+
 class SessionManager:
     """
     Detects active Institutional Trading Sessions (Killzones)
@@ -16,11 +34,12 @@ class SessionManager:
         """
         Determines current session and killzone based on UTC time.
         """
+        offset_hours = get_broker_utc_offset()
         if dt is None:
             dt = datetime.now(timezone.utc)
         elif dt.tzinfo is None:
             # Adjust naive candle timestamp (broker server time) to UTC
-            dt = (dt - timedelta(hours=BROKER_UTC_OFFSET_HOURS)).replace(tzinfo=timezone.utc)
+            dt = (dt - timedelta(hours=offset_hours)).replace(tzinfo=timezone.utc)
 
         t = dt.time()
 
@@ -74,7 +93,8 @@ class SessionManager:
             return None, None
 
         # Convert broker server time to true UTC
-        df_copy["time_utc"] = pd.to_datetime(df_copy["time"]) - pd.Timedelta(hours=BROKER_UTC_OFFSET_HOURS)
+        offset_hours = get_broker_utc_offset()
+        df_copy["time_utc"] = pd.to_datetime(df_copy["time"]) - pd.Timedelta(hours=offset_hours)
         latest_date = df_copy["time_utc"].iloc[-1].date()
 
         # Filter candles belonging to today's Asian session

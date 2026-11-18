@@ -38,6 +38,26 @@ DEFAULT_SYMBOLS = [
 
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",") if s.strip()]
 
+
+def clean_symbol(symbol: str) -> str:
+    """
+    Normalizes a broker symbol to standard clean uppercase ticker:
+    e.g. 'EURUSD.pro' -> 'EURUSD', 'XAUUSD.raw' -> 'XAUUSD', 'EURUSDm' -> 'EURUSD'.
+    """
+    if not symbol:
+        return ""
+    clean = symbol.upper().strip()
+    for suffix in [".PRO", ".RAW", ".ECN", ".F", "_PRO", "_RAW", ".STP", ".C"]:
+        if clean.endswith(suffix):
+            clean = clean[:-len(suffix)]
+            break
+    # Single-char broker suffixes like EURUSDm or EURUSDp
+    if len(clean) == 7 and clean.endswith(("M", "P", "C", "I", "S", "F")):
+        clean = clean[:-1]
+    clean = clean.replace("/", "").replace("_", "").replace("-", "").replace(".", "")
+    return clean
+
+
 # Timeframe Settings
 # HTF (Higher Timeframe) for Trend & Major Market Structure
 HTF_TIMEFRAME = os.getenv("HTF_TIMEFRAME", "H4")  # H4 as primary HTF
@@ -128,12 +148,18 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 
 # ==========================================
-# RISK-NEUTRAL PYRAMIDING SETTINGS (SCALE-IN)
+# ADVANCED MULTI-LEVEL PYRAMIDING SETTINGS (SCALE-IN)
 # ==========================================
 ENABLE_PYRAMIDING = os.getenv("ENABLE_PYRAMIDING", "True").lower() in ("true", "1")
-MAX_PYRAMID_LEVEL = int(os.getenv("MAX_PYRAMID_LEVEL", "2"))               # Max 2 concurrent positions per symbol (Base + 1 scale-in)
-PYRAMID_MIN_PROFIT_R = float(os.getenv("PYRAMID_MIN_PROFIT_R", "1.0"))     # Base position must have reached at least +1.0R
+MAX_PYRAMID_LEVEL = int(os.getenv("MAX_PYRAMID_LEVEL", "3"))               # Max poziomy (np. 3: Baza + L2 + L3)
+PYRAMID_MIN_PROFIT_R = float(os.getenv("PYRAMID_MIN_PROFIT_R", "1.0"))     # Każda poprzednia pozycja musi osiągnąć min. +1.0R
+PYRAMID_MIN_RR_TO_TP = float(os.getenv("PYRAMID_MIN_RR_TO_TP", "1.5"))     # Minimalna przestrzeń do Master TP (min 1.5R)
+PYRAMID_AUTO_EXECUTE = os.getenv("PYRAMID_AUTO_EXECUTE", "False").lower() in ("true", "1") # Auto wejście vs przyciski TG
+PYRAMID_MAX_RISK_FINANCE_RATIO = float(os.getenv("PYRAMID_MAX_RISK_FINANCE_RATIO", "0.75")) # Max % zablokowanego zysku na ryzyko dokładki (75%)
 PYRAMID_LOCK_PREVIOUS_PROFIT = os.getenv("PYRAMID_LOCK_PREVIOUS_PROFIT", "True").lower() in ("true", "1") # Lock profit on parent trade
+PYRAMID_LEVEL_DECAY = {2: 0.50, 3: 0.25, 4: 0.125}                        # Mnożnik bazowego ryzyka dla dokładek
+PYRAMID_GRADE_WEIGHTS = {"A+": 1.0, "A": 0.75, "B": 0.50}                  # Wagi Grade dla dokładek
+
 
 # ==========================================
 # ADVANCED INSTITUTIONAL LIQUIDITY SWEEPS

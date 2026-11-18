@@ -4,7 +4,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 import httpx
 
-from config import NEWS_WINDOW_MINUTES
+from config import NEWS_WINDOW_MINUTES, clean_symbol
 
 logger = logging.getLogger("ForexSMC.NewsFilter")
 
@@ -26,14 +26,7 @@ class NewsFilter:
 
     def _extract_currencies(self, symbol: str) -> List[str]:
         """Extracts relevant currency codes from symbol (e.g. EURUSD -> ['EUR', 'USD'], XAUUSD -> ['USD'])."""
-        clean = symbol.upper()
-        for suffix in [".PRO", ".RAW", ".ECN", ".F", "_PRO", "_RAW"]:
-            clean = clean.replace(suffix, "")
-        clean = clean.rstrip("._-+")
-        # If symbol has a single-character broker suffix like 'EURUSDp' or 'EURUSDm' or 'EURUSDf'
-        if len(clean) == 7 and clean.endswith(("P", "M", "C", "I", "S", "F")):
-            clean = clean[:-1]
-
+        clean = clean_symbol(symbol)
         if "XAU" in clean or "GOLD" in clean:
             return ["USD"]
         if len(clean) >= 6:

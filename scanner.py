@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from typing import Dict, List, Set, Tuple
+import MetaTrader5 as mt5
 
 from chart_generator import ChartGenerator
 from config import (
@@ -27,8 +28,10 @@ from config import (
     PROP_MAX_DRAWDOWN_PERCENT,
     PROP_MAX_OPEN_TRADES,
     PROP_SAFETY_BUFFER_PERCENT,
+    PYRAMID_AUTO_EXECUTE,
     PYRAMID_LOCK_PREVIOUS_PROFIT,
     PYRAMID_MIN_PROFIT_R,
+    PYRAMID_MIN_RR_TO_TP,
     SCAN_INTERVAL_SECONDS,
     TRADE_MONITOR_INTERVAL_SECONDS,
     SWING_LENGTH,
@@ -38,6 +41,7 @@ from config import (
     ZUMIKO_SLOW_EMA,
     ZUMIKO_SWING_LEN,
     ZUMIKO_TREND_EMA,
+    clean_symbol,
 )
 from mt5_client import MT5Client
 from news_filter import NewsFilter
@@ -144,6 +148,66 @@ class SMCScanner:
                     self._prop_warned = True
                 elif not metrics.get("is_safety_halt") and self._prop_warned:
                     self._prop_warned = False  # Reset once equity recovers
+
+        # 1.5. Pending Orders Fill Monitor (Audit finding 2 & Review finding 4)
+        try:
+            pending_trades = self.journal.get_pending_trades()
+        except Exception as e:
+            logger.error(f"Failed to query pending trades from journal: {e}")
+            pending_trades = []
+
+        for pt in pending_trades:
+            ticket = pt.get("mt5_ticket")
+            if not ticket:
+                continue
+
+            # Check if ticket now exists in open positions (order filled!)
+            pos = mt5.positions_get(ticket=ticket)
+            if pos and len(pos) > 0:
+                p_item = pos[0]
+                fill_price = getattr(p_item, "price_open", None)
+                if fill_price is None and isinstance(p_item, dict):
+                    fill_price = p_item.get("price_open", pt.get("entry_price", 0.0))
+                fill_price = float(fill_price or pt.get("entry_price", 0.0))
+                self.journal.mark_trade_as_open(ticket, fill_price, comment="Zlecenie limit zrealizowane w MT5")
+                logger.info(f"✅ Pending order #{ticket} ({pt['symbol']}) filled at {fill_price}!")
+
+                # If this was a pyramid scale-in, synchronize cluster SL!
+                sync_msg = ""
+                if pt.get("is_pyramid") or pt.get("parent_ticket"):
+                    sync_results = self.mt5_client.sync_cluster_stop_loss(
+                        symbol=pt["symbol"],
+                        new_sl=pt["sl_price"],
+                    )
+                    synced_count = sum(1 for _, ok, _ in sync_results if ok)
+                    sync_msg = f"\n🔒 **Stop Loss klastra zsynchronizowany** ({synced_count} pozycji przestawionych na `{pt['sl_price']}`)."
+
+                if self.telegram:
+                    pyr_badge = f" [PIRAMIDA L{pt.get('pyramid_level', 2)}]" if pt.get("is_pyramid") else ""
+                    alert_msg = (
+                        f"⚡ **ZLECENIE LIMIT ZREALIZOWANE!{pyr_badge}**\n\n"
+                        f"🎯 Pozycja: `{pt['symbol']}` [{pt['direction']}] `#{ticket}`\n"
+                        f"📍 Cena wejścia: `{fill_price}` | SL: `{pt['sl_price']}` | TP: `{pt['tp_price']}`"
+                        f"{sync_msg}"
+                    )
+                    await self.telegram.send_message(alert_msg)
+                continue
+
+            # Check if pending order was cancelled in MT5
+            closed_info = self.mt5_client.get_closed_deal_info(ticket)
+            if closed_info and closed_info.get("status") == "CANCELLED":
+                self.journal.cancel_trade_by_ticket(
+                    ticket,
+                    comment=closed_info.get("comment", "Zlecenie oczekujące anulowane w MT5"),
+                )
+                logger.info(f"Pending order #{ticket} ({pt['symbol']}) marked as CANCELLED.")
+                if self.telegram:
+                    await self.telegram.send_message(
+                        f"ℹ️ **ZLECENIE ANULOWANE: {pt['symbol']} [{pt['direction']}]**\n\n"
+                        f"🎫 **Ticket:** `#{ticket}`\n"
+                        f"Status: Zlecenie oczekujące wygasło lub zostało anulowane w MT5."
+                    )
+                continue
 
         # 2. Closed Trades Monitor
         try:
@@ -380,10 +444,11 @@ class SMCScanner:
                 )
 
             try:
-                # Fetch multi-timeframe candles using configured LTF, HTF, Daily, and Weekly
-                df_ltf = self.mt5_client.fetch_ohlcv(sym, LTF_TIMEFRAME, LOOKBACK_BARS)
-                df_h1 = self.mt5_client.fetch_ohlcv(sym, "H1", LOOKBACK_BARS)
-                df_htf = self.mt5_client.fetch_ohlcv(sym, HTF_TIMEFRAME, LOOKBACK_BARS)
+                # Fetch multi-timeframe candles with at least 300 bars for Zumiko EMA 238 (Audit finding 1)
+                scan_bars = max(LOOKBACK_BARS, 300)
+                df_ltf = self.mt5_client.fetch_ohlcv(sym, LTF_TIMEFRAME, scan_bars)
+                df_h1 = self.mt5_client.fetch_ohlcv(sym, "H1", scan_bars)
+                df_htf = self.mt5_client.fetch_ohlcv(sym, HTF_TIMEFRAME, scan_bars)
                 df_d1 = self.mt5_client.fetch_ohlcv(sym, "D1", 10)
                 df_w1 = self.mt5_client.fetch_ohlcv(sym, "W1", 5)
 
@@ -445,14 +510,46 @@ class SMCScanner:
 
                 # Process final alerts
                 for setup in final_setups:
-                    # If this is a pyramiding scan, filter out counter-trend setups
+                    # If this is a pyramiding scan, filter out counter-trend setups & check distance to Master TP
                     if is_pyramid:
                         if setup.direction != pyramid_status.get("direction"):
                             continue  # Never pyramid against active position
+
+                        master_tp = pyramid_status.get("master_tp", 0.0)
+                        if master_tp > 0:
+                            sl_dist = abs(setup.entry_price - setup.sl_price)
+                            tp_dist = abs(master_tp - setup.entry_price)
+                            rr_to_master = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
+                            if rr_to_master < PYRAMID_MIN_RR_TO_TP:
+                                logger.info(
+                                    f"⏭️ [PYRAMID SKIP] {sym}: Zbyt blisko Master TP "
+                                    f"(R:R do celu: {rr_to_master:.2f}R < wymagane {PYRAMID_MIN_RR_TO_TP}R)."
+                                )
+                                continue
+                            setup.master_tp = master_tp
+                            setup.tp1_price = master_tp
+
                         setup.is_pyramid = True
                         setup.parent_ticket = pyramid_status.get("base_ticket")
+                        setup.pyramid_level = pyramid_status.get("next_level", 2)
                         setup.pyramid_profit_r = pyramid_status.get("profit_r", 0.0)
-                        setup.setup_type = f"[DOKŁADKA TRENDOWA L{pyramid_status.get('count', 1) + 1}] {setup.setup_type}"
+                        setup.cluster_tickets = pyramid_status.get("cluster_tickets", [])
+                        setup.cluster_locked_profit_usd = pyramid_status.get("profit_usd", 0.0)
+                        setup.setup_type = f"[DOKŁADKA TRENDOWA L{setup.pyramid_level}] {setup.setup_type}"
+
+                        # Strict Risk-Neutral volume verification
+                        pyr_lot, locked_usd, allowed_risk, pyr_reason = self.mt5_client.calculate_pyramid_position_size(
+                            symbol=setup.symbol,
+                            entry_price=setup.entry_price,
+                            sl_price=setup.sl_price,
+                            setup_grade=getattr(setup, "grade", "A"),
+                            cluster_status=pyramid_status,
+                        )
+                        if pyr_lot <= 0:
+                            logger.info(f"⏭️ [PYRAMID SKIP] {sym}: Kwalifikacja wolumenu odrzucona: {pyr_reason}")
+                            continue
+                        setup._pyramid_lot = pyr_lot
+                        setup.cluster_locked_profit_usd = locked_usd
 
                     # Anti-Spam Check 1: User Dismissed / Muted Check
                     if self.telegram and self.telegram.is_symbol_muted(setup.symbol, setup.direction):
@@ -466,7 +563,7 @@ class SMCScanner:
                         continue  # Already notified for this M15 candle
 
                     # Anti-Spam Check 3: Time Cooldown per Symbol & Direction
-                    sym_dir_key = (setup.symbol.upper().replace(".PRO", "").replace(".RAW", ""), setup.direction.upper())
+                    sym_dir_key = (clean_symbol(setup.symbol), setup.direction.upper())
                     last_alert_t = self._last_alert_by_symbol.get(sym_dir_key, 0.0)
                     if (time.time() - last_alert_t) < (ALERT_COOLDOWN_MINUTES * 60):
                         logger.debug(f"⏳ [COOLDOWN] Pomijam alert dla {setup.symbol} {setup.direction} (aktywny cooldown {ALERT_COOLDOWN_MINUTES}m).")

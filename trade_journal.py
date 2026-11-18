@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ForexSMC.TradeJournal")
@@ -46,6 +47,7 @@ class TradeJournal:
     Tracks executed trades, confluence ratings, realized R, and Max R (MFE).
     Features automated self-healing, integrity verification, and crash recovery.
     """
+    _db_lock = threading.RLock()
 
     def __init__(self, db_path: str = "trades.db"):
         self.db_path = db_path
@@ -53,13 +55,14 @@ class TradeJournal:
 
     @contextmanager
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA busy_timeout = 30000;")
-            yield conn
-        finally:
-            conn.close()
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA busy_timeout = 30000;")
+                yield conn
+            finally:
+                conn.close()
 
     def _init_db(self):
         with self._get_connection() as conn:
@@ -84,6 +87,7 @@ class TradeJournal:
                     notion_page_id TEXT,
                     parent_ticket INTEGER,
                     is_pyramid INTEGER DEFAULT 0,
+                    pyramid_level INTEGER DEFAULT 1,
                     strategy TEXT DEFAULT 'SMC',
                     session_name TEXT DEFAULT '',
                     is_killzone INTEGER DEFAULT 0,
@@ -101,6 +105,7 @@ class TradeJournal:
                 ("notion_page_id", "TEXT"),
                 ("parent_ticket", "INTEGER"),
                 ("is_pyramid", "INTEGER DEFAULT 0"),
+                ("pyramid_level", "INTEGER DEFAULT 1"),
                 ("strategy", "TEXT DEFAULT 'SMC'"),
                 ("session_name", "TEXT DEFAULT ''"),
                 ("is_killzone", "INTEGER DEFAULT 0"),
@@ -295,6 +300,7 @@ class TradeJournal:
         comment: str = "",
         parent_ticket: Optional[int] = None,
         is_pyramid: int = 0,
+        pyramid_level: int = 1,
         strategy: str = "SMC",
         session_name: str = "",
         is_killzone: int = 0,
@@ -318,13 +324,13 @@ class TradeJournal:
                 INSERT INTO trades (
                     timestamp, symbol, direction, entry_price, sl_price, tp_price,
                     realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
-                    parent_ticket, is_pyramid,
+                    parent_ticket, is_pyramid, pyramid_level,
                     strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, symbol.upper(), direction.upper(), entry_price, sl_price, tp_price,
                 realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
-                parent_ticket, is_pyramid,
+                parent_ticket, is_pyramid, pyramid_level,
                 strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade
             ))
             conn.commit()
@@ -361,6 +367,54 @@ class TradeJournal:
             return [dict(row) for row in cur.fetchall()]
 
     @_auto_recover_on_corruption
+    def get_pending_trades(self) -> List[Dict]:
+        """Returns all limit / stop orders currently tracked as PENDING in the journal."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM trades WHERE status = 'PENDING' ORDER BY id ASC")
+            return [dict(row) for row in cur.fetchall()]
+
+    @_auto_recover_on_corruption
+    def mark_trade_as_open(self, mt5_ticket: int, fill_price: float, comment: str = "") -> bool:
+        """Transitions a PENDING order to OPEN upon execution/filling in MT5."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            if comment:
+                cur.execute("""
+                    UPDATE trades
+                    SET status = 'OPEN', entry_price = ?, comment = ?
+                    WHERE mt5_ticket = ? AND status = 'PENDING'
+                """, (fill_price, comment, mt5_ticket))
+            else:
+                cur.execute("""
+                    UPDATE trades
+                    SET status = 'OPEN', entry_price = ?
+                    WHERE mt5_ticket = ? AND status = 'PENDING'
+                """, (fill_price, mt5_ticket))
+            conn.commit()
+            return cur.rowcount > 0
+
+    @_auto_recover_on_corruption
+    def get_pyramid_cluster_trades(self, symbol: str, parent_ticket: Optional[int] = None) -> List[Dict]:
+        """Retrieves all trades (open and closed) associated with a pyramid cluster."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            clean = symbol.upper().replace(".PRO", "").replace(".RAW", "")
+            if parent_ticket:
+                cur.execute("""
+                    SELECT * FROM trades
+                    WHERE (mt5_ticket = ? OR parent_ticket = ?) AND symbol LIKE ?
+                    ORDER BY id ASC
+                """, (parent_ticket, parent_ticket, f"%{clean}%"))
+            else:
+                cur.execute("""
+                    SELECT * FROM trades
+                    WHERE (is_pyramid > 0 OR parent_ticket IS NOT NULL) AND symbol LIKE ?
+                    ORDER BY id ASC
+                """, (f"%{clean}%",))
+            return [dict(row) for row in cur.fetchall()]
+
+    @_auto_recover_on_corruption
     def set_notion_page_id_by_ticket(self, ticket: int, page_id: str):
         """Associates an MT5 ticket with its synced Notion Page ID."""
         with self._get_connection() as conn:
@@ -385,33 +439,33 @@ class TradeJournal:
         status: str = "CLOSED",
         comment: str = "",
     ) -> bool:
-        """Closes an open trade record in trades.db by its MT5 ticket number."""
+        """Closes an open or pending trade record in trades.db by its MT5 ticket number."""
         with self._get_connection() as conn:
             cur = conn.cursor()
             if max_r is not None:
                 cur.execute("""
                     UPDATE trades
                     SET realized_r = ?, max_r = ?, status = ?, comment = ?
-                    WHERE mt5_ticket = ? AND status = 'OPEN'
+                    WHERE mt5_ticket = ? AND status IN ('OPEN', 'PENDING')
                 """, (realized_r, max_r, status, comment, mt5_ticket))
             else:
                 cur.execute("""
                     UPDATE trades
                     SET realized_r = ?, status = ?, comment = ?
-                    WHERE mt5_ticket = ? AND status = 'OPEN'
+                    WHERE mt5_ticket = ? AND status IN ('OPEN', 'PENDING')
                 """, (realized_r, status, comment, mt5_ticket))
             conn.commit()
             return cur.rowcount > 0
 
     @_auto_recover_on_corruption
     def cancel_trade_by_ticket(self, mt5_ticket: int, comment: str = "Order cancelled in MT5") -> bool:
-        """Marks a pending trade record as CANCELLED in trades.db."""
+        """Marks a pending or open trade record as CANCELLED in trades.db."""
         with self._get_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE trades
                 SET status = 'CANCELLED', comment = ?
-                WHERE mt5_ticket = ? AND status = 'OPEN'
+                WHERE mt5_ticket = ? AND status IN ('OPEN', 'PENDING')
             """, (comment, mt5_ticket))
             conn.commit()
             return cur.rowcount > 0

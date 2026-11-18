@@ -39,9 +39,19 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
     for t, p in open_tickets_mt5.items():
         print(f"  • #{t} {p['symbol']} [{p['type']}] | Open: {p['price_open']} | SL: {p['sl']} | TP: {p['tp']} | Zysk: {p['profit']:+.2f} USD")
 
-    # 3. Get Closed Deals from MT5 (last 7 days + 1 day buffer for broker time)
+    # 3. Get Closed Deals from MT5 (Audit finding 4: dynamically check earliest open trade in DB)
     now = datetime.now()
-    from_date = now - timedelta(days=7)
+    db_trades = journal.get_all_trades()
+    open_db_trades = [t for t in db_trades if t.get("status") in ("OPEN", "PENDING")]
+    earliest_open_dt = None
+    if open_db_trades:
+        try:
+            parsed_dates = [datetime.strptime(t["timestamp"], "%Y-%m-%d %H:%M:%S") for t in open_db_trades if t.get("timestamp")]
+            if parsed_dates:
+                earliest_open_dt = min(parsed_dates) - timedelta(days=2)
+        except Exception:
+            pass
+    from_date = min(earliest_open_dt, now - timedelta(days=7)) if earliest_open_dt else (now - timedelta(days=14))
     to_date = now + timedelta(days=1)
     deals = mt5.history_deals_get(from_date, to_date)
     closed_deals_mt5: Dict[int, Dict[str, Any]] = {}
@@ -59,13 +69,13 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                     "comment": d.comment,
                     "time_close": d.time,
                 }
-    print(f"\n[2/4] Zamknięte pozycje w historii MT5 (ostatnie 7 dni): {len(closed_deals_mt5)}")
+    days_span = (to_date - from_date).days
+    print(f"\n[2/4] Zamknięte pozycje w historii MT5 (ostatnie {days_span} dni): {len(closed_deals_mt5)}")
     for pos_id, d in closed_deals_mt5.items():
         print(f"  • #{pos_id} {d['symbol']} | Zysk: {d['profit']:+.2f} USD | Zamknięcie: {d['comment']} | Reason: {d['reason']}")
 
     # 4. Reconcile with trades.db
     print(f"\n[3/4] Weryfikacja i synchronizacja bazy SQLite (trades.db)...")
-    db_trades = journal.get_all_trades()
     db_by_ticket = {t.get("mt5_ticket"): t for t in db_trades if t.get("mt5_ticket")}
 
     # A) Check open trades in DB that are actually closed in MT5
