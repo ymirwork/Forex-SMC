@@ -43,6 +43,7 @@ Forex-SMC/
 ├── requirements.txt           # Zależności i biblioteki Python
 ├── setup.bat                  # Instalator 1-kliknięciem dla nowego komputera
 ├── start.bat                  # Skrót do uruchamiania bota jednym kliknięciem
+├── update.bat                 # Pobieranie najnowszych aktualizacji z GitHuba jednym kliknięciem
 ├── config.py                  # Główny moduł konfiguracyjny
 ├── mt5_client.py              # Klient MetaTrader 5 (dane, kalkulacja lota, egzekucja zleceń)
 ├── smc_detector.py            # Silnik SMC + Confluence Weights + Dynamic Best RR
@@ -107,6 +108,11 @@ TELEGRAM_CHAT_ID=-100xxxxxxxxxx,123456789
      ```powershell
      .venv\Scripts\python.exe run.py
      ```
+
+### Krok 5: Aktualizacja do najnowszej wersji (w dowolnym momencie)
+Gdy na GitHubie pojawią się nowe funkcje lub poprawki:
+* Kliknij dwukrotnie **`update.bat`**
+* Skrypt automatycznie pobierze najnowszy kod (`git pull`), zaktualizuje biblioteki w `.venv` oraz zabezpieczy Twoją konfigurację `.env`.
 
 ---
 
