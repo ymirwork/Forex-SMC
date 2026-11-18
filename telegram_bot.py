@@ -974,6 +974,10 @@ class TelegramBotManager:
                             safe_caption += "`"
                         if safe_caption.count("**") % 2 != 0:
                             safe_caption += "**"
+                        if safe_caption.count("*") % 2 != 0:
+                            safe_caption += "*"
+                        if safe_caption.count("_") % 2 != 0:
+                            safe_caption += "_"
                         try:
                             msg = await self.app.bot.send_photo(
                                 chat_id=target_chat,

@@ -4,6 +4,7 @@ import os
 import time
 from typing import Dict, List, Optional, Set, Tuple
 import MetaTrader5 as mt5
+import pandas as pd
 
 from chart_generator import ChartGenerator
 from config import (
@@ -133,7 +134,7 @@ class SMCScanner:
         timeframe: str,
         n_bars: int,
         max_age_seconds: float = 1800.0,
-    ) -> Optional[object]:
+    ) -> Optional[pd.DataFrame]:
         """Caches slower HTF candles (D1, W1) to eliminate redundant MT5 IPC queries."""
         key = (symbol.upper(), timeframe.upper())
         now = time.time()

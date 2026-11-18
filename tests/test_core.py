@@ -429,5 +429,130 @@ class TestTelegramCallbacksAndOrderExecution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs.get("mt5_ticket"), 777001)
 
 
+class TestScannerCandleCaching(unittest.TestCase):
+    def test_fetch_cached_ohlcv_reuses_cache_within_ttl(self):
+        from scanner import SMCScanner
+        mt5_mock = MagicMock()
+        dummy_df = pd.DataFrame({"close": [1.0800, 1.0850]})
+        mt5_mock.fetch_ohlcv.return_value = dummy_df
+
+        scanner = SMCScanner(mt5_client=mt5_mock)
+        df1 = scanner._fetch_cached_ohlcv("EURUSD", "D1", 10, max_age_seconds=1800.0)
+        df2 = scanner._fetch_cached_ohlcv("EURUSD", "D1", 10, max_age_seconds=1800.0)
+
+        self.assertIs(df1, df2)
+        mt5_mock.fetch_ohlcv.assert_called_once_with("EURUSD", "D1", 10)
+
+    def test_fetch_cached_ohlcv_refetches_after_ttl(self):
+        import time
+        from scanner import SMCScanner
+        mt5_mock = MagicMock()
+        dummy_df1 = pd.DataFrame({"close": [1.0800]})
+        dummy_df2 = pd.DataFrame({"close": [1.0850]})
+        mt5_mock.fetch_ohlcv.side_effect = [dummy_df1, dummy_df2]
+
+        scanner = SMCScanner(mt5_client=mt5_mock)
+        df1 = scanner._fetch_cached_ohlcv("EURUSD", "D1", 10, max_age_seconds=0.01)
+        time.sleep(0.02)
+        df2 = scanner._fetch_cached_ohlcv("EURUSD", "D1", 10, max_age_seconds=0.01)
+
+        self.assertEqual(mt5_mock.fetch_ohlcv.call_count, 2)
+        self.assertIsNot(df1, df2)
+
+
+class TestNotionTicketExactMatch(unittest.IsolatedAsyncioTestCase):
+    async def test_find_page_id_exact_token_matching(self):
+        from notion_journal import NotionJournal
+        journal = NotionJournal()
+        journal.api_key = "dummy"
+        journal.database_id = "dummy_db"
+        journal._db_properties = {"trade id": ("Name", "title")}
+
+        mock_response_substring = MagicMock()
+        mock_response_substring.status_code = 200
+        mock_response_substring.json.return_value = {
+            "results": [
+                {
+                    "id": "page_wrong",
+                    "properties": {
+                        "Name": {
+                            "type": "title",
+                            "title": [{"plain_text": "#105626168 EURUSD"}],
+                        }
+                    },
+                }
+            ]
+        }
+
+        with patch("httpx.AsyncClient.post", new_callable=unittest.mock.AsyncMock) as mock_post:
+            mock_post.return_value = mock_response_substring
+            res = await journal._find_page_id_by_ticket(105)
+            self.assertIsNone(res)
+
+        mock_response_exact = MagicMock()
+        mock_response_exact.status_code = 200
+        mock_response_exact.json.return_value = {
+            "results": [
+                {
+                    "id": "page_correct",
+                    "properties": {
+                        "Name": {
+                            "type": "title",
+                            "title": [{"plain_text": "#105 EURUSD"}],
+                        }
+                    },
+                }
+            ]
+        }
+
+        with patch("httpx.AsyncClient.post", new_callable=unittest.mock.AsyncMock) as mock_post:
+            mock_post.return_value = mock_response_exact
+            res = await journal._find_page_id_by_ticket(105)
+            self.assertEqual(res, "page_correct")
+
+
+class TestSyncJournalDirectionFallback(unittest.IsolatedAsyncioTestCase):
+    @patch("sync_journal.mt5.history_deals_get")
+    @patch("sync_journal.mt5.history_orders_get")
+    @patch("sync_journal.mt5.positions_get", return_value=[])
+    async def test_direction_falls_back_to_comment_when_entry_deal_missing(
+        self, mock_pos, mock_orders, mock_deals
+    ):
+        from sync_journal import sync_all
+        from trade_journal import TradeJournal
+
+        mt5_mock = MagicMock()
+        mt5_mock.connect.return_value = True
+        mt5_mock.get_open_positions.return_value = []
+        mt5_mock.get_position_mfe.return_value = 1.5
+
+        exit_deal = MagicMock()
+        exit_deal.entry = 1  # DEAL_ENTRY_OUT
+        exit_deal.position_id = 888123
+        exit_deal.ticket = 999123
+        exit_deal.symbol = "EURUSD.pro"
+        exit_deal.profit = 150.0
+        exit_deal.price = 1.0800
+        exit_deal.reason = 5
+        exit_deal.comment = "TP hit [SELL]"
+        exit_deal.time = 1700000000
+
+        mock_deals.side_effect = [
+            [exit_deal],  # for general history_deals_get(from_date, to_date)
+            [exit_deal],  # for history_deals_get(position=ticket)
+        ]
+        mock_orders.return_value = []
+
+        journal_mock = MagicMock(spec=TradeJournal)
+        journal_mock.get_all_trades.return_value = []
+
+        await sync_all(client=mt5_mock, journal=journal_mock)
+
+        journal_mock.add_trade.assert_called_once()
+        _, kwargs = journal_mock.add_trade.call_args
+        self.assertEqual(kwargs.get("symbol"), "EURUSD")  # clean_symbol was applied!
+        self.assertEqual(kwargs.get("direction"), "SELL")  # Fell back to comment!
+
+
 if __name__ == "__main__":
     unittest.main()

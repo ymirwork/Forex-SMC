@@ -435,12 +435,18 @@ class NotionJournal:
                             p_type = p_val.get("type")
                             if p_type == "title":
                                 title_texts = p_val.get("title", [])
-                                if any(ticket_str in t.get("plain_text", "") for t in title_texts):
-                                    return page.get("id")
+                                for t_obj in title_texts:
+                                    txt = t_obj.get("plain_text", "").strip()
+                                    words = txt.split()
+                                    if words and words[0] in (f"#{ticket_str}", ticket_str):
+                                        return page.get("id")
                             elif p_type == "rich_text":
                                 rich_texts = p_val.get("rich_text", [])
-                                if any(ticket_str in t.get("plain_text", "") for t in rich_texts):
-                                    return page.get("id")
+                                for r_obj in rich_texts:
+                                    txt = r_obj.get("plain_text", "").strip()
+                                    words = txt.split()
+                                    if words and words[0] in (f"#{ticket_str}", ticket_str):
+                                        return page.get("id")
                             elif p_type == "number" and p_val.get("number") == ticket:
                                 return page.get("id")
         except Exception as e:

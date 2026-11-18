@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import MetaTrader5 as mt5
 
-from config import ENABLE_NOTION
+from config import ENABLE_NOTION, clean_symbol
 from mt5_client import MT5Client
 from notion_journal import NotionJournal
 from trade_journal import TradeJournal
@@ -126,7 +126,7 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
     # B) Add missing MT5 open positions to trades.db
     for ticket, p in open_tickets_mt5.items():
         if ticket not in db_by_ticket:
-            raw_sym = p["symbol"].replace(".pro", "").replace(".raw", "").replace(".PRO", "").replace(".RAW", "")
+            raw_sym = clean_symbol(p["symbol"])
             cmt = str(p.get("comment") or "")
             if "zumiko" in cmt.lower() or "killmlm" in cmt.lower():
                 strat = "Zumiko KillMLM"
@@ -160,7 +160,7 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
     # C) Backfill missing closed deals into trades.db
     for ticket, d in closed_deals_mt5.items():
         if ticket not in db_by_ticket and ticket not in open_tickets_mt5:
-            raw_sym = d["symbol"].replace(".pro", "").replace(".raw", "").replace(".PRO", "").replace(".RAW", "")
+            raw_sym = clean_symbol(d["symbol"])
             profit = d["profit"]
             reason = d["reason"]
             if profit > 0:
@@ -185,21 +185,31 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 grade = "A"
 
             # Determine true direction and prices from opening deal in MT5 history
-            direction = "BUY"
+            direction = None
             entry_p = 0.0
             sl_p = 0.0
             tp_p = 0.0
+            time_open = 0
             open_deals = mt5.history_deals_get(position=ticket)
             if open_deals:
                 for od in open_deals:
                     if getattr(od, "entry", -1) == 0:  # DEAL_ENTRY_IN
                         direction = "BUY" if od.type == mt5.DEAL_TYPE_BUY else "SELL"
                         entry_p = float(od.price)
+                        time_open = int(getattr(od, "time", 0) or 0)
                         break
-            elif "BUY" in (d.get("comment") or "").upper():
-                direction = "BUY"
-            elif "SELL" in (d.get("comment") or "").upper():
-                direction = "SELL"
+
+            if direction is None:
+                cmt_upper = (d.get("comment") or "").upper()
+                if "BUY" in cmt_upper:
+                    direction = "BUY"
+                elif "SELL" in cmt_upper:
+                    direction = "SELL"
+                else:
+                    direction = "BUY"
+
+            if time_open == 0 and open_deals and len(open_deals) > 0:
+                time_open = int(getattr(open_deals[0], "time", 0) or 0)
 
             hist_orders = mt5.history_orders_get(position=ticket)
             if hist_orders and len(hist_orders) > 0:
@@ -219,7 +229,7 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 is_buy=(direction == "BUY"),
                 entry_price=entry_p,
                 initial_sl_price=sl_p,
-                time_open=open_deals[0].time if (open_deals and len(open_deals) > 0) else 0,
+                time_open=time_open,
                 time_close=d["time_close"],
             ) if (entry_p > 0 and sl_p > 0) else 0.0
             max_r = max(calc_mfe, realized_r if realized_r > 0 else 0.0)
