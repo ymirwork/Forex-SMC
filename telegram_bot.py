@@ -583,6 +583,25 @@ class TelegramBotManager:
         parent_t = getattr(setup, "parent_ticket", None)
         strat_label = f"PYRAMID_{setup.strategy_name}" if is_pyr else setup.setup_type
 
+        raw_strat = getattr(setup, "strategy_name", "SMC")
+        strat_upper = str(raw_strat).upper()
+        if "ZUMIKO" in strat_upper or "KILLMLM" in strat_upper:
+            strat_name_db = "Zumiko KillMLM"
+            strat_prefix = "Zumiko"
+        elif "GOLDEN" in strat_upper:
+            strat_name_db = "GOLDEN_COMBO"
+            strat_prefix = "GoldCombo"
+        else:
+            strat_name_db = "SMC"
+            strat_prefix = "SMC"
+
+        grade_val = getattr(setup, "grade", "")
+        if not grade_val and setup.confluence_score > 0:
+            if strat_name_db == "Zumiko KillMLM":
+                grade_val = "A+" if setup.confluence_score >= 90 else ("A" if setup.confluence_score >= 75 else "B")
+            else:
+                grade_val = "A+" if setup.confluence_score >= 85 else ("A" if setup.confluence_score >= 70 else "B")
+
         if action == "market":
             success, msg, ticket, fill_price = self.mt5_client.execute_market_order(
                 symbol=setup.symbol,
@@ -590,7 +609,7 @@ class TelegramBotManager:
                 volume=lot,
                 sl=setup.sl_price,
                 tp=setup.tp1_price,
-                comment=f"SMC {'Pyr L2 ' if is_pyr else ''}{setup.setup_type[:10]}",
+                comment=f"{strat_prefix} {'Pyr L2 ' if is_pyr else ''}{setup.setup_type[:10]}"[:31],
             )
             if success:
                 actual_entry = fill_price if fill_price > 0 else setup.entry_price
@@ -614,6 +633,9 @@ class TelegramBotManager:
                     comment=f"{'Piramida L2' if is_pyr else 'Market order'} via Telegram | {setup.setup_type}",
                     parent_ticket=parent_t,
                     is_pyramid=is_pyr,
+                    strategy=strat_name_db,
+                    setup_type=setup.setup_type,
+                    grade=grade_val,
                 )
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
@@ -626,6 +648,9 @@ class TelegramBotManager:
                     "confluence_score": setup.confluence_score,
                     "status": "OPEN",
                     "mt5_ticket": ticket,
+                    "strategy": strat_name_db,
+                    "grade": grade_val,
+                    "setup_type": setup.setup_type,
                     "comment": f"{strat_label} | via Telegram",
                 }))
                 new_caption = (
@@ -652,7 +677,7 @@ class TelegramBotManager:
                 volume=lot,
                 sl=setup.sl_price,
                 tp=setup.tp1_price,
-                comment=f"SMC Limit {'Pyr ' if is_pyr else ''}{setup.setup_type[:10]}",
+                comment=f"{strat_prefix} Limit {'Pyr ' if is_pyr else ''}{setup.setup_type[:10]}"[:31],
             )
             if success:
                 self.journal.add_trade(
@@ -669,6 +694,9 @@ class TelegramBotManager:
                     comment=f"{'Piramida L2 Limit' if is_pyr else 'Limit order'} via Telegram | {setup.setup_type}",
                     parent_ticket=parent_t,
                     is_pyramid=is_pyr,
+                    strategy=strat_name_db,
+                    setup_type=setup.setup_type,
+                    grade=grade_val,
                 )
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
@@ -681,6 +709,9 @@ class TelegramBotManager:
                     "confluence_score": setup.confluence_score,
                     "status": "OPEN",
                     "mt5_ticket": ticket,
+                    "strategy": strat_name_db,
+                    "grade": grade_val,
+                    "setup_type": setup.setup_type,
                     "comment": f"{strat_label} (Limit) | via Telegram",
                 }))
                 new_caption = (

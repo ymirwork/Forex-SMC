@@ -117,6 +117,17 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
     for ticket, p in open_tickets_mt5.items():
         if ticket not in db_by_ticket:
             raw_sym = p["symbol"].replace(".pro", "").replace(".raw", "").replace(".PRO", "").replace(".RAW", "")
+            cmt = str(p.get("comment") or "")
+            if "zumiko" in cmt.lower() or "killmlm" in cmt.lower():
+                strat = "Zumiko KillMLM"
+                grade = "A"
+            elif "golden" in cmt.lower():
+                strat = "GOLDEN_COMBO"
+                grade = "A+"
+            else:
+                strat = "SMC"
+                grade = "A"
+
             tid = journal.add_trade(
                 symbol=raw_sym,
                 direction=p["type"],
@@ -131,9 +142,10 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 mt5_ticket=ticket,
                 comment=p["comment"] or "Zsynchronizowano z MT5",
                 is_pyramid=False,
-                strategy="SMC",
+                strategy=strat,
+                grade=grade,
             )
-            print(f"  ➕ Dodano brakującą otwartą pozycję #{ticket} ({raw_sym}) do trades.db (ID: {tid})")
+            print(f"  ➕ Dodano brakującą otwartą pozycję #{ticket} ({raw_sym}) [{strat}] do trades.db (ID: {tid})")
 
     # C) Backfill missing closed deals into trades.db
     for ticket, d in closed_deals_mt5.items():
@@ -151,6 +163,17 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 status = "BE"
                 realized_r = 0.0
 
+            d_cmt = str(d.get("comment") or "")
+            if "zumiko" in d_cmt.lower() or "killmlm" in d_cmt.lower():
+                strat = "Zumiko KillMLM"
+                grade = "A"
+            elif "golden" in d_cmt.lower():
+                strat = "GOLDEN_COMBO"
+                grade = "A+"
+            else:
+                strat = "SMC"
+                grade = "A"
+
             tid = journal.add_trade(
                 symbol=raw_sym,
                 direction="BUY" if "BUY" in (d.get("comment") or "").upper() else "SELL",
@@ -165,10 +188,11 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 mt5_ticket=ticket,
                 comment=f"{d.get('comment') or 'Historia MT5'}",
                 is_pyramid=False,
-                strategy="SMC",
+                strategy=strat,
+                grade=grade,
                 exit_reason=("TP" if status == "WIN" else ("SL" if status == "LOSS" else "BE")),
             )
-            print(f"  ➕ Dodano pozycję archiwalną #{ticket} ({raw_sym}) do trades.db -> {status} (PnL: {profit:+.2f} USD)")
+            print(f"  ➕ Dodano pozycję archiwalną #{ticket} ({raw_sym}) [{strat}] do trades.db -> {status} (PnL: {profit:+.2f} USD)")
 
     # Refresh db_trades
     db_trades = journal.get_all_trades()
@@ -259,6 +283,44 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                         if ok and page_id:
                             journal.set_notion_page_id_by_ticket(ticket, page_id)
                             print(f"  ➕ Wysłano brakującą transakcję #{ticket} ({t['symbol']}) do Notion!")
+                        await asyncio.sleep(0.3)
+
+                # C) Backfill / Verify Strategy & Grade in Notion for all existing pages
+                for ticket, page in notion_by_ticket.items():
+                    t = db_by_ticket.get(ticket)
+                    if not t:
+                        continue
+                    p_props = page.get("properties", {})
+                    curr_strat = (p_props.get("Strategy", {}).get("select") or {}).get("name")
+                    curr_grade = (p_props.get("Grade", {}).get("select") or {}).get("name")
+
+                    expected_strat = t.get("strategy") or "SMC"
+                    raw_upper = expected_strat.upper()
+                    if "ZUMIKO" in raw_upper or "KILLMLM" in raw_upper:
+                        expected_strat = "Zumiko KillMLM"
+                    elif "GOLDEN" in raw_upper:
+                        expected_strat = "GOLDEN_COMBO"
+                    else:
+                        expected_strat = "SMC"
+
+                    expected_grade = t.get("grade")
+                    if not expected_grade and t.get("confluence_score"):
+                        cs = int(t["confluence_score"])
+                        if "ZUMIKO" in expected_strat.upper():
+                            expected_grade = "A+" if cs >= 90 else ("A" if cs >= 75 else "B")
+                        else:
+                            expected_grade = "A+" if cs >= 85 else ("A" if cs >= 70 else "B")
+
+                    fix_props = {}
+                    if curr_strat != expected_strat:
+                        fix_props["Strategy"] = {"select": {"name": expected_strat}}
+                    if not curr_grade and expected_grade:
+                        fix_props["Grade"] = {"select": {"name": expected_grade}}
+
+                    if fix_props:
+                        ok_fix = await notion.update_page_properties(page["id"], fix_props)
+                        if ok_fix:
+                            print(f"  🎨 Uzupełniono Notion #{ticket} -> Strategy: '{expected_strat}', Grade: '{expected_grade}'")
                         await asyncio.sleep(0.3)
             else:
                 print(f"  ❌ Błąd zapytania Notion: {res.status_code}")

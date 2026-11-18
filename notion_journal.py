@@ -166,13 +166,31 @@ class NotionJournal:
         # 10. Strategy
         strat_match = find_prop(["Strategy", "Strategia"])
         if strat_match:
-            strat_val = str(trade.get("strategy") or trade.get("strategy_name") or "SMC").upper()
+            raw_strat = str(trade.get("strategy") or trade.get("strategy_name") or "SMC").strip()
+            raw_upper = raw_strat.upper()
+            if "ZUMIKO" in raw_upper or "KILLMLM" in raw_upper:
+                strat_val = "Zumiko KillMLM"
+            elif "GOLDEN" in raw_upper:
+                strat_val = "GOLDEN_COMBO"
+            elif "SMC" in raw_upper:
+                strat_val = "SMC"
+            else:
+                strat_val = raw_strat
             props[strat_match[0]] = {"select": {"name": strat_val}}
 
         # 11. Grade (A+, A, B)
         grade_match = find_prop(["Grade", "Klasa", "Ocena"])
-        if grade_match and trade.get("grade"):
-            props[grade_match[0]] = {"select": {"name": str(trade["grade"])}}
+        if grade_match:
+            grade_val = trade.get("grade")
+            if not grade_val and trade.get("confluence_score"):
+                cs = int(trade["confluence_score"])
+                raw_upper = str(trade.get("strategy") or trade.get("strategy_name") or "").upper()
+                if "ZUMIKO" in raw_upper or "KILLMLM" in raw_upper:
+                    grade_val = "A+" if cs >= 90 else ("A" if cs >= 75 else "B")
+                else:
+                    grade_val = "A+" if cs >= 85 else ("A" if cs >= 70 else "B")
+            if grade_val:
+                props[grade_match[0]] = {"select": {"name": str(grade_val)}}
 
         # 12. Date / Timestamp
         date_match = find_prop(["Date", "Data", "Timestamp", "Created"])
@@ -189,7 +207,7 @@ class NotionJournal:
             props[prop_name] = {"date": {"start": iso_date}}
 
         # 13. Notes / Strategy / Comment
-        notes_match = find_prop(["Notes", "Comment", "Strategy", "Strategia", "Opis", "Setup"])
+        notes_match = find_prop(["Notes", "Comment", "Opis", "Uwagi", "Komentarz"])
         if notes_match:
             prop_name, _ = notes_match
             comment_text = trade.get("comment") or trade.get("setup_type") or "SMC Trade"
@@ -274,6 +292,8 @@ class NotionJournal:
         comment: str = "",
         max_r: Optional[float] = None,
         page_id: Optional[str] = None,
+        strategy: Optional[str] = None,
+        grade: Optional[str] = None,
     ) -> bool:
         """
         Updates an existing trade page in Notion when TP / SL or closure is detected.
@@ -335,6 +355,18 @@ class NotionJournal:
                 exit_val = "MANUAL"
             patch_props[exit_col] = {"select": {"name": exit_val}}
 
+        if strategy:
+            strat_col = find_prop(["Strategy", "Strategia"])
+            if strat_col:
+                raw_upper = strategy.upper()
+                strat_val = "Zumiko KillMLM" if ("ZUMIKO" in raw_upper or "KILLMLM" in raw_upper) else ("GOLDEN_COMBO" if "GOLDEN" in raw_upper else "SMC")
+                patch_props[strat_col] = {"select": {"name": strat_val}}
+
+        if grade:
+            grade_col = find_prop(["Grade", "Klasa", "Ocena"])
+            if grade_col:
+                patch_props[grade_col] = {"select": {"name": str(grade)}}
+
         if not patch_props:
             return False
 
@@ -349,6 +381,19 @@ class NotionJournal:
                     return False
         except Exception as e:
             logger.error(f"Error updating Notion page: {e}")
+            return False
+
+    async def update_page_properties(self, page_id: str, patch_props: Dict[str, Any]) -> bool:
+        """Directly patches properties of an existing Notion page by ID."""
+        if not self.enabled:
+            return False
+        url = f"{self.BASE_URL}/pages/{page_id}"
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.patch(url, headers=self._get_headers(), json={"properties": patch_props})
+                return res.status_code == 200
+        except Exception as e:
+            logger.error(f"Error updating Notion page {page_id}: {e}")
             return False
 
     async def _find_page_id_by_ticket(self, ticket: int) -> Optional[str]:

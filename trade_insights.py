@@ -252,8 +252,15 @@ class TradeInsightEngine:
                     )
 
         # Check strategy edge
+        strat_key = strategy.upper().replace(" ", "").replace("_", "")
         for m in edge_data.get("strategy", []):
-            if m.label == strategy and m.n_trades >= self.min_sample_size and m.is_weak:
+            m_key = m.label.upper().replace(" ", "").replace("_", "")
+            is_match = (
+                m.label == strategy
+                or m_key == strat_key
+                or (("ZUMIKO" in m_key or "KILLMLM" in m_key) and ("ZUMIKO" in strat_key or "KILLMLM" in strat_key))
+            )
+            if is_match and m.n_trades >= self.min_sample_size and m.is_weak:
                 weak_hits.append(
                     f"⚠️ Strategia {strategy}: EV {m.ev_per_trade:+.2f}R | WinRate {m.winrate:.0f}% | PF {m.profit_factor:.2f} (n={m.n_trades})"
                 )

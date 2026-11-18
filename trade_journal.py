@@ -91,7 +91,8 @@ class TradeJournal:
                     confluences_json TEXT DEFAULT '{}',
                     mae_r REAL DEFAULT 0.0,
                     closed_at TEXT DEFAULT '',
-                    exit_reason TEXT DEFAULT ''
+                    exit_reason TEXT DEFAULT '',
+                    grade TEXT DEFAULT ''
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);")
@@ -108,6 +109,7 @@ class TradeJournal:
                 ("mae_r", "REAL DEFAULT 0.0"),
                 ("closed_at", "TEXT DEFAULT ''"),
                 ("exit_reason", "TEXT DEFAULT ''"),
+                ("grade", "TEXT DEFAULT ''"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_def}")
@@ -300,8 +302,16 @@ class TradeJournal:
         confluences_json: str = "{}",
         mae_r: float = 0.0,
         exit_reason: str = "",
+        grade: str = "",
     ) -> int:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        if not grade and confluence_score > 0:
+            strat_upper = str(strategy).upper()
+            if "ZUMIKO" in strat_upper or "KILLMLM" in strat_upper:
+                grade = "A+" if confluence_score >= 90 else ("A" if confluence_score >= 75 else "B")
+            else:
+                grade = "A+" if confluence_score >= 85 else ("A" if confluence_score >= 70 else "B")
+
         with self._get_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
@@ -309,16 +319,28 @@ class TradeJournal:
                     timestamp, symbol, direction, entry_price, sl_price, tp_price,
                     realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
                     parent_ticket, is_pyramid,
-                    strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, symbol.upper(), direction.upper(), entry_price, sl_price, tp_price,
                 realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
                 parent_ticket, is_pyramid,
-                strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason
+                strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade
             ))
             conn.commit()
             return cur.lastrowid
+
+    @_auto_recover_on_corruption
+    def update_trade_strategy_and_grade(self, mt5_ticket: int, strategy: str, grade: str) -> bool:
+        """Updates strategy name and grade for a trade by MT5 ticket."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE trades SET strategy = ?, grade = ? WHERE mt5_ticket = ?",
+                (strategy, grade, mt5_ticket),
+            )
+            conn.commit()
+            return cur.rowcount > 0
 
     @_auto_recover_on_corruption
     def update_trade_result(self, trade_id: int, realized_r: float, max_r: float, status: str = "CLOSED"):
