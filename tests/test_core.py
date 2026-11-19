@@ -512,6 +512,7 @@ class TestNotionTicketExactMatch(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSyncJournalDirectionFallback(unittest.IsolatedAsyncioTestCase):
+    @patch("sync_journal.ENABLE_NOTION", False)
     @patch("sync_journal.mt5.history_deals_get")
     @patch("sync_journal.mt5.history_orders_get")
     @patch("sync_journal.mt5.positions_get", return_value=[])

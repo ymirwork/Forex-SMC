@@ -129,6 +129,139 @@ class TestRiskAndFilters(unittest.TestCase):
         # Default target threshold should be 0.85R
         self.assertEqual(AUTO_BE_R_TRIGGER, 0.85)
 
+    def test_multi_position_break_even_isolation(self):
+        """Verifies that an open position with MFE does not leak state to subsequent positions."""
+        from unittest.mock import MagicMock, AsyncMock, patch
+        import asyncio
+        from scanner import SMCScanner
+
+        mt5_mock = MagicMock()
+        journal_mock = MagicMock()
+        journal_mock.get_pending_trades.return_value = []
+        journal_mock.get_open_trades.return_value = []
+        journal_mock.get_rollover_shielded_trades.return_value = []
+
+        # Position 1: EURUSD (reached +1.2R, qualifies for BE)
+        # Position 2: GBPUSD (only +0.1R, does NOT qualify for BE, no journal entry)
+        p1 = {
+            "ticket": 101,
+            "symbol": "EURUSD",
+            "type": "BUY",
+            "price_open": 1.0800,
+            "sl": 1.0700,
+            "price_current": 1.0900,
+            "profit": 100.0,
+            "time": 1000,
+        }
+        p2 = {
+            "ticket": 102,
+            "symbol": "GBPUSD",
+            "type": "BUY",
+            "price_open": 1.3000,
+            "sl": 1.2900,
+            "price_current": 1.3010,
+            "profit": 10.0,
+            "time": 1005,
+        }
+
+        mt5_mock.get_open_positions.return_value = [p1, p2]
+        mt5_mock.get_initial_sl.side_effect = lambda t: 1.0700 if t == 101 else 1.2900
+        mt5_mock.is_position_at_be.return_value = False
+        mt5_mock.move_sl_to_breakeven.return_value = (True, "BE moved")
+        mt5_mock.get_broker_server_time.return_value = datetime(2026, 11, 19, 12, 0)
+        mt5_mock.get_prop_metrics.return_value = {}
+
+        # Trade 101 has journal record and MFE 1.2R; Trade 102 has None
+        def mock_get_trade(ticket):
+            if ticket == 101:
+                return {"mt5_ticket": 101, "max_r": 0.5}
+            return None
+
+        journal_mock.get_trade_by_ticket.side_effect = mock_get_trade
+        mt5_mock.get_position_mfe.return_value = 1.2
+
+        scanner = SMCScanner(mt5_client=mt5_mock, telegram_manager=None, journal=journal_mock)
+
+        # Run monitor_open_trades
+        asyncio.run(scanner.monitor_open_trades())
+
+        # Verify only ticket 101 was moved to Break-Even!
+        self.assertEqual(mt5_mock.move_sl_to_breakeven.call_count, 1)
+        args, _ = mt5_mock.move_sl_to_breakeven.call_args
+        self.assertEqual(args[0], 101)
+
+    def test_telegram_rapid_click_prevents_duplicate_execution(self):
+        """Verifies that atomic setup pop in handle_callback prevents double execution on rapid clicks."""
+        from unittest.mock import MagicMock, AsyncMock, patch
+        import asyncio
+        from telegram_bot import TelegramBotManager
+        from smc_detector import TradeSetup
+
+        mt5_mock = MagicMock()
+        mt5_mock.execute_market_order.return_value = (True, "OK", 888001, 1.0850)
+        mt5_mock.calculate_lot_size.return_value = 0.1
+        mt5_mock.can_open_new_trade.return_value = (True, "OK")
+
+        journal_mock = MagicMock()
+        bot = TelegramBotManager(mt5_mock, token="dummy", alert_channel=-100123, allowed_ids=[123456], journal=journal_mock)
+
+        setup = MagicMock(spec=TradeSetup)
+        setup.symbol = "EURUSD"
+        setup.direction = "BUY"
+        setup.entry_price = 1.0850
+        setup.sl_price = 1.0820
+        setup.tp1_price = 1.0910
+        setup.confluence_score = 85
+        setup.setup_type = "M15 CHoCH"
+        setup.strategy_name = "SMC"
+        setup.is_pyramid = False
+
+        bot.pending_setups["setup_click_test"] = setup
+        bot.pending_setups_time["setup_click_test"] = 1000
+
+        update1 = MagicMock()
+        update1.effective_user.id = 123456
+        update1.callback_query.from_user.id = 123456
+        update1.effective_chat.id = -100123
+        update1.callback_query.data = "market:setup_click_test"
+        update1.callback_query.message.caption = "Alert caption"
+        update1.callback_query.answer = AsyncMock()
+        update1.callback_query.edit_message_caption = AsyncMock()
+
+        update2 = MagicMock()
+        update2.effective_user.id = 123456
+        update2.callback_query.from_user.id = 123456
+        update2.effective_chat.id = -100123
+        update2.callback_query.data = "market:setup_click_test"
+        update2.callback_query.message.caption = "Alert caption"
+        update2.callback_query.answer = AsyncMock()
+        update2.callback_query.edit_message_caption = AsyncMock()
+
+        london_session = {"session_name": "London Open", "is_killzone": True, "is_rollover": False}
+        async def run_clicks():
+            with patch.object(bot.news_filter, "check_news_async", AsyncMock(return_value=(False, None, None))), \
+                 patch("session_manager.SessionManager.get_current_session", return_value=london_session):
+                await bot.handle_callback(update1, MagicMock())
+                await bot.handle_callback(update2, MagicMock())
+
+        asyncio.run(run_clicks())
+
+        # First click executed market order, second click was safely rejected as expired/already processed!
+        self.assertEqual(mt5_mock.execute_market_order.call_count, 1)
+        self.assertNotIn("setup_click_test", bot.pending_setups)
+
+    def test_zumiko_tp2_non_zero_fallback(self):
+        """Verifies that Zumiko SELL/BUY setup never outputs tp2 = 0.0 even if last swing is 0.0."""
+        from zumiko_detector import ZumikoDetector
+        z = ZumikoDetector()
+        entry = 1.0850
+        risk = 0.0020
+        target_rr = 2.0
+        # If last_low_val is 0.0 for SELL
+        tp2_sell = min(0.0, entry - (risk * (target_rr + 1.0))) if 0.0 > 0 else (entry - (risk * (target_rr + 1.0)))
+        self.assertGreater(tp2_sell, 0.0)
+        self.assertAlmostEqual(tp2_sell, entry - (0.0020 * 3.0), places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -280,10 +280,7 @@ class SMCScanner:
             logger.error(f"Failed to query open trades from journal: {e}")
             open_trades = []
 
-        if not open_trades:
-            return
-
-        for t in open_trades:
+        for t in (open_trades or []):
             ticket = t.get("mt5_ticket")
             if not ticket:
                 continue
@@ -400,6 +397,7 @@ class SMCScanner:
             curr_p = p["price_current"]
             pnl = p["profit"]
             is_buy = p["type"] == "BUY"
+            current_mfe = None
 
             orig_sl = self.mt5_client.get_initial_sl(ticket)
             if orig_sl <= 0:
@@ -443,7 +441,7 @@ class SMCScanner:
 
                 favorable_move = (curr_p - entry_p) if is_buy else (entry_p - curr_p)
                 trigger_dist = initial_sl_dist * AUTO_BE_R_TRIGGER
-                current_trade_mfe = current_mfe if 'current_mfe' in locals() else (favorable_move / initial_sl_dist if initial_sl_dist > 0 else 0.0)
+                current_trade_mfe = current_mfe if current_mfe is not None else (favorable_move / initial_sl_dist if initial_sl_dist > 0 else 0.0)
 
                 # If market moved >= AUTO_BE_R_TRIGGER (e.g. 0.85R) in favor of trade (checked via live tick or MFE)
                 if favorable_move >= trigger_dist or current_trade_mfe >= AUTO_BE_R_TRIGGER:

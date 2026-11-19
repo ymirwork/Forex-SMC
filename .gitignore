@@ -71,6 +71,13 @@ charts/*.jpeg
 *.swo
 
 # ==========================================
+# GRAPHIFY CACHE & INTERNAL AST
+# ==========================================
+graphify-out/cache/
+graphify-out/.graphify_*
+graphify-out/.graphify*
+
+# ==========================================
 # OS GENERATED FILES
 # ==========================================
 .DS_Store

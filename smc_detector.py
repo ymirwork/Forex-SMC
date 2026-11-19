@@ -58,7 +58,8 @@ def get_min_sl_distance(symbol: str, point_scale: float = 0.0001) -> float:
         return 0.0
     sym = symbol.upper()
     if "XAU" in sym or "GOLD" in sym:
-        return max(30.0, MIN_SL_PIPS_GOLD * 0.10)
+        gold_pip = 0.10 if point_scale >= 0.01 else point_scale
+        return MIN_SL_PIPS_GOLD * gold_pip
     if "GBP" in sym:
         return MIN_SL_PIPS_GBP * point_scale
     if "JPY" in sym:

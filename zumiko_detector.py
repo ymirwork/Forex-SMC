@@ -463,7 +463,7 @@ class ZumikoDetector:
             if sl is None or risk is None:
                 return None
             tp1 = entry + (risk * target_rr)
-            tp2 = max(last_high_val, entry + (risk * (target_rr + 1.0)))
+            tp2 = max(last_high_val, entry + (risk * (target_rr + 1.0))) if last_high_val > 0 else (entry + (risk * (target_rr + 1.0)))
             zone_top = curr_e10
             zone_bottom = curr_e21
             swing_pat = f"HL ({last_low_val:.{digits}f})"
@@ -483,7 +483,7 @@ class ZumikoDetector:
             if sl is None or risk is None:
                 return None
             tp1 = entry - (risk * target_rr)
-            tp2 = min(last_low_val, entry - (risk * (target_rr + 1.0)))
+            tp2 = min(last_low_val, entry - (risk * (target_rr + 1.0))) if last_low_val > 0 else (entry - (risk * (target_rr + 1.0)))
             zone_top = curr_e21
             zone_bottom = curr_e10
             swing_pat = f"LH ({last_high_val:.{digits}f})"

@@ -540,7 +540,9 @@ class TelegramBotManager:
                 await query.answer(text=f"Błąd BE: {e}", show_alert=True)
             return
 
-        setup = self.pending_setups.get(setup_id)
+        setup = self.pending_setups.pop(setup_id, None)
+        self.pending_setups_time.pop(setup_id, None)
+
         orig_caption = (
             query.message.caption
             if (query.message and query.message.caption is not None)
@@ -554,9 +556,6 @@ class TelegramBotManager:
                 mute_txt = f"\n\n🔇 **Powiadomienia dla {setup.symbol} [{setup.direction}] wyciszone na {DISMISS_MUTE_HOURS:.1f}h.**"
 
             await self._safe_edit_message(query, f"{orig_caption}\n\n❌ **Setup odrzucony przez użytkownika.**{mute_txt}")
-            if setup_id in self.pending_setups:
-                del self.pending_setups[setup_id]
-            self.pending_setups_time.pop(setup_id, None)
             return
 
         if not setup:
@@ -788,10 +787,6 @@ class TelegramBotManager:
                     query,
                     f"{orig_caption}\n\n❌ **Błąd zlecenia limit w MT5:** {msg}"
                 )
-
-        if setup_id in self.pending_setups:
-            del self.pending_setups[setup_id]
-        self.pending_setups_time.pop(setup_id, None)
 
     async def send_setup_alert(self, setup: TradeSetup, chart_path: str, setup_id: str):
         """Sends rich alert with chart image and interactive execution buttons."""
