@@ -13,13 +13,20 @@ from liquidity_detector import LiquidityDetector, LiquidityEvaluation
 from trade_journal import TradeJournal
 from config import (
     ADD_SPREAD_TO_SL,
+    BLOCK_EVENING_ENTRIES,
     BLOCK_ROLLOVER_SESSION,
     DEFAULT_RR_RATIO,
     LIQUIDITY_SWEEP_LOOKBACK_BARS,
     LTF_TIMEFRAME,
     MAX_SL_ATR_MULTIPLIER,
+    MIN_SL_PIPS_CROSS_JPY,
+    MIN_SL_PIPS_FOREX,
+    MIN_SL_PIPS_GBP,
+    MIN_SL_PIPS_GOLD,
     MIN_TRADES_FOR_OPTIMAL_RR,
     OPTIMAL_RR_MIN_FLOOR,
+    REJECTION_WICK_MIN_RATIO,
+    REQUIRE_REJECTION_CANDLE,
     REQUIRE_STRUCTURAL_SPACE_FOR_RR,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
@@ -31,6 +38,79 @@ from config import (
 logger = logging.getLogger("ForexSMC.SMCDetector")
 
 
+def get_symbol_pip_size(symbol: str, digits: int = 5) -> float:
+    """Returns the base pip scale for a symbol."""
+    sym = (symbol or "").upper()
+    if "XAU" in sym or "GOLD" in sym:
+        return 0.10 if digits == 2 else 0.01
+    if "JPY" in sym or digits == 3:
+        return 0.01
+    return 0.0001
+
+
+def get_min_sl_distance(symbol: str, point_scale: float = 0.0001) -> float:
+    """
+    Returns the absolute minimum Stop Loss distance floor in price units.
+    Prevents micro-stops below market noise and broker spread thresholds.
+    Returns 0.0 if symbol is empty (for generic unit test callers).
+    """
+    if not symbol:
+        return 0.0
+    sym = symbol.upper()
+    if "XAU" in sym or "GOLD" in sym:
+        return max(30.0, MIN_SL_PIPS_GOLD * 0.10)
+    if "GBP" in sym:
+        return MIN_SL_PIPS_GBP * point_scale
+    if "JPY" in sym:
+        return MIN_SL_PIPS_CROSS_JPY * point_scale
+    return MIN_SL_PIPS_FOREX * point_scale
+
+
+def check_rejection_candle(
+    df: pd.DataFrame,
+    is_buy: bool,
+    min_wick_ratio: float = REJECTION_WICK_MIN_RATIO,
+) -> Tuple[bool, str]:
+    """
+    Validates whether recent candle price action confirms rejection of the zone:
+    - For BUY:
+      1. Candle closed bullish (close >= open), OR
+      2. Lower rejection wick >= min_wick_ratio * total_range (buying absorption at lows).
+    - For SELL:
+      1. Candle closed bearish (close <= open), OR
+      2. Upper rejection wick >= min_wick_ratio * total_range (selling absorption at highs).
+    Checks the latest bar (iloc[-1]) and the previous bar (iloc[-2]).
+    """
+    if df is None or len(df) < 2:
+        return True, "Brak wystarczającej liczby świec do analizy odrzucenia"
+
+    for i in [-1, -2]:
+        row = df.iloc[i]
+        o = float(row.get("open", 0.0))
+        h = float(row.get("high", 0.0))
+        l = float(row.get("low", 0.0))
+        c = float(row.get("close", 0.0))
+        rng = h - l
+        if rng <= 0:
+            continue
+
+        if is_buy:
+            if c >= o:
+                return True, "Potwierdzenie: świeca zamknęła się prowzrostowo (close >= open)"
+            lower_wick = min(o, c) - l
+            if (lower_wick / rng) >= min_wick_ratio:
+                return True, f"Potwierdzenie: dolny knot odrzucenia {(lower_wick / rng)*100:.1f}% strefy popytowej"
+        else:
+            if c <= o:
+                return True, "Potwierdzenie: świeca zamknęła się prospadkowo (close <= open)"
+            upper_wick = h - max(o, c)
+            if (upper_wick / rng) >= min_wick_ratio:
+                return True, f"Potwierdzenie: górny knot odrzucenia {(upper_wick / rng)*100:.1f}% strefy podażowej"
+
+    direction_str = "wzrostu (spadający nóż bez odrzucenia)" if is_buy else "spadku (dynamiczny wzrost bez odrzucenia)"
+    return False, f"Brak potwierdzenia świecowego dla {direction_str}"
+
+
 def calculate_stop_loss(
     entry: float,
     structural_sl: float,
@@ -38,44 +118,50 @@ def calculate_stop_loss(
     is_buy: bool,
     spread_buffer: float = 0.0,
     point_scale: float = 0.0001,
+    symbol: str = "",
 ) -> Tuple[Optional[float], Optional[float], str]:
     """
     Calculates Stop Loss price and risk amount according to configured SL mode:
-    - "STRUCTURE": Pure structural swing / OTE / EMA invalidation level.
-    - "ATR": Entry +/- (ATR * multiplier + spread_buffer).
-    - "HYBRID": Structural SL, but guarantees a minimum risk buffer of (ATR * hybrid_mult + spread_buffer).
+    - "STRUCTURE": Pure structural swing / OTE / EMA invalidation level, clamped to minimum SL floor.
+    - "ATR": Entry +/- (ATR * multiplier + spread_buffer), clamped to minimum SL floor.
+    - "HYBRID": Structural SL, but guarantees a minimum risk buffer of (ATR * hybrid_mult + spread_buffer) and min SL floor.
     Returns (sl, risk, applied_sl_mode). Returns (None, None, applied_sl_mode) if risk <= 5 * point_scale.
     """
     atr_val = atr if (atr is not None and atr > 0) else 0.0
     atr_risk = atr_val * SL_ATR_MULTIPLIER
+    min_floor = get_min_sl_distance(symbol, point_scale)
 
     if is_buy:
         structural_risk = entry - structural_sl
         if SL_CALCULATION_MODE == "ATR":
-            sl = entry - (atr_risk + spread_buffer)
+            final_risk = max(atr_risk + spread_buffer, min_floor)
+            sl = entry - final_risk
             applied_sl_mode = "ATR"
         elif SL_CALCULATION_MODE == "HYBRID":
-            min_risk = (atr_val * SL_HYBRID_MIN_ATR_MULT) + spread_buffer
+            min_risk = max((atr_val * SL_HYBRID_MIN_ATR_MULT) + spread_buffer, min_floor)
             final_risk = max(structural_risk, min_risk)
             sl = entry - final_risk
             applied_sl_mode = "HYBRID"
         else:
-            sl = structural_sl
+            final_risk = max(structural_risk, min_floor)
+            sl = entry - final_risk
             applied_sl_mode = "STRUCTURE"
 
         risk = entry - sl
     else:
         structural_risk = structural_sl - entry
         if SL_CALCULATION_MODE == "ATR":
-            sl = entry + (atr_risk + spread_buffer)
+            final_risk = max(atr_risk + spread_buffer, min_floor)
+            sl = entry + final_risk
             applied_sl_mode = "ATR"
         elif SL_CALCULATION_MODE == "HYBRID":
-            min_risk = (atr_val * SL_HYBRID_MIN_ATR_MULT) + spread_buffer
+            min_risk = max((atr_val * SL_HYBRID_MIN_ATR_MULT) + spread_buffer, min_floor)
             final_risk = max(structural_risk, min_risk)
             sl = entry + final_risk
             applied_sl_mode = "HYBRID"
         else:
-            sl = structural_sl
+            final_risk = max(structural_risk, min_floor)
+            sl = entry + final_risk
             applied_sl_mode = "STRUCTURE"
 
         risk = sl - entry
@@ -337,14 +423,17 @@ class SMCDetector:
         current_time = current_candle["time"]
 
         digits = 2 if "JPY" in symbol.upper() or "XAU" in symbol.upper() or "GOLD" in symbol.upper() else 4
-        point_scale = 0.01 if digits == 2 else 0.0001
+        point_scale = get_symbol_pip_size(symbol, digits)
         atr = (df_ltf["high"] - df_ltf["low"]).tail(14).mean()
         buffer = max(atr * 0.2, point_scale * 5)
 
         # Session & News Context
         session_info = SessionManager.get_current_session(current_time)
-        if BLOCK_ROLLOVER_SESSION and "Rollover" in session_info.get("session_name", ""):
+        if BLOCK_ROLLOVER_SESSION and ("Rollover" in session_info.get("session_name", "") or session_info.get("is_rollover", False)):
             logger.info(f"🛡️ [FILTER] Pomijam {symbol}: Aktywna sesja {session_info.get('session_name')} (BLOCK_ROLLOVER_SESSION=True).")
+            return setups
+        if BLOCK_EVENING_ENTRIES and session_info.get("is_evening_blocked", False):
+            logger.info(f"🛡️ [FILTER] Pomijam {symbol}: Blokada wejść wieczornych ({session_info.get('session_name')}, {session_info.get('time_utc')}).")
             return setups
 
         has_news, news_warn, _ = self.news_filter.check_news(symbol)
@@ -538,6 +627,14 @@ class SMCDetector:
             # Price must be in discount (at or below 61.8% pullback) and not breaking below impulse low
             if not ((current_price <= fibo_618 + buffer) and (current_price >= impulse_low - buffer)):
                 return None
+
+            # Rejection Candle Filter: wait for confirmation rather than entering a falling knife
+            if REQUIRE_REJECTION_CANDLE:
+                rejection_ok, reject_reason = check_rejection_candle(df_ltf, is_buy=True)
+                if not rejection_ok:
+                    logger.info(f"🛡️ [FILTER] Odrzucono setup {symbol} BUY: {reject_reason}")
+                    return None
+
             entry = current_price
             if TIGHT_SL_MODE:
                 recent_pullback_low = df_ltf.iloc[-5:]["low"].min()
@@ -559,6 +656,7 @@ class SMCDetector:
                 is_buy=True,
                 spread_buffer=spread_buffer,
                 point_scale=point_scale,
+                symbol=symbol,
             )
             if sl is None or risk is None:
                 return None
@@ -604,6 +702,14 @@ class SMCDetector:
             # Price must be in premium (at or above 61.8% pullback) and not breaking above impulse high
             if not ((current_price >= fibo_618 - buffer) and (current_price <= impulse_high + buffer)):
                 return None
+
+            # Rejection Candle Filter: wait for confirmation rather than entering a rising knife
+            if REQUIRE_REJECTION_CANDLE:
+                rejection_ok, reject_reason = check_rejection_candle(df_ltf, is_buy=False)
+                if not rejection_ok:
+                    logger.info(f"🛡️ [FILTER] Odrzucono setup {symbol} SELL: {reject_reason}")
+                    return None
+
             entry = current_price
             if TIGHT_SL_MODE:
                 recent_pullback_high = df_ltf.iloc[-5:]["high"].max()
@@ -625,6 +731,7 @@ class SMCDetector:
                 is_buy=False,
                 spread_buffer=spread_buffer,
                 point_scale=point_scale,
+                symbol=symbol,
             )
             if sl is None or risk is None:
                 return None

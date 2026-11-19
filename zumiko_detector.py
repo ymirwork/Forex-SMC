@@ -7,13 +7,22 @@ import pandas as pd
 from news_filter import NewsFilter
 from rr_optimizer import RROptimizer
 from session_manager import SessionManager
-from smc_detector import ConfluenceItem, TradeSetup, calculate_stop_loss
+from smc_detector import (
+    ConfluenceItem,
+    TradeSetup,
+    calculate_stop_loss,
+    check_rejection_candle,
+    get_symbol_pip_size,
+)
 from trade_journal import TradeJournal
 from config import (
     ADD_SPREAD_TO_SL,
+    BLOCK_EVENING_ENTRIES,
+    BLOCK_ROLLOVER_SESSION,
     DEFAULT_RR_RATIO,
     LTF_TIMEFRAME,
     MIN_TRADES_FOR_OPTIMAL_RR,
+    REQUIRE_REJECTION_CANDLE,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
     SL_HYBRID_MIN_ATR_MULT,
@@ -188,7 +197,7 @@ class ZumikoDetector:
             return setups
 
         digits = 2 if "JPY" in symbol.upper() or "XAU" in symbol.upper() or "GOLD" in symbol.upper() else 4
-        point_scale = 0.01 if digits == 2 else 0.0001
+        point_scale = get_symbol_pip_size(symbol, digits)
         atr = (df_m15["high"] - df_m15["low"]).tail(14).mean()
         buffer = max(atr * 0.2, point_scale * 5)
 
@@ -219,6 +228,12 @@ class ZumikoDetector:
 
         # 4. News & Session
         session_info = SessionManager.get_current_session(current_time)
+        if BLOCK_ROLLOVER_SESSION and ("Rollover" in session_info.get("session_name", "") or session_info.get("is_rollover", False)):
+            logger.info(f"🛡️ [FILTER] Pomijam {symbol}: Aktywna sesja {session_info.get('session_name')} (BLOCK_ROLLOVER_SESSION=True).")
+            return setups
+        if BLOCK_EVENING_ENTRIES and session_info.get("is_evening_blocked", False):
+            logger.info(f"🛡️ [FILTER] Pomijam {symbol}: Blokada wejść wieczornych ({session_info.get('session_name')}, {session_info.get('time_utc')}).")
+            return setups
         has_news, news_warn, _ = self.news_filter.check_news(symbol)
 
         # Target RR
@@ -421,6 +436,13 @@ class ZumikoDetector:
         if total_score < self.min_confluence_score:
             return None
 
+        # Rejection Candle Filter: ensure price is reacting rather than plunging through
+        if REQUIRE_REJECTION_CANDLE:
+            rejection_ok, reject_reason = check_rejection_candle(df_m15, is_buy=is_buy)
+            if not rejection_ok:
+                logger.info(f"🛡️ [FILTER] Odrzucono setup Zumiko {symbol} {direction}: {reject_reason}")
+                return None
+
         spread_buffer = spread if ADD_SPREAD_TO_SL else 0.0
         effective_buffer = buffer + spread_buffer
 
@@ -436,6 +458,7 @@ class ZumikoDetector:
                 is_buy=True,
                 spread_buffer=spread_buffer,
                 point_scale=point_scale,
+                symbol=symbol,
             )
             if sl is None or risk is None:
                 return None
@@ -455,6 +478,7 @@ class ZumikoDetector:
                 is_buy=False,
                 spread_buffer=spread_buffer,
                 point_scale=point_scale,
+                symbol=symbol,
             )
             if sl is None or risk is None:
                 return None

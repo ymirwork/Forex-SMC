@@ -673,13 +673,10 @@ class MT5Client:
         - Forex standard (5 digits): 0.0001
         - JPY pairs (3 digits): 0.01
         - Gold (XAU/GOLD): 0.10 (1 pip = $0.10 / 10 cents)
+        Delegates to get_symbol_pip_size for a single source of truth.
         """
-        clean = symbol.upper()
-        if "XAU" in clean or "GOLD" in clean:
-            return 0.10
-        if "JPY" in clean:
-            return 0.01
-        return 0.0001
+        from smc_detector import get_symbol_pip_size
+        return get_symbol_pip_size(symbol)
 
     def get_symbol_spread(self, symbol: str) -> float:
         """

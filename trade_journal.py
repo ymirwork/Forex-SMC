@@ -277,7 +277,30 @@ class TradeJournal:
         else:
             logger.info(f"Created clean {self.db_path}. Active trades and history will be synced from MT5.")
 
+        # Step 5: Prune old backup archives to prevent disk accumulation (keep last 3)
+        self._prune_old_corrupt_backups(backup_dir, base_name, max_keep=3)
+
         return True
+
+    @staticmethod
+    def _prune_old_corrupt_backups(backup_dir: str, base_name: str, max_keep: int = 3):
+        """Retains only the latest max_keep corrupted backup files, cleaning up older ones."""
+        try:
+            prefix = f"{base_name}.corrupt_"
+            files = [
+                f for f in os.listdir(backup_dir)
+                if f.startswith(prefix) and os.path.isfile(os.path.join(backup_dir, f))
+            ]
+            stamps = sorted({f.split("-")[0] for f in files}, reverse=True)
+            for old_stamp in stamps[max_keep:]:
+                for f in files:
+                    if f.startswith(old_stamp):
+                        try:
+                            os.remove(os.path.join(backup_dir, f))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"Error pruning old corrupt backups: {e}")
 
     def checkpoint(self):
         """Forces a WAL checkpoint to truncate temporary WAL files and prevent corruption on exit."""

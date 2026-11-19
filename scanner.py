@@ -13,6 +13,7 @@ from config import (
     ALERT_COOLDOWN_MINUTES,
     AUTO_BE_AT_1R,
     AUTO_BE_OFFSET_PIPS,
+    AUTO_BE_R_TRIGGER,
     BLOCK_ON_HIGH_IMPACT_NEWS,
     BLOCK_ROLLOVER_SESSION,
     DYNAMIC_FILTER_MODE,
@@ -151,7 +152,7 @@ class SMCScanner:
         except Exception as e:
             logger.debug(f"Error during chart cleanup: {e}")
 
-    def _cleanup_old_notifications(self, max_age_hours: float = 6.0):
+    def _cleanup_old_notifications(self, max_age_hours: float = 2.0):
         """Clears old sent setup keys so memory does not leak."""
         now = time.time()
         expired = [k for k, ts in self.notified_setups.items() if (now - ts) > (max_age_hours * 3600)]
@@ -160,6 +161,13 @@ class SMCScanner:
         expired_symbols = [k for k, ts in self._last_alert_by_symbol.items() if (now - ts) > (max_age_hours * 3600)]
         for k in expired_symbols:
             del self._last_alert_by_symbol[k]
+
+        # Extra safety cap: ensure dictionaries never exceed 500 keys under extreme multi-pair bursts
+        if len(self.notified_setups) > 500:
+            sorted_keys = sorted(self.notified_setups.items(), key=lambda x: x[1])
+            for k, _ in sorted_keys[: len(sorted_keys) - 250]:
+                self.notified_setups.pop(k, None)
+
         self._cleanup_old_charts()
 
     def _fetch_cached_ohlcv(
@@ -416,7 +424,7 @@ class SMCScanner:
                 if current_mfe > prev_max:
                     self.journal.update_trade_max_r(ticket, current_mfe)
 
-            # Auto Break-Even Assistant (Locks 0 risk when trade reaches +1.0R)
+            # Auto Break-Even Assistant (Locks 0 risk when trade reaches configured R, e.g. +0.85R)
             if AUTO_BE_AT_1R:
                 if ticket in self._be_moved_tickets or ticket in self._shielded_trades:
                     continue
@@ -434,18 +442,20 @@ class SMCScanner:
                     continue
 
                 favorable_move = (curr_p - entry_p) if is_buy else (entry_p - curr_p)
+                trigger_dist = initial_sl_dist * AUTO_BE_R_TRIGGER
+                current_trade_mfe = current_mfe if 'current_mfe' in locals() else (favorable_move / initial_sl_dist if initial_sl_dist > 0 else 0.0)
 
-                # If market moved >= 1.0R in favor of trade
-                if favorable_move >= initial_sl_dist:
+                # If market moved >= AUTO_BE_R_TRIGGER (e.g. 0.85R) in favor of trade (checked via live tick or MFE)
+                if favorable_move >= trigger_dist or current_trade_mfe >= AUTO_BE_R_TRIGGER:
                     ok, msg = self.mt5_client.move_sl_to_breakeven(ticket, offset_pips=AUTO_BE_OFFSET_PIPS)
                     if ok:
                         self._be_moved_tickets.add(ticket)
                         if self.telegram:
                             offset_txt = f" +{AUTO_BE_OFFSET_PIPS:.1f} pips na pokrycie kosztów" if AUTO_BE_OFFSET_PIPS > 0 else ""
                             alert_msg = (
-                                f"⚡ **AUTO BREAK-EVEN (+1.0R)!**\n\n"
+                                f"⚡ **AUTO BREAK-EVEN (+{AUTO_BE_R_TRIGGER:.2f}R)!**\n\n"
                                 f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
-                                f"📈 Aktualny zysk: `+{pnl:.2f} USD` (Osiągnięto +1.0R!)\n"
+                                f"📈 Aktualny zysk: `+{pnl:.2f} USD` (Osiągnięto +{AUTO_BE_R_TRIGGER:.2f}R!)\n"
                                 f"🛡️ **Stop Loss przestawiony na wejście{offset_txt}!**\n"
                                 f"🔒 Pozycja jest w 100% bezpieczna (Guaranteed Profit / Risk-Free)."
                             )
@@ -867,8 +877,8 @@ class SMCScanner:
                         f"🔥 NEW SETUP: {setup.symbol} {setup.direction} [{setup.strategy_name}] ({setup.setup_type})"
                     )
 
-                    # Generate visual chart with Fibo or EMAs
-                    chart_path = self.chart_gen.generate_setup_chart(df_ltf, setup)
+                    # Generate visual chart with Fibo or EMAs in worker thread (non-blocking)
+                    chart_path = await asyncio.to_thread(self.chart_gen.generate_setup_chart, df_ltf, setup)
 
                     # Send to Telegram
                     if self.telegram:

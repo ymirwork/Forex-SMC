@@ -2,7 +2,12 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, Optional, Tuple
 import pandas as pd
 
-from config import BROKER_UTC_OFFSET_HOURS
+from config import (
+    BLOCK_EVENING_ENTRIES,
+    BROKER_UTC_OFFSET_HOURS,
+    EVENING_BLOCK_END_HOUR_UTC,
+    EVENING_BLOCK_START_HOUR_UTC,
+)
 
 
 def get_broker_utc_offset() -> int:
@@ -54,6 +59,10 @@ class SessionManager:
         is_london_killzone = dtime(7, 0) <= t <= dtime(10, 0)
         is_ny_killzone = dtime(12, 0) <= t <= dtime(15, 0)
         is_asian_session = dtime(0, 0) <= t < dtime(7, 0)
+        is_rollover = dtime(20, 0) <= t or t < dtime(0, 15)
+
+        # Evening entry block (e.g. 17:00 - 23:00 UTC) to avoid low-liquidity chop and midnight spread blowouts
+        is_evening_blocked = BLOCK_EVENING_ENTRIES and (dtime(EVENING_BLOCK_START_HOUR_UTC, 0) <= t < dtime(EVENING_BLOCK_END_HOUR_UTC, 0))
 
         if is_london_killzone:
             session_name = "London Open Killzone"
@@ -64,8 +73,11 @@ class SessionManager:
         elif dtime(10, 0) < t < dtime(12, 0):
             session_name = "London Continuation"
             is_active_killzone = False
-        elif dtime(15, 0) < t <= dtime(20, 0):
+        elif dtime(15, 0) < t <= dtime(17, 0):
             session_name = "New York Afternoon"
+            is_active_killzone = False
+        elif dtime(17, 0) < t <= dtime(20, 0):
+            session_name = "New York Late / Evening"
             is_active_killzone = False
         elif is_asian_session:
             session_name = "Asian Session"
@@ -77,6 +89,8 @@ class SessionManager:
         return {
             "session_name": session_name,
             "is_killzone": is_active_killzone,
+            "is_rollover": is_rollover,
+            "is_evening_blocked": is_evening_blocked,
             "time_utc": dt.strftime("%H:%M UTC"),
         }
 

@@ -134,16 +134,17 @@ PROP_MAX_SAME_CURRENCY_TRADES = int(os.getenv("PROP_MAX_SAME_CURRENCY_TRADES", "
 PROP_ENFORCE_NEWS_FILTER = os.getenv("PROP_ENFORCE_NEWS_FILTER", "True").lower() in ("true", "1")
 
 # ==========================================
-# SCALABLE RISK & TIGHT SL MANAGEMENT
+# SCALABLE RISK & SL MANAGEMENT
 # ==========================================
 # Ciasny SL oparty na świecy reakcyjnej i strefie OTE / EMA 10/21
 TIGHT_SL_MODE = os.getenv("TIGHT_SL_MODE", "True").lower() in ("true", "1")
 # Dopuszczalne odchylenie ryzyka % przy zaokrągleniu do min. lota 0.01 (1.35 = max +35% ponad cel %)
 MAX_RISK_DEVIATION_TOLERANCE = float(os.getenv("MAX_RISK_DEVIATION_TOLERANCE", "1.35"))
-# Automatyczne przestawianie na Break-Even po osiągnięciu zysku +1.0R
+# Automatyczne przestawianie na Break-Even po osiągnięciu zysku (domyślnie +0.85R zamiast sztywnego 1.0R)
 AUTO_BE_AT_1R = os.getenv("AUTO_BE_AT_1R", "True").lower() in ("true", "1")
-# Dodatkowy bufor w pipsach dodawany do Break-Even w stronę zysku (np. +1.0 pips), aby pokryć prowizje brokera i spread
-AUTO_BE_OFFSET_PIPS = float(os.getenv("AUTO_BE_OFFSET_PIPS", "1.0"))
+AUTO_BE_R_TRIGGER = float(os.getenv("AUTO_BE_R_TRIGGER", "0.85"))
+# Dodatkowy bufor w pipsach dodawany do Break-Even w stronę zysku (np. +0.2 pips na pokrycie prowizji, bez wybijania retestu)
+AUTO_BE_OFFSET_PIPS = float(os.getenv("AUTO_BE_OFFSET_PIPS", "0.2"))
 # Uwzględnianie spreadu brokera przy kalkulacji Stop Lossa (oddalenie SL o spread)
 ADD_SPREAD_TO_SL = os.getenv("ADD_SPREAD_TO_SL", "True").lower() in ("true", "1")
 # Domyślny spread w pipsach, jeśli MT5 nie zwróci danych
@@ -155,6 +156,21 @@ SL_CALCULATION_MODE = os.getenv("SL_CALCULATION_MODE", "HYBRID").upper()
 SL_ATR_MULTIPLIER = float(os.getenv("SL_ATR_MULTIPLIER", "1.5"))
 # Minimalny bufor ATR dla trybu HYBRID (np. 0.8 * ATR(14))
 SL_HYBRID_MIN_ATR_MULT = float(os.getenv("SL_HYBRID_MIN_ATR_MULT", "0.8"))
+
+# Twarde minimalne progi odległości Stop Loss (ochrona przed mikro-stopami poniżej szumu rynkowego)
+MIN_SL_PIPS_FOREX = float(os.getenv("MIN_SL_PIPS_FOREX", "14.0"))       # Standardowe pary walutowe (min 14 pips)
+MIN_SL_PIPS_CROSS_JPY = float(os.getenv("MIN_SL_PIPS_CROSS_JPY", "18.0")) # Pary z JPY (min 18 pips)
+MIN_SL_PIPS_GBP = float(os.getenv("MIN_SL_PIPS_GBP", "20.0"))           # Zmienne pary z GBP (min 20 pips)
+MIN_SL_PIPS_GOLD = float(os.getenv("MIN_SL_PIPS_GOLD", "300.0"))        # Złoto XAUUSD (300 pips = $30.00)
+
+# Potwierdzenie świecowe wejścia (Rejection Candle Filter)
+REQUIRE_REJECTION_CANDLE = os.getenv("REQUIRE_REJECTION_CANDLE", "True").lower() in ("true", "1")
+REJECTION_WICK_MIN_RATIO = float(os.getenv("REJECTION_WICK_MIN_RATIO", "0.25")) # Min. 25% knot odrzucenia lub świeca w kierunku setupu
+
+# Blokada wejść wieczornych (sesja New York PM i spadek płynności 17:00-23:00 UTC)
+BLOCK_EVENING_ENTRIES = os.getenv("BLOCK_EVENING_ENTRIES", "True").lower() in ("true", "1")
+EVENING_BLOCK_START_HOUR_UTC = int(os.getenv("EVENING_BLOCK_START_HOUR_UTC", "17")) # 17:00 UTC = 18:00 CET
+EVENING_BLOCK_END_HOUR_UTC = int(os.getenv("EVENING_BLOCK_END_HOUR_UTC", "23"))   # 23:00 UTC = 00:00 CET / 01:00 MT5
 
 # ==========================================
 # ANTI-SPAM & ALERT COOLDOWN SETTINGS
