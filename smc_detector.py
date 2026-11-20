@@ -527,6 +527,7 @@ class SMCDetector:
 
             # Check 1: Freshness (Breakout must have occurred within max_structure_age_bars)
             bars_since_break = current_bar_idx - broken_idx
+            structure_age = bars_since_break
             if bars_since_break > max_structure_age_bars or bars_since_break < 0:
                 logger.debug(f"{symbol} {dir_str} {event_name} pominięty: zbyt stary ({bars_since_break} bars > {max_structure_age_bars}).")
                 continue

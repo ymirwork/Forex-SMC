@@ -428,6 +428,43 @@ class TestSignalGuards(unittest.TestCase):
         self.assertEqual(setup.confluence_score, 100)
         self.assertEqual(setup.grade, "A+")
 
+    def test_scan_for_setups_structure_age_defined(self):
+        """Verify scan_for_setups does not crash with NameError for structure_age when evaluating breakout."""
+        from unittest.mock import MagicMock, patch
+        detector = SMCDetector()
+        detector.news_filter.check_news = MagicMock(return_value=(False, None, []))
+
+        dates = pd.date_range(end=datetime(2026, 11, 20, 10, 0), periods=50, freq="15min")
+        df_ltf = pd.DataFrame({
+            "time": dates,
+            "open": np.linspace(1.1000, 1.1050, 50),
+            "high": np.linspace(1.1010, 1.1060, 50),
+            "low": np.linspace(1.0990, 1.1040, 50),
+            "close": np.linspace(1.1005, 1.1055, 50),
+        })
+
+        # Mock bos_choch_ltf with a valid CHoCH event
+        mock_bos_choch = pd.DataFrame({
+            "CHOCH": [np.nan] * 45 + [1.0] + [np.nan] * 4,
+            "BOS": [np.nan] * 50,
+            "BrokenIndex": [0] * 45 + [45] + [0] * 4,
+            "Level": [1.1030] * 50,
+        })
+        mock_swings = pd.DataFrame({
+            "HighLow": [0] * 50,
+            "Level": [1.1000] * 50,
+        })
+
+        import smc_detector as smc_mod
+        with patch.object(smc_mod.smc, "swing_highs_lows", return_value=mock_swings), \
+             patch.object(smc_mod.smc, "bos_choch", return_value=mock_bos_choch):
+            # Should run smoothly without raising NameError: name 'structure_age' is not defined
+            try:
+                setups = detector.scan_for_setups("EURUSD", df_ltf)
+                self.assertIsInstance(setups, list)
+            except NameError as e:
+                self.fail(f"scan_for_setups raised NameError: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()
