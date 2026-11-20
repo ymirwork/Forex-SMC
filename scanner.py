@@ -9,6 +9,7 @@ import pandas as pd
 
 from chart_generator import ChartGenerator
 from config import (
+    ADAPTIVE_M15_TRAILING,
     ADD_SPREAD_TO_SL,
     ALERT_COOLDOWN_MINUTES,
     AUTO_BE_AT_1R,
@@ -62,6 +63,7 @@ from smc_detector import SMCDetector, TradeSetup
 from trade_journal import TradeJournal
 from zumiko_detector import ZumikoDetector
 from trade_insights import TradeInsightEngine
+from adaptive_manager import AdaptivePositionManager, MarketRegime
 
 logger = logging.getLogger("ForexSMC.Scanner")
 
@@ -131,6 +133,10 @@ class SMCScanner:
         self._htf_cache: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
         self.notion = NotionJournal()
         self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
+        self.adaptive_manager = AdaptivePositionManager(journal=self.journal, mt5_client=self.mt5_client)
+        self._trailed_sl_levels: Dict[int, float] = {}
+        self._shadow_reported_be: Set[int] = set()
+        self._shadow_reported_trail: Dict[int, float] = {}
         self._cleanup_old_charts(max_days=3)
 
     def _cleanup_old_charts(self, max_days: int = 3):
@@ -348,11 +354,18 @@ class SMCScanner:
                 comment_str = f"{status_desc} | Zysk: {profit:+.2f} USD | Max R: {max_r:.2f}R"
                 self._be_moved_tickets.discard(ticket)
                 self._shielded_trades.pop(ticket, None)
+                self._trailed_sl_levels.pop(ticket, None)
+                self._shadow_reported_be.discard(ticket)
+                self._shadow_reported_trail.pop(ticket, None)
                 self.journal.close_trade_by_ticket(ticket, realized_r, max_r=max_r, status=status, comment=comment_str)
 
                 # Record close-time telemetry
                 exit_r = "TP" if status == "WIN" else ("SL" if status == "LOSS" else "BE")
                 self.journal.update_trade_close_telemetry(ticket, exit_reason=exit_r, mae_r=0.0)
+
+                # Note winning trade for subsequent counterfactual MFE backfill
+                if status == "WIN":
+                    logger.debug(f"Trade #{ticket} marked for counterfactual MFE evaluation once post-close candles form.")
 
                 # Update trade result in Notion database
                 if self.notion.enabled:
@@ -422,42 +435,103 @@ class SMCScanner:
                 if current_mfe > prev_max:
                     self.journal.update_trade_max_r(ticket, current_mfe)
 
-            # Auto Break-Even Assistant (Locks 0 risk when trade reaches configured R, e.g. +0.85R)
-            if AUTO_BE_AT_1R:
-                if ticket in self._be_moved_tickets or ticket in self._shielded_trades:
-                    continue
+            # If SL is already moved to BE or into profit
+            is_already_be = self.mt5_client.is_position_at_be(
+                entry=entry_p,
+                sl=sl_p,
+                is_buy=is_buy,
+                initial_sl_dist=initial_sl_dist,
+                tolerance_ratio=0.15,
+            )
+            if is_already_be:
+                self._be_moved_tickets.add(ticket)
 
-                # If SL is already moved to BE or into profit
-                is_already_be = self.mt5_client.is_position_at_be(
-                    entry=entry_p,
-                    sl=sl_p,
-                    is_buy=is_buy,
-                    initial_sl_dist=initial_sl_dist,
-                    tolerance_ratio=0.15,
-                )
-                if is_already_be:
-                    self._be_moved_tickets.add(ticket)
-                    continue
+            # Auto / Adaptive Break-Even Assistant (Locks 0 risk when trade reaches configured R)
+            if AUTO_BE_AT_1R and (ticket not in self._be_moved_tickets) and (ticket not in self._shielded_trades):
+                # Determine regime and dynamic BE trigger
+                trade_regime_str = (journal_trade.get("regime") if journal_trade else "") or "COMPRESSION"
+                try:
+                    regime_enum = MarketRegime(trade_regime_str)
+                except ValueError:
+                    regime_enum = MarketRegime.COMPRESSION
+
+                be_r_target = AUTO_BE_R_TRIGGER
+                if self.adaptive_manager.enabled:
+                    adaptive_be = self.adaptive_manager.get_dynamic_be_trigger(regime_enum)
+                    if self.adaptive_manager.mode == "LIVE":
+                        be_r_target = adaptive_be
+                    elif self.adaptive_manager.mode == "SHADOW":
+                        # Log shadow BE evaluation if reached (deduplicated per trade)
+                        favorable_m = (curr_p - entry_p) if is_buy else (entry_p - curr_p)
+                        curr_mfe_val = current_mfe if current_mfe is not None else (favorable_m / initial_sl_dist if initial_sl_dist > 0 else 0.0)
+                        if curr_mfe_val >= adaptive_be and ticket not in self._shadow_reported_be:
+                            self._shadow_reported_be.add(ticket)
+                            self.adaptive_manager.log_shadow_action(
+                                ticket, "DYNAMIC_BE_QUALIFIED", f"Reżim: {regime_enum.value}, Trigger: +{adaptive_be:.2f}R (Live BE: +{AUTO_BE_R_TRIGGER:.2f}R)"
+                            )
 
                 favorable_move = (curr_p - entry_p) if is_buy else (entry_p - curr_p)
-                trigger_dist = initial_sl_dist * AUTO_BE_R_TRIGGER
+                trigger_dist = initial_sl_dist * be_r_target
                 current_trade_mfe = current_mfe if current_mfe is not None else (favorable_move / initial_sl_dist if initial_sl_dist > 0 else 0.0)
 
-                # If market moved >= AUTO_BE_R_TRIGGER (e.g. 0.85R) in favor of trade (checked via live tick or MFE)
-                if favorable_move >= trigger_dist or current_trade_mfe >= AUTO_BE_R_TRIGGER:
+                # If market moved >= be_r_target in favor of trade (checked via live tick or MFE)
+                if favorable_move >= trigger_dist or current_trade_mfe >= be_r_target:
                     ok, msg = self.mt5_client.move_sl_to_breakeven(ticket, offset_pips=AUTO_BE_OFFSET_PIPS)
                     if ok:
                         self._be_moved_tickets.add(ticket)
+                        is_already_be = True
                         if self.telegram:
                             offset_txt = f" +{AUTO_BE_OFFSET_PIPS:.1f} pips na pokrycie kosztów" if AUTO_BE_OFFSET_PIPS > 0 else ""
                             alert_msg = (
-                                f"⚡ **AUTO BREAK-EVEN (+{AUTO_BE_R_TRIGGER:.2f}R)!**\n\n"
+                                f"⚡ **AUTO BREAK-EVEN (+{be_r_target:.2f}R)!**\n\n"
                                 f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
-                                f"📈 Aktualny zysk: `+{pnl:.2f} USD` (Osiągnięto +{AUTO_BE_R_TRIGGER:.2f}R!)\n"
+                                f"📈 Aktualny zysk: `+{pnl:.2f} USD` (Osiągnięto +{be_r_target:.2f}R!)\n"
                                 f"🛡️ **Stop Loss przestawiony na wejście{offset_txt}!**\n"
                                 f"🔒 Pozycja jest w 100% bezpieczna (Guaranteed Profit / Risk-Free)."
                             )
                             await self.telegram.send_message(alert_msg)
+
+            # 3b. Adaptive Structural Trailing SL (Locks further profit behind M15 protected swings)
+            if self.adaptive_manager.enabled and ADAPTIVE_M15_TRAILING and is_already_be:
+                if ticket not in self._shielded_trades:
+                    swing_price, atr_m15, point_scale = self.smc_detector.get_latest_m15_swing(p["symbol"], is_buy)
+                    if swing_price > 0:
+                        stops_pts = self.mt5_client.get_symbol_stops_level(p["symbol"])
+                        spread_live = self.mt5_client.get_symbol_spread(p["symbol"])
+                        should_trail, new_sl, trail_reason = self.adaptive_manager.evaluate_m15_trailing_sl(
+                            symbol=p["symbol"],
+                            is_buy=is_buy,
+                            current_sl=sl_p,
+                            current_price=curr_p,
+                            entry_price=entry_p,
+                            initial_sl_dist=initial_sl_dist,
+                            m15_swing_price=swing_price,
+                            atr_m15=atr_m15,
+                            stops_level_points=stops_pts,
+                            point_scale=point_scale,
+                            spread=spread_live,
+                        )
+                        if should_trail:
+                            if self.adaptive_manager.mode == "SHADOW":
+                                last_reported = self._shadow_reported_trail.get(ticket, 0.0)
+                                if abs(new_sl - last_reported) > (point_scale * 2):
+                                    self._shadow_reported_trail[ticket] = new_sl
+                                    self.adaptive_manager.log_shadow_action(
+                                        ticket, "STRUCTURAL_TRAILING_SL", f"Proponowany SL: {new_sl} ({trail_reason})"
+                                    )
+                            elif self.adaptive_manager.mode == "LIVE":
+                                last_trailed = self._trailed_sl_levels.get(ticket, 0.0)
+                                if abs(new_sl - last_trailed) > (point_scale * 2):
+                                    ok, mod_msg = self.mt5_client.modify_position_sl(ticket, new_sl)
+                                    if ok:
+                                        self._trailed_sl_levels[ticket] = new_sl
+                                        if self.telegram:
+                                            await self.telegram.send_message(
+                                                f"📈 **STRUKTURALNY TRAILING SL (M15)!**\n\n"
+                                                f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
+                                                f"🛡️ **SL przesunięty na `{new_sl}`**\n"
+                                                f"🔒 {trail_reason} (Ochrona zysku za strukturą M15)."
+                                            )
 
         # 4. Rollover SL Shield (Protects tight SL and BE trades during rollover spread spike)
         await self._handle_rollover_sl_shield(open_positions)
@@ -691,6 +765,24 @@ class SMCScanner:
             pyramid_status = self.mt5_client.get_pyramid_status(sym) if ENABLE_PYRAMIDING else {"is_eligible": False}
             is_pyramid = pyramid_status.get("is_eligible", False)
 
+            # Adaptive Pyramiding Filter: strictly require STRONG_TREND regime
+            if is_pyramid and self.adaptive_manager.enabled:
+                base_ticket = pyramid_status.get("base_ticket")
+                base_trade = self.journal.get_trade_by_ticket(base_ticket) if base_ticket else None
+                base_regime_str = (base_trade.get("regime") if base_trade else "") or "COMPRESSION"
+                try:
+                    base_regime = MarketRegime(base_regime_str)
+                except ValueError:
+                    base_regime = MarketRegime.COMPRESSION
+
+                if not self.adaptive_manager.can_pyramid(base_regime):
+                    logger.info(
+                        f"🛡️ [ADAPTIVE PYRAMID FILTER] {sym}: Reżim pozycji bazowej [{base_regime.value}] "
+                        f"nie dopuszcza piramidowania (wymagany STRONG_TREND)."
+                    )
+                    is_pyramid = False
+                    pyramid_status["is_eligible"] = False
+
             # Active Position Lock: Skip symbol if it currently has an open position and is NOT eligible for pyramiding
             if sym.upper() in busy_symbols and not is_pyramid:
                 logger.info(f"🔒 [SYMBOL LOCK] {sym} posiada aktywną pozycję/zlecenie w MT5. Pomijam skanowanie do czasu zamknięcia.")
@@ -893,6 +985,7 @@ class SMCScanner:
         logger.info(f"SMC & Zumiko Multi-Strategy Scanner loop started. Interval: {SCAN_INTERVAL_SECONDS}s")
 
         last_scan_time = 0.0
+        last_cf_backfill_time = 0.0
 
         while self.is_running:
             now = time.time()
@@ -909,6 +1002,16 @@ class SMCScanner:
                     last_scan_time = now
                 except Exception as e:
                     logger.error(f"Error during scan_once: {e}", exc_info=True)
+
+            # Periodic counterfactual MFE backfill every 1800s (30m)
+            if (now - last_cf_backfill_time) >= 1800.0:
+                last_cf_backfill_time = now
+                try:
+                    updated_cnt = self.journal.backfill_counterfactual_mfe(self.mt5_client)
+                    if updated_cnt > 0:
+                        logger.info(f"📈 Zaktualizowano kontrfaktyczne MFE dla {updated_cnt} zamkniętych transakcji.")
+                except Exception as cf_err:
+                    logger.debug(f"Błąd okresowego backfillu MFE: {cf_err}")
 
             await asyncio.sleep(TRADE_MONITOR_INTERVAL_SECONDS)
 

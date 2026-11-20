@@ -174,7 +174,8 @@ class TelegramBotManager:
             "• `/notionsync` - Synchronizacja dziennika z Notion Database\n"
             "• `/optimizer` - Optymalizator BEST RR (szukanie idealnego Take Profit)\n"
             "• `/addtrade` - Ręczne dodanie zagrania do dziennika\n"
-            "• `/insights` - Analiza słabych stron i mocnych zagra ń (Edge Report)\n"
+            "• `/insights` - Analiza słabych stron i mocnych zagrań (Edge Report)\n"
+            "• `/adaptive` - Silnik adaptacyjny (reżimy rynku, dynamiczny BE i trailing)\n"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -390,6 +391,39 @@ class TelegramBotManager:
             RROptimizer.calculate_best_rr(trades)
         )
         await update.message.reply_text(report_msg, parse_mode="Markdown")
+
+    async def adaptive_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Displays status and statistics of Adaptive Position Management engine."""
+        if not self._is_authorized(update):
+            return
+
+        from config import (
+            ENABLE_ADAPTIVE_MANAGER,
+            ADAPTIVE_MODE,
+            ADAPTIVE_MIN_REGIME_SAMPLES,
+            ADAPTIVE_M15_TRAILING,
+            ADAPTIVE_BE_TREND_R,
+            ADAPTIVE_BE_CHOP_R,
+            ADAPTIVE_BE_VOLATILE_R,
+        )
+
+        all_trades = self.journal.get_all_trades()
+        trend_trades = [t for t in all_trades if str(t.get("regime", "")).upper() == "STRONG_TREND"]
+        chop_trades = [t for t in all_trades if str(t.get("regime", "")).upper() == "COMPRESSION"]
+        vol_trades = [t for t in all_trades if str(t.get("regime", "")).upper() == "HIGH_VOLATILITY"]
+
+        msg = (
+            f"🧠 **ADAPTIVE POSITION MANAGER**\n\n"
+            f"⚙️ **Status modułu:** `{'WŁĄCZONY' if ENABLE_ADAPTIVE_MANAGER else 'WYŁĄCZONY'}`\n"
+            f"🎯 **Tryb egzekucji:** `{ADAPTIVE_MODE}` ({'Modyfikacja MT5 aktywna' if ADAPTIVE_MODE == 'LIVE' else 'Telemetria bez dotykania zleceń'})\n"
+            f"📐 **M15 Trailing SL:** `{'WŁĄCZONY' if ADAPTIVE_M15_TRAILING else 'WYŁĄCZONY'}`\n\n"
+            f"📊 **Parametry Reżimów Rynkowych:**\n"
+            f"• 🟢 **STRONG_TREND:** BE: `+{ADAPTIVE_BE_TREND_R:.2f}R` | Próba w bazie: `{len(trend_trades)}/{ADAPTIVE_MIN_REGIME_SAMPLES}` | Piramida: `DOZWOLONA`\n"
+            f"• 🟡 **COMPRESSION:** BE: `+{ADAPTIVE_BE_CHOP_R:.2f}R` | Próba w bazie: `{len(chop_trades)}/{ADAPTIVE_MIN_REGIME_SAMPLES}` | Piramida: `ZABLOKOWANA`\n"
+            f"• 🔴 **HIGH_VOLATILITY:** BE: `+{ADAPTIVE_BE_VOLATILE_R:.2f}R` | Próba w bazie: `{len(vol_trades)}/{ADAPTIVE_MIN_REGIME_SAMPLES}` | Piramida: `ZABLOKOWANA`\n\n"
+            f"💡 *Gdy próbka w reżimie osiągnie {ADAPTIVE_MIN_REGIME_SAMPLES} zagrań, Take Profit jest optymalizowany automatycznie pod kątem najwyższego EV.*"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def addtrade_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Allows manual addition of trades from phone: /addtrade XAUUSD BUY YES 1.0 2.8"""
@@ -693,6 +727,7 @@ class TelegramBotManager:
                     strategy=strat_name_db,
                     setup_type=setup.setup_type,
                     grade=grade_val,
+                    regime=getattr(setup, "regime", ""),
                 )
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
@@ -757,6 +792,7 @@ class TelegramBotManager:
                     strategy=strat_name_db,
                     setup_type=setup.setup_type,
                     grade=grade_val,
+                    regime=getattr(setup, "regime", ""),
                 )
                 asyncio.create_task(self._log_trade_to_notion({
                     "symbol": setup.symbol,
@@ -827,6 +863,12 @@ class TelegramBotManager:
         grade_emoji = "🔥 [Grade A+ Setup]" if setup.grade == "A+" else "⭐ [Grade A Setup]"
         rr_badge = "🔥 [Best RR]" if setup.is_optimal_rr else "⚙️ [Domyślne]"
         rr_src = f"\n💡 `{setup.rr_source_info}`" if setup.rr_source_info else ""
+
+        regime_badge = ""
+        setup_regime = getattr(setup, "regime", "")
+        if setup_regime:
+            setup_be = getattr(setup, "dynamic_be_trigger", 0.85)
+            regime_badge = f"🧠 **Reżim rynkowy:** `[{setup_regime}]` (Dynamic BE: `+{setup_be:.2f}R`)\n"
 
         # Prop Firm metrics for alert
         risk_pct = PROP_RISK_PER_TRADE_PERCENT if PROP_FIRM_MODE else DEFAULT_RISK_PERCENT
@@ -910,6 +952,7 @@ class TelegramBotManager:
             f"{edge_warning_text}"
             f"📊 **Kierunek:** {dir_emoji}\n"
             f"⏱ **Interwał:** `{setup.timeframe}` (H4: **{setup.htf_trend}**) | {session_badge}\n"
+            f"{regime_badge}"
             f"🎯 **Strategia:** `{setup.setup_type}`\n\n"
             f"{mtf_text}"
             f"{zumiko_text}"
@@ -1110,6 +1153,7 @@ class TelegramBotManager:
         self.app.add_handler(CommandHandler("bestrr", self.optimizer_cmd))
         self.app.add_handler(CommandHandler("addtrade", self.addtrade_cmd))
         self.app.add_handler(CommandHandler("insights", self.insights_cmd))
+        self.app.add_handler(CommandHandler("adaptive", self.adaptive_cmd))
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
         return self.app

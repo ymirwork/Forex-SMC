@@ -71,6 +71,7 @@ System zaprojektowany jest w architekturze modułowej o wyraźnie rozdzielonych 
 | **`chart_generator.py`** | Generator wykresów świecowych w stylu Dark Mode (mplfinance). Rysuje świece, strefy OB/FVG, linie Fibo OTE, EMA Zumiko, poziomy płynności, Entry, SL, TP1, TP2. | `ChartGenerator` | Logika decyzyjna tradingu. |
 | **`trade_journal.py`** | Dziennik transakcji w SQLite (`trades.db`). Rejestracja zagrań, statusów, PnL, R-wielokrotności, ochrona przed uszkodzeniem bazy (WAL, autorecovery, reindex). | `TradeJournal`, dekorator `_auto_recover_on_corruption` | Bezpośrednie wywołania graficzne. |
 | **`trade_insights.py`** | Silnik statystyczny badający przewagę (Edge). Analizuje Win Rate i EV w podziale na sesje, symbole, strategie; dynamicznie rekomenduje redukcję ryzyka dla słabych par. | `TradeInsightEngine`, `EdgeMetrics` | Edycja zleceń w MT5. |
+| **`adaptive_manager.py`** | Silnik adaptacyjnego zarządzania pozycjami: klasyfikacja reżimów rynkowych (STRONG_TREND, COMPRESSION, HIGH_VOLATILITY), dynamiczny próg Break-Even, strukturalny trailing SL (M15 Swing) oraz filtr piramidowania. | `AdaptivePositionManager`, `MarketRegime` | Bezpośrednie rysowanie wykresów. |
 | **`rr_optimizer.py`** | Optymalizator Best RR oparty na symulacji Maximum Favorable Excursion (MFE). Oblicza matematycznie optymalny Take Profit. | `RROptimizer`, `RROptimizerResult` | Komunikacja sieciowa. |
 | **`session_manager.py`** | Śledzenie sesji giełdowych (Azja, Londyn, Nowy Jork AM/PM, Rollover), Killzones oraz wyznaczanie ekstremów sesji azjatyckiej (Asian Range High/Low). | `SessionManager`, `get_broker_utc_offset()` | Pobieranie notowań z zewnętrznych API. |
 | **`news_filter.py`** | Filtr kalendarza makroekonomicznego (ForexFactory). Wykrywanie wiadomości High-Impact (czerwone teczki) w oknie czasowym +/- 45 min. | `NewsFilter`, `EconomicEvent` | Modyfikacja bazy SQLite. |
@@ -253,3 +254,44 @@ Przed wdrożeniem jakiejkolwiek zmiany w kodzie:
 3. W przypadku modyfikacji bazy danych lub struktury `TradeSetup`:
    - Zaktualizuj schemat tabeli w `trade_journal.py` oraz mapowanie pól w `notion_journal.py`.
    - Zaktualizuj testy w `tests/test_core.py` oraz `tests/test_journal_recovery.py`.
+
+---
+
+## 10. Standard Konfiguracji i Samodokumentacji Pliku `.env.example`
+
+Każda zmiana, rozszerzenie lub dodanie nowej zmiennej konfiguracyjnej w projekcie (w `config.py` oraz `.env`) bezwzględnie wymaga zaktualizowania pliku referencyjnego `.env.example` zgodnie z poniższym standardem.
+
+### 10.1. Obowiązkowy Komentarz dla Każdej Zmiennej
+> [!IMPORTANT]
+> **ZAKAZ DODAWANIA ZMIENNYCH BEZ WYJAŚNIENIA!**
+> Przy dopisywaniu lub modyfikacji jakiejkolwiek flagi/parametru w `.env.example` **każda zmienna musi posiadać jednoznaczny komentarz wyjaśniający** (inline `# ...` lub tuż nad zmienną), opisujący:
+> 1. **Co dokładnie robi dany parametr** i jaki ma wpływ na trading / logikę bota.
+> 2. **Dopuszczalne wartości i jednostki** (np. `True/False`, pipsy, sekundy, mnożnik ATR, wielokrotność R).
+> 3. **Domyślne lub rekomendowane zachowanie**.
+
+### 10.2. Wzorzec Formatowania
+Format zapisu w pliku `.env.example`:
+```env
+# Przykład 1: Flagi logiczne (True/False)
+USE_OPTIMAL_RR=True # Uzywanie optymalnego RR (Take Profit wyliczany automatycznie z MFE w trades.db)
+
+# Przykład 2: Limity i progi liczbowe
+MIN_TRADES_FOR_OPTIMAL_RR=30 # Minimalna liczba transakcji w bazie przed aktywacją Best RR
+PROP_MAX_DRAWDOWN_PERCENT=10.0 # Maksymalny statyczny drawdown konta w % (wymóg Prop Firm)
+
+# Przykład 3: Tryby działania
+SL_CALCULATION_MODE=HYBRID # Tryb wyliczania Stop Lossa: HYBRID (struktura + bufor ATR), STRUCTURE lub ATR
+```
+
+### 10.3. Cel Biznesowy: "Year-Later Readiness" (Gotowość na powrót po roku)
+Zasada ta ma kluczowe znaczenie długoterminowe:
+- Gdy trader lub programista wróci do repozytorium np. **za rok**, natychmiast wie, do czego służy każda linijka w pliku konfiguracyjnym, bez potrzeby przekopywania kodu źródłowego w `config.py` czy czytania commitów.
+- Zapewnia pojedyncze, przejrzyste źródło prawdy konfiguracyjnej dla osób wdrażających bota na nowym serwerze VPS.
+
+### 10.4. Obowiązkowa Równoległa Synchronizacja z `.env`
+> [!IMPORTANT]
+> **ZASADA NATYCHMIASTOWEJ SYNCHRONIZACJI Z PLIKIEM `.env`!**
+> Jeśli jakakolwiek nowa zmienna zostaje dopisana do `.env.example`, **musi zostać natychmiast dopisana również do lokalnego pliku `.env`**, aby konfiguracja była zawsze w 100% na bieżąco.
+> - **Ochrona sekretów tradera:** Przy dopisywaniu zmiennych do `.env` pod żadnym pozorem nie wolno nadpisywać ani kasować istniejących kluczy (np. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `NOTION_API_KEY`, niestandardowych list `SYMBOLS`).
+> - Nowo dodawane parametry w `.env` otrzymują bezpieczne wartości domyślne (fallback) oraz ten sam czytelny komentarz wyjaśniający ich rolę.
+> - Dzięki temu aktywne środowisko bota od razu widzi nowe funkcje bez konieczności ręcznego porównywania i przepisywania parametrów przez tradera.

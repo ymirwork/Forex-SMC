@@ -16,6 +16,7 @@ class RROptimizerResult:
     best_winrate: float
     best_profit_factor: float
     simulation_table: pd.DataFrame
+    best_ev: float = 0.0
 
 
 class RROptimizer:
@@ -32,11 +33,14 @@ class RROptimizer:
         use_optimal_rr: bool = True,
         min_trades: Optional[int] = None,
         min_floor_rr: Optional[float] = None,
+        regime: Optional[str] = None,
+        be_trigger_r: float = 0.85,
     ) -> Tuple[float, bool, str]:
         """
         Determines the target Risk:Reward dynamically:
-        If enough trades exist (>= min_trades), uses mathematically
-        optimized BEST RR from the journal. Otherwise falls back to default_rr.
+        1. If regime is provided and enough regime trades exist, uses regime-optimized BEST RR.
+        2. Otherwise falls back to global BEST RR if enough total trades exist.
+        3. Otherwise falls back to default_rr.
         Guarantees that optimal RR is never below min_floor_rr (default: 2.0).
         """
         required_trades = min_trades if min_trades is not None else MIN_TRADES_FOR_OPTIMAL_RR
@@ -44,13 +48,31 @@ class RROptimizer:
 
         if use_optimal_rr and journal is not None:
             trades = [t for t in journal.get_all_trades() if t.get("status") in ("CLOSED", "WIN", "LOSS", "BE")]
+
+            # 1. Try regime-specific optimization first if regime provided
+            if regime:
+                reg_res = RROptimizer.calculate_regime_rr(
+                    trades,
+                    regime=regime,
+                    min_rr=floor_rr,
+                    be_trigger_r=be_trigger_r,
+                    min_trades=min_trades if min_trades is not None else 10,
+                )
+                if reg_res and reg_res.best_rr >= floor_rr:
+                    return (
+                        reg_res.best_rr,
+                        True,
+                        f"Zoptymalizowany Best RR dla reżimu [{regime.upper()}] (1:{reg_res.best_rr:.1f} z {reg_res.total_trades} zagrań, EV: {reg_res.best_ev:+.2f}R)",
+                    )
+
+            # 2. Global optimization fallback
             if len(trades) >= required_trades:
-                opt_res = RROptimizer.calculate_best_rr(trades, min_rr=floor_rr)
+                opt_res = RROptimizer.calculate_best_rr(trades, min_rr=floor_rr, be_trigger_r=be_trigger_r)
                 if opt_res and opt_res.best_rr >= floor_rr:
                     return (
                         opt_res.best_rr,
                         True,
-                        f"Zoptymalizowany Best RR (1:{opt_res.best_rr:.1f} z {len(trades)} zagrań)",
+                        f"Zoptymalizowany Best RR (1:{opt_res.best_rr:.1f} z {len(trades)} zagrań, EV: {opt_res.best_ev:+.2f}R)",
                     )
         return (
             default_rr,
@@ -59,15 +81,50 @@ class RROptimizer:
         )
 
     @staticmethod
+    def calculate_regime_rr(
+        trades: List[Dict],
+        regime: str,
+        min_rr: float = OPTIMAL_RR_MIN_FLOOR,
+        max_rr: float = 6.0,
+        step: float = 0.1,
+        be_trigger_r: float = 0.85,
+        min_trades: int = 10,
+    ) -> Optional[RROptimizerResult]:
+        """
+        Calculates optimal RR specifically for a market regime (STRONG_TREND, COMPRESSION, HIGH_VOLATILITY).
+        Requires at least min_trades in that regime.
+        """
+        if not trades or not regime:
+            return None
+        regime_upper = regime.upper().strip()
+        regime_trades = [
+            t for t in trades
+            if str(t.get("regime", "")).upper().strip() == regime_upper
+        ]
+        if len(regime_trades) < min_trades:
+            return None
+        return RROptimizer.calculate_best_rr(
+            regime_trades,
+            min_rr=min_rr,
+            max_rr=max_rr,
+            step=step,
+            be_trigger_r=be_trigger_r,
+        )
+
+    @staticmethod
     def calculate_best_rr(
         trades: List[Dict],
         min_rr: float = OPTIMAL_RR_MIN_FLOOR,
         max_rr: float = 8.0,
         step: float = 0.1,
+        be_trigger_r: float = 0.85,
     ) -> Optional[RROptimizerResult]:
         """
         Runs counter-factual simulation across candidate RR targets from min_rr to max_rr.
-        Each trade dict must have: 'max_r' (float), and optionally 'realized_r' (float).
+        Uses multi-outcome empirical simulation:
+        - If peak MFE >= target_rr: WIN (+target_rr)
+        - If peak MFE < target_rr, but >= be_trigger_r: BREAK-EVEN (0.0R, defended, no dollar loss)
+        - If peak MFE < be_trigger_r: LOSS (-1.0R, stopped out at initial SL)
         """
         if not trades:
             return None
@@ -94,29 +151,36 @@ class RROptimizer:
             target_rr = round(curr_rr, 1)
 
             sim_wins = 0
+            sim_bes = 0
             sim_losses = 0
 
             for t in trades:
-                max_r = float(t.get("max_r", 0.0))
-                # If market ran at least up to target_rr, target would be hit!
-                if max_r >= target_rr:
+                # Use counterfactual Max R if available, falling back to recorded Max R
+                eff_mfe = max(float(t.get("counterfactual_max_r") or 0.0), float(t.get("max_r") or 0.0))
+                if eff_mfe >= target_rr:
                     sim_wins += 1
+                elif be_trigger_r > 0 and eff_mfe >= be_trigger_r:
+                    # Target not hit, but price passed Break-Even trigger -> protected at BE (0.0R outcome)
+                    sim_bes += 1
                 else:
-                    # Target was not reached, price eventually stopped out at initial SL (-1R)
+                    # Stopped out at initial SL (-1.0R outcome)
                     sim_losses += 1
 
             gross_gain = sim_wins * target_rr
             gross_loss = sim_losses * 1.0
             net_r = round(gross_gain - gross_loss, 2)
+            ev = round(net_r / total_trades, 3) if total_trades > 0 else 0.0
             winrate = round((sim_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
-            pf = round(gross_gain / gross_loss, 2) if gross_loss > 0 else 99.0
+            pf = round(gross_gain / gross_loss, 2) if gross_loss > 0 else (99.0 if gross_gain > 0 else 0.0)
 
             results.append({
                 "target_rr": target_rr,
                 "net_r": net_r,
+                "ev": ev,
                 "winrate": winrate,
                 "profit_factor": pf,
                 "wins": sim_wins,
+                "bes": sim_bes,
                 "losses": sim_losses,
             })
 
@@ -138,6 +202,7 @@ class RROptimizer:
             best_winrate=best_row["winrate"],
             best_profit_factor=best_row["profit_factor"],
             simulation_table=df_sim,
+            best_ev=best_row.get("ev", round(best_row["net_r"] / total_trades, 3)),
         )
 
     @staticmethod

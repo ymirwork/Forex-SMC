@@ -666,6 +666,98 @@ class MT5Client:
 
         return 0.0
 
+    def get_counterfactual_mfe(
+        self,
+        symbol: str,
+        is_buy: bool,
+        entry_price: float,
+        initial_sl_price: float,
+        time_close: int,
+        lookback_hours: int = 24,
+    ) -> float:
+        """
+        Calculates counter-factual excursion (MFE) after a position closed (e.g. at TP).
+        Simulates where the market ran post-close for up to lookback_hours (default 24h),
+        stopping if price would have reversed and hit the initial SL.
+        """
+        if not self.ensure_connection():
+            return 0.0
+
+        risk_dist = abs(entry_price - initial_sl_price)
+        if risk_dist <= 0:
+            return 0.0
+
+        resolved = self.resolve_symbol(symbol)
+        now_ts = int(datetime.now().timestamp())
+        end_time = min(time_close + (lookback_hours * 3600), now_ts)
+        if time_close >= end_time:
+            return 0.0
+
+        rates = mt5.copy_rates_range(resolved, mt5.TIMEFRAME_M5, time_close, end_time)
+        if rates is None or len(rates) == 0:
+            rates = mt5.copy_rates_range(resolved, mt5.TIMEFRAME_M1, time_close, end_time)
+
+        if rates is None or len(rates) == 0:
+            return 0.0
+
+        peak_price = entry_price
+        for r in rates:
+            if is_buy:
+                # If price reversed and hit initial SL, trend excursion ended
+                if float(r["low"]) <= initial_sl_price:
+                    if float(r["high"]) > peak_price:
+                        peak_price = float(r["high"])
+                    break
+                if float(r["high"]) > peak_price:
+                    peak_price = float(r["high"])
+            else:
+                if float(r["high"]) >= initial_sl_price:
+                    if float(r["low"]) < peak_price:
+                        peak_price = float(r["low"])
+                    break
+                if float(r["low"]) < peak_price:
+                    peak_price = float(r["low"])
+
+        if is_buy:
+            favorable_move = max(0.0, peak_price - entry_price)
+        else:
+            favorable_move = max(0.0, entry_price - peak_price)
+
+        return round(favorable_move / risk_dist, 2)
+
+    def get_symbol_stops_level(self, symbol: str) -> float:
+        """
+        Returns the broker's minimum stops_level (in points) for placing/modifying SL and TP.
+        """
+        if not self.ensure_connection():
+            return 0.0
+        resolved = self.resolve_symbol(symbol)
+        sym_info = mt5.symbol_info(resolved)
+        if not sym_info:
+            return 0.0
+        return float(getattr(sym_info, "trade_stops_level", 0) or getattr(sym_info, "stops_level", 0) or 5)
+
+    def calculate_atr_percentile(self, symbol: str, current_atr: float, lookback_days: int = 30) -> float:
+        """
+        Calculates the percentile ranking of current ATR relative to the past lookback_days daily ranges.
+        Returns a float between 0.0 and 100.0. Defaults to 50.0 if data unavailable.
+        """
+        if not self.ensure_connection() or current_atr <= 0:
+            return 50.0
+
+        resolved = self.resolve_symbol(symbol)
+        rates = mt5.copy_rates_from_pos(resolved, mt5.TIMEFRAME_D1, 0, lookback_days + 1)
+        if rates is None or len(rates) < 5:
+            return 50.0
+
+        daily_ranges = [float(r["high"] - r["low"]) for r in rates]
+        if not daily_ranges:
+            return 50.0
+
+        count_below = sum(1 for d in daily_ranges if current_atr >= d)
+        percentile = (count_below / len(daily_ranges)) * 100.0
+        return round(percentile, 1)
+
     @staticmethod
     def get_pip_size(symbol: str) -> float:
         """
@@ -780,29 +872,36 @@ class MT5Client:
             return False, f"Pozycja #{ticket} nie została znaleziona w MT5"
 
         p = pos[0]
-        sym_info = mt5.symbol_info(p.symbol)
+        p_symbol = p["symbol"] if isinstance(p, dict) else getattr(p, "symbol", "")
+        p_ticket = p["ticket"] if isinstance(p, dict) else getattr(p, "ticket", ticket)
+        p_sl = p["sl"] if isinstance(p, dict) else getattr(p, "sl", 0.0)
+        p_tp = p["tp"] if isinstance(p, dict) else getattr(p, "tp", 0.0)
+        p_type = p["type"] if isinstance(p, dict) else getattr(p, "type", 0)
+        p_price_current = p.get("price_current", 0.0) if isinstance(p, dict) else getattr(p, "price_current", 0.0)
+
+        sym_info = mt5.symbol_info(p_symbol)
         if not sym_info:
-            return False, f"Brak danych symbolu {p.symbol}"
+            return False, f"Brak danych symbolu {p_symbol}"
 
         target_sl = round(new_sl, sym_info.digits)
-        if target_sl == p.sl:
+        if target_sl == p_sl:
             return True, f"SL dla #{ticket} jest już na poziomie {target_sl}"
 
         # stops_level safety check
         stops_level = getattr(sym_info, "trade_stops_level", 0) or getattr(sym_info, "stops_level", 0) or 5
         min_dist = (stops_level + 2) * sym_info.point
-        is_buy = p.type == mt5.ORDER_TYPE_BUY
-        if is_buy and (p.price_current - target_sl) < min_dist:
-            return False, f"Target SL {target_sl} zbyt blisko ceny rynkowej ({p.price_current})"
-        elif not is_buy and (target_sl - p.price_current) < min_dist:
-            return False, f"Target SL {target_sl} zbyt blisko ceny rynkowej ({p.price_current})"
+        is_buy = p_type in (mt5.ORDER_TYPE_BUY, 0, "BUY")
+        if is_buy and (p_price_current - target_sl) < min_dist:
+            return False, f"Target SL {target_sl} zbyt blisko ceny rynkowej ({p_price_current})"
+        elif not is_buy and (target_sl - p_price_current) < min_dist:
+            return False, f"Target SL {target_sl} zbyt blisko ceny rynkowej ({p_price_current})"
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
-            "position": p.ticket,
-            "symbol": p.symbol,
+            "position": p_ticket,
+            "symbol": p_symbol,
             "sl": target_sl,
-            "tp": p.tp,
+            "tp": p_tp,
         }
 
         result = mt5.order_send(request)
@@ -813,7 +912,7 @@ class MT5Client:
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return False, f"Modyfikacja SL odrzucona: retcode={result.retcode} ({result.comment})"
 
-        logger.info(f"Stop Loss for #{ticket} ({p.symbol}) successfully set to {target_sl}")
+        logger.info(f"Stop Loss for #{ticket} ({p_symbol}) successfully set to {target_sl}")
         return True, f"SL dla #{ticket} zaktualizowany na {target_sl}"
 
     def close_market_position(self, ticket: int, comment: str = "") -> Tuple[bool, str]:

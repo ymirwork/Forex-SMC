@@ -39,14 +39,18 @@ W systemie wyróżniamy **5 wyspecjalizowanych ról**. Każda zmiana w kodzie mu
 
 ### Rola 1: 🏗️ Core Architect & System Coordinator
 - **Misja:** Strażnik integralności systemu, czystości architektury oraz zasady Single Source of Truth (SSOT).
-- **Obszar plików:** `config.py`, `run.py`, `docs/*`.
+- **Obszar plików:** `config.py`, `run.py`, `docs/*`, `.env.example`, `.env`.
 - **Zadania:**
   - Koordynacja pracy pozostałych agentów i dekompozycja zadań.
   - Pilnowanie, aby parametry biznesowe trafiały do `config.py`, a nie były wpisywane „na sztywno” w kodzie.
+  - Dbanie o pełną samodokumentację `.env.example` — każda dopisywana zmienna musi posiadać komentarz wyjaśniający (np. `USE_OPTIMAL_RR=True # Uzywanie optymalnego RR`).
+  - Dbanie o natychmiastową synchronizację z `.env` — każda nowa zmienna w `.env.example` musi zostać od razu dopisana do lokalnego pliku `.env` (z zachowaniem istniejących sekretów tradera).
   - Blokowanie powielania istniejących funkcji (np. normalizacji symboli czy wyliczania spreadu).
   - Dbanie o to, by żaden moduł nie łamał granic swojej warstwy.
 - **Nienaruszalne zasady (Invariants):**
   - Nigdy nie dopuść do rozproszenia konfiguracji poza `config.py`.
+  - Nigdy nie dopuść do dodania zmiennej w `.env.example` bez komentarza wyjaśniającego jej rolę i format ("Year-Later Readiness").
+  - Nigdy nie dopuść do rozjazdu pomiędzy `.env.example` a aktywnym `.env` (brakujące zmienne muszą być od razu uzupełniane).
   - Każda nowa funkcja musi zostać sprawdzona w grafie zależności (`/graphify`).
 
 ---
@@ -145,7 +149,10 @@ Przed przystąpieniem do edycji kodu agent ma obowiązek przejść poniższą ś
 - Jeśli dodajesz nową funkcjonalność, dopisz do niej test jednostkowy w folderze `tests/`.
 
 ### Krok 5: Zaktualizuj Dokumentację
-- Jeśli zmieniłeś konfigurację `.env` lub `config.py`, zaktualizuj `.env.example` oraz [PROJECT_CONTEXT.md](file:///d:/Github/Forex-SMC/docs/PROJECT_CONTEXT.md).
+- Jeśli zmieniłeś konfigurację `.env` lub `config.py`:
+  - Zaktualizuj `.env.example` — **każda nowa lub zmodyfikowana zmienna MUSI posiadać komentarz wyjaśniający jej działanie** (np. `USE_OPTIMAL_RR=True # Uzywanie optymalnego RR`), aby po roku od razu było wiadomo, co dana opcja oznacza.
+  - **Natychmiast dopisz nową zmienną również do lokalnego pliku `.env`**, aby aktywna konfiguracja była na bieżąco (bezwzględnie zachowując istniejące tokeny, klucze i customowe wartości tradera).
+  - Zaktualizuj [PROJECT_CONTEXT.md](file:///d:/Github/Forex-SMC/docs/PROJECT_CONTEXT.md#10-standard-konfiguracji-i-samodokumentacji-pliku-envexample).
 - Jeśli zmieniłeś schemat tabeli `trades`, zaktualizuj `trade_journal.py` i `notion_journal.py`.
 
 ---
@@ -155,6 +162,8 @@ Przed przystąpieniem do edycji kodu agent ma obowiązek przejść poniższą ś
 Przed zwróceniem odpowiedzi użytkownikowi upewnij się, że:
 - [ ] Żadna funkcja nie została zdublowana (sprawdzono tabelę SSOT).
 - [ ] Nowe parametry są zdefiniowane w `config.py` i odczytywane z `os.getenv()`.
+- [ ] Wszystkie nowe lub zmienione zmienne w `.env.example` posiadają czytelny komentarz wyjaśniający ich działanie (`# Co robi zmienna`).
+- [ ] Wszystkie nowe zmienne z `.env.example` zostały natychmiast dopisane do aktywnego `.env` (z zachowaniem istniejących sekretów i wartości użytkownika).
 - [ ] Wszystkie symbole są czyszczone za pomocą `clean_symbol()`.
 - [ ] Zapytania do bazy danych korzystają wyłącznie z metod `TradeJournal`.
 - [ ] Pakiet testów jednostkowych przeszedł bezbłędnie (`Ran 70+ tests ... OK`).

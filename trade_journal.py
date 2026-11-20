@@ -98,7 +98,9 @@ class TradeJournal:
                     exit_reason TEXT DEFAULT '',
                     grade TEXT DEFAULT '',
                     is_rollover_shielded INTEGER DEFAULT 0,
-                    shielded_original_sl REAL DEFAULT 0.0
+                    shielded_original_sl REAL DEFAULT 0.0,
+                    counterfactual_max_r REAL DEFAULT 0.0,
+                    regime TEXT DEFAULT ''
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);")
@@ -119,6 +121,8 @@ class TradeJournal:
                 ("grade", "TEXT DEFAULT ''"),
                 ("is_rollover_shielded", "INTEGER DEFAULT 0"),
                 ("shielded_original_sl", "REAL DEFAULT 0.0"),
+                ("counterfactual_max_r", "REAL DEFAULT 0.0"),
+                ("regime", "TEXT DEFAULT ''"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_def}")
@@ -336,6 +340,8 @@ class TradeJournal:
         mae_r: float = 0.0,
         exit_reason: str = "",
         grade: str = "",
+        counterfactual_max_r: float = 0.0,
+        regime: str = "",
     ) -> int:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if not grade and confluence_score > 0:
@@ -352,13 +358,15 @@ class TradeJournal:
                     timestamp, symbol, direction, entry_price, sl_price, tp_price,
                     realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
                     parent_ticket, is_pyramid, pyramid_level,
-                    strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade,
+                    counterfactual_max_r, regime
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 now_str, symbol.upper(), direction.upper(), entry_price, sl_price, tp_price,
                 realized_r, max_r, confluence_score, status, chart_path, mt5_ticket, comment,
                 parent_ticket, is_pyramid, pyramid_level,
-                strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade
+                strategy, session_name, is_killzone, setup_type, confluences_json, mae_r, exit_reason, grade,
+                counterfactual_max_r, regime
             ))
             conn.commit()
             return cur.lastrowid
@@ -548,6 +556,125 @@ class TradeJournal:
                 (exit_reason, mae_r, closed_at, mt5_ticket),
             )
             conn.commit()
+
+    @_auto_recover_on_corruption
+    def update_trade_counterfactual_max_r(self, mt5_ticket: int, counterfactual_max_r: float) -> bool:
+        """Updates counter-factual excursion Max R for a trade."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE trades SET counterfactual_max_r = ? WHERE mt5_ticket = ?",
+                (counterfactual_max_r, mt5_ticket),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    @_auto_recover_on_corruption
+    def update_trade_regime(self, mt5_ticket: int, regime: str) -> bool:
+        """Sets the market regime (e.g. STRONG_TREND, COMPRESSION) for a trade."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE trades SET regime = ? WHERE mt5_ticket = ?",
+                (regime, mt5_ticket),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    @_auto_recover_on_corruption
+    def get_trades_by_regime(self, regime: str) -> List[Dict]:
+        """Returns closed trades belonging to a specific market regime."""
+        regime_upper = regime.upper().strip()
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM trades WHERE UPPER(TRIM(regime)) = ? AND status IN ('CLOSED', 'WIN', 'LOSS', 'BE') ORDER BY id ASC",
+                (regime_upper,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    @_auto_recover_on_corruption
+    def backfill_counterfactual_mfe(
+        self,
+        mt5_client,
+        ticket: Optional[int] = None,
+        lookback_hours: int = 24,
+    ) -> int:
+        """
+        Backfills counter-factual MFE for closed WIN trades where counterfactual_max_r is 0.0.
+        Uses mt5_client to evaluate where price ran after position closed at TP.
+        """
+        if not mt5_client or not mt5_client.ensure_connection():
+            return 0
+
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            if ticket is not None:
+                cur.execute(
+                    "SELECT * FROM trades WHERE mt5_ticket = ? AND status IN ('WIN', 'CLOSED')",
+                    (ticket,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM trades WHERE status IN ('WIN', 'CLOSED') AND (counterfactual_max_r IS NULL OR counterfactual_max_r = 0.0)",
+                )
+            qualifying = [dict(row) for row in cur.fetchall()]
+
+        updated_count = 0
+        for t in qualifying:
+            t_num = t.get("mt5_ticket")
+            if not t_num:
+                continue
+
+            sym = t.get("symbol")
+            is_buy = str(t.get("direction")).upper() == "BUY"
+            entry_p = float(t.get("entry_price") or 0.0)
+            sl_p = float(t.get("sl_price") or 0.0)
+            if entry_p <= 0 or sl_p <= 0 or not sym:
+                continue
+
+            time_close = None
+            deal_info = mt5_client.get_closed_deal_info(t_num)
+            if deal_info and deal_info.get("time_close"):
+                time_close = int(deal_info["time_close"])
+            elif t.get("closed_at"):
+                try:
+                    dt = datetime.strptime(t["closed_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    time_close = int(dt.timestamp())
+                except Exception:
+                    time_close = None
+
+            if not time_close:
+                continue
+
+            now_ts = int(datetime.now().timestamp())
+            elapsed = now_ts - time_close
+
+            # If less than 1 hour has passed since trade close, do not finalize counterfactual MFE early
+            # so that future M5 bars can form over the full post-close horizon (Fix 1).
+            if elapsed < 3600 and ticket is None:
+                continue
+
+            cf_mfe = mt5_client.get_counterfactual_mfe(
+                symbol=sym,
+                is_buy=is_buy,
+                entry_price=entry_p,
+                initial_sl_price=sl_p,
+                time_close=time_close,
+                lookback_hours=lookback_hours,
+            )
+            # If trade closed recently and no post-close rates arrived, keep counterfactual_max_r pending
+            if elapsed < 3600 and cf_mfe <= 0.0:
+                continue
+
+            recorded_max = float(t.get("max_r") or 0.0)
+            final_cf = max(cf_mfe, recorded_max)
+            if final_cf > 0:
+                self.update_trade_counterfactual_max_r(t_num, final_cf)
+                updated_count += 1
+
+        return updated_count
+
 
     @_auto_recover_on_corruption
     def get_closed_trades(self) -> List[Dict]:

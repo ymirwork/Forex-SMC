@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -232,6 +233,9 @@ class TradeSetup:
     is_multi_sweep: bool = False
     has_htf_sweep: bool = False
     liquidity_summary: str = ""
+    regime: str = "COMPRESSION"
+    dynamic_be_trigger: float = 0.85
+    is_adaptive_tp: bool = False
 
 
 
@@ -268,15 +272,42 @@ class SMCDetector:
         self.news_filter = news_filter or NewsFilter()
         self.journal = journal or TradeJournal()
         self.liquidity_detector = liquidity_detector or LiquidityDetector()
+        from adaptive_manager import AdaptivePositionManager
+        self.adaptive_manager = AdaptivePositionManager(journal=self.journal)
+        self._latest_swings: Dict[str, Dict] = {}
+        self._rr_cache: Dict[Tuple[Optional[str], float], Tuple[float, Tuple[float, bool, str]]] = {}
 
-    def get_effective_rr(self) -> Tuple[float, bool, str]:
-        """Determines target RR dynamically using shared RROptimizer logic."""
-        return RROptimizer.get_effective_rr(
+    def get_effective_rr(self, regime: Optional[str] = None, be_trigger_r: float = 0.85) -> Tuple[float, bool, str]:
+        """Determines target RR dynamically using shared RROptimizer logic (cached 60s)."""
+        cache_key = (regime, round(be_trigger_r, 2))
+        now = time.time()
+        if cache_key in self._rr_cache:
+            cached_time, cached_val = self._rr_cache[cache_key]
+            if (now - cached_time) < 60.0:
+                return cached_val
+
+        result = RROptimizer.get_effective_rr(
             journal=self.journal,
             default_rr=self.default_rr,
             use_optimal_rr=self.use_optimal_rr,
             min_trades=self.min_trades_for_optimal,
+            regime=regime,
+            be_trigger_r=be_trigger_r,
         )
+        self._rr_cache[cache_key] = (now, result)
+        return result
+
+    def get_latest_m15_swing(self, symbol: str, is_buy: bool) -> Tuple[float, float, float]:
+        """
+        Returns cached (swing_price, atr, point_scale) for symbol from latest M15 scan.
+        If is_buy: returns (swing_low, atr, point_scale)
+        If not is_buy: returns (swing_high, atr, point_scale)
+        """
+        cached = self._latest_swings.get(symbol.upper(), {})
+        if not cached:
+            return 0.0, 0.0, 0.0001
+        swing_price = cached.get("swing_low", 0.0) if is_buy else cached.get("swing_high", 0.0)
+        return float(swing_price), float(cached.get("atr", 0.0)), float(cached.get("point_scale", 0.0001))
 
     def determine_htf_trend(self, df_htf: pd.DataFrame) -> str:
         """Determines H4 trend using BOS/CHoCH and swing highs/lows."""
@@ -439,9 +470,6 @@ class SMCDetector:
 
         has_news, news_warn, _ = self.news_filter.check_news(symbol)
 
-        # Dynamic / Adaptive Best RR Calculation
-        target_rr, is_optimal_rr, rr_source = self.get_effective_rr()
-
         # M15 Swings & CHoCH / BOS (Trend Reversals & Trend Continuations)
         try:
             swings_ltf = smc.swing_highs_lows(df_ltf, swing_length=self.swing_length)
@@ -449,6 +477,25 @@ class SMCDetector:
         except Exception as e:
             logger.debug(f"Error computing swings / bos_choch for {symbol}: {e}")
             return setups
+
+        # Cache confirmed swing extremes for M15 trailing SL
+        try:
+            valid_swings = swings_ltf[swings_ltf["HighLow"].notna() & (swings_ltf["HighLow"] != 0)]
+            if len(valid_swings) > 0:
+                highs = valid_swings[valid_swings["HighLow"] == 1]["Level"].values
+                lows = valid_swings[valid_swings["HighLow"] == -1]["Level"].values
+                self._latest_swings[symbol.upper()] = {
+                    "swing_high": float(highs[-1]) if len(highs) > 0 else 0.0,
+                    "swing_low": float(lows[-1]) if len(lows) > 0 else 0.0,
+                    "atr": float(atr),
+                    "point_scale": point_scale,
+                }
+        except Exception as e:
+            logger.debug(f"Error caching M15 swings for {symbol}: {e}")
+
+        # Calculate ATR percentile from LTF history
+        rolling_atr = (df_ltf["high"] - df_ltf["low"]).tail(min(len(df_ltf), 100))
+        atr_percentile = (sum(1 for val in rolling_atr if atr >= val) / len(rolling_atr)) * 100.0 if len(rolling_atr) > 0 else 50.0
 
         # Extract both CHoCH and BOS events
         structure_events = bos_choch_ltf[bos_choch_ltf["CHOCH"].notna() | bos_choch_ltf["BOS"].notna()].copy()
@@ -523,6 +570,19 @@ class SMCDetector:
                 impulse_low = float(post_break_win["low"].iloc[min_low_rel_idx])
                 leg_start_idx = win_start + max_high_rel_idx
 
+            # Classify market regime and determine dynamic BE & optimal RR
+            regime = self.adaptive_manager.classify_regime(
+                htf_trend=htf_trend,
+                ltf_trend=dir_str,
+                atr_percentile=atr_percentile,
+                is_news_window=has_news,
+            )
+            dynamic_be = self.adaptive_manager.get_dynamic_be_trigger(regime)
+            target_rr, is_optimal_rr, rr_source = self.get_effective_rr(
+                regime=regime.value,
+                be_trigger_r=dynamic_be,
+            )
+
             setup = self._build_smc_setup(
                 direction=dir_str,
                 symbol=symbol,
@@ -549,6 +609,8 @@ class SMCDetector:
                 df_w1=df_w1,
                 df_h1=df_h1,
                 structure_age=structure_age,
+                regime=regime.value,
+                dynamic_be=dynamic_be,
             )
             if setup:
                 setups.append(setup)
@@ -584,6 +646,8 @@ class SMCDetector:
         df_h1: Optional[pd.DataFrame] = None,
         leg_df: Optional[pd.DataFrame] = None,
         structure_age: int = 5,
+        regime: str = "COMPRESSION",
+        dynamic_be: float = 0.85,
     ) -> Optional[TradeSetup]:
         if leg_df is not None and (impulse_low is None or impulse_high is None):
             impulse_low = float(leg_df["low"].min())
@@ -920,4 +984,7 @@ class SMCDetector:
             is_multi_sweep=liq_eval.is_multi_sweep,
             has_htf_sweep=liq_eval.has_htf_sweep,
             liquidity_summary=liq_eval.summary_msg,
+            regime=regime,
+            dynamic_be_trigger=dynamic_be,
+            is_adaptive_tp=is_optimal_rr,
         )

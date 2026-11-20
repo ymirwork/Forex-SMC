@@ -224,6 +224,20 @@ INSIGHTS_MIN_SAMPLE_SIZE = int(os.getenv("INSIGHTS_MIN_SAMPLE_SIZE", "10"))
 # Automatically send weekend insights report (Sunday before market open)
 SEND_WEEKEND_INSIGHTS_REPORT = os.getenv("SEND_WEEKEND_INSIGHTS_REPORT", "True").lower() in ("true", "1")
 
+# ==========================================
+# ADAPTIVE POSITION MANAGEMENT & REGIME SETTINGS
+# ==========================================
+ENABLE_ADAPTIVE_MANAGER = os.getenv("ENABLE_ADAPTIVE_MANAGER", "True").lower() in ("true", "1")
+ADAPTIVE_MODE = os.getenv("ADAPTIVE_MODE", "SHADOW").upper()  # 'SHADOW' (telemetria) lub 'LIVE' (realne modyfikacje w MT5)
+ADAPTIVE_MIN_REGIME_SAMPLES = int(os.getenv("ADAPTIVE_MIN_REGIME_SAMPLES", "10"))  # Min próba na reżim (10 zagrań)
+ADAPTIVE_M15_TRAILING = os.getenv("ADAPTIVE_M15_TRAILING", "True").lower() in ("true", "1")  # Trailing na bazie M15 Swing
+ADAPTIVE_BE_TREND_R = float(os.getenv("ADAPTIVE_BE_TREND_R", "1.15"))      # Szerszy BE w silnym trendzie (pozwala na retest)
+ADAPTIVE_BE_CHOP_R = float(os.getenv("ADAPTIVE_BE_CHOP_R", "0.80"))        # Szybki BE w konsolidacji / szumie
+ADAPTIVE_BE_VOLATILE_R = float(os.getenv("ADAPTIVE_BE_VOLATILE_R", "0.85")) # BE przy podwyższonej zmienności
+ADAPTIVE_TRAILING_MIN_STEP_R = float(os.getenv("ADAPTIVE_TRAILING_MIN_STEP_R", "0.40")) # Min. krok zysku do przesunięcia SL
+ADAPTIVE_TRAILING_ATR_MULT = float(os.getenv("ADAPTIVE_TRAILING_ATR_MULT", "1.0"))       # Min. dystans SL od ceny (1.0 * ATR)
+
+
 
 
 
