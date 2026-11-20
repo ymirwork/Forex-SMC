@@ -144,6 +144,19 @@ class TelegramBotManager:
         except Exception as e:
             logger.debug(f"Error in _safe_edit_message: {e}")
 
+    @staticmethod
+    async def _safe_answer_query(query, text: Optional[str] = None, show_alert: bool = False):
+        """Safely answers a Telegram callback query without crashing if the query is expired or timed out."""
+        if not query:
+            return
+        try:
+            if text:
+                await query.answer(text=text, show_alert=show_alert)
+            else:
+                await query.answer()
+        except Exception as e:
+            logger.debug(f"Ignored callback query answer error (likely expired/timeout): {e}")
+
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             user_id = update.effective_user.id if update.effective_user else 0
@@ -550,13 +563,14 @@ class TelegramBotManager:
 
         if not self._is_authorized(update):
             user_id = update.effective_user.id if update.effective_user else 0
-            await query.answer(
+            await self._safe_answer_query(
+                query,
                 text=f"⛔ Brak uprawnień do wykonania tego zlecenia!\nTwoje User ID to: {user_id}.\nDopisz je do TELEGRAM_CHAT_ID w pliku .env",
                 show_alert=True,
             )
             return
 
-        await query.answer()
+        await self._safe_answer_query(query)
 
         data = query.data or ""
         parts = data.split(":")
@@ -567,11 +581,11 @@ class TelegramBotManager:
             try:
                 ticket_num = int(setup_id)
                 ok, msg = self.mt5_client.move_sl_to_breakeven(ticket_num)
-                await query.answer(text=msg[:190], show_alert=True)
+                await self._safe_answer_query(query, text=msg[:190], show_alert=True)
                 if ok and query.message:
                     await query.message.reply_text(msg, parse_mode="Markdown")
             except Exception as e:
-                await query.answer(text=f"Błąd BE: {e}", show_alert=True)
+                await self._safe_answer_query(query, text=f"Błąd BE: {e}", show_alert=True)
             return
 
         setup = self.pending_setups.pop(setup_id, None)
@@ -603,7 +617,8 @@ class TelegramBotManager:
             if BLOCK_ROLLOVER_SESSION and action == "market":
                 curr_session = SessionManager.get_current_session()
                 if "Rollover" in curr_session.get("session_name", ""):
-                    await query.answer(
+                    await self._safe_answer_query(
+                        query,
                         text="⛔ Zablokowano: Sesja Rollover (niska płynność i szerokie spready)!",
                         show_alert=True,
                     )
@@ -619,7 +634,7 @@ class TelegramBotManager:
                 # Live news verification at the exact time of order placement (async non-blocking)
                 has_news, news_warn, _ = await self.news_filter.check_news_async(setup.symbol)
                 if has_news and news_warn:
-                    await query.answer(text="Zablokowano: zbliżają się wiadomości High-Impact!", show_alert=True)
+                    await self._safe_answer_query(query, text="Zablokowano: zbliżają się wiadomości High-Impact!", show_alert=True)
                     await self._safe_edit_message(
                         query,
                         f"{orig_caption}\n\n🛑 **Zlecenie zablokowane na żywo (Filtr Wiadomości High-Impact):**\n{news_warn}"
@@ -634,7 +649,7 @@ class TelegramBotManager:
                     is_pyramid=getattr(setup, "is_pyramid", False),
                 )
                 if not can_trade:
-                    await query.answer(text=reason[:190], show_alert=True)
+                    await self._safe_answer_query(query, text=reason[:190], show_alert=True)
                     await self._safe_edit_message(
                         query,
                         f"{orig_caption}\n\n🛑 **Zlecenie zablokowane (Prop Firm Guardian):**\n{reason}"
@@ -1128,6 +1143,11 @@ class TelegramBotManager:
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
 
+    async def _on_telegram_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler for Telegram application."""
+        err = getattr(context, "error", None)
+        logger.warning(f"Telegram error encountered: {err}")
+
     def build_application(self) -> Application:
         """Configures the telegram application."""
         if not self.token:
@@ -1141,6 +1161,8 @@ class TelegramBotManager:
         )
         builder = Application.builder().token(self.token).request(request)
         self.app = builder.build()
+
+        self.app.add_error_handler(self._on_telegram_error)
 
         self.app.add_handler(CommandHandler("start", self.start_cmd))
         self.app.add_handler(CommandHandler("status", self.status_cmd))
