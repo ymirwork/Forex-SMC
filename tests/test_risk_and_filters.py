@@ -263,5 +263,19 @@ class TestRiskAndFilters(unittest.TestCase):
         self.assertAlmostEqual(tp2_sell, entry - (0.0020 * 3.0), places=4)
 
 
+    def test_safe_answer_query_suppresses_bad_request(self):
+        """Verifies _safe_answer_query catches and swallows expired or already-answered BadRequest without crashing."""
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock
+        from telegram_bot import TelegramBotManager
+        from telegram.error import BadRequest
+        query = MagicMock()
+        query.answer = AsyncMock(side_effect=BadRequest("Query is too old and response timeout expired or query ID is invalid"))
+
+        # Should execute cleanly without raising exception
+        asyncio.run(TelegramBotManager._safe_answer_query(query, text="Test", show_alert=True))
+        self.assertEqual(query.answer.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

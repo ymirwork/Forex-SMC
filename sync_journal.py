@@ -373,10 +373,7 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                     expected_grade = t.get("grade")
                     if not expected_grade and t.get("confluence_score"):
                         cs = int(t["confluence_score"])
-                        if "ZUMIKO" in expected_strat.upper():
-                            expected_grade = "A+" if cs >= 90 else ("A" if cs >= 75 else "B")
-                        else:
-                            expected_grade = "A+" if cs >= 85 else ("A" if cs >= 70 else "B")
+                        expected_grade = "A+" if cs >= 85 else ("A" if cs >= 70 else "B")
 
                     fix_props = {}
                     if curr_strat != expected_strat:

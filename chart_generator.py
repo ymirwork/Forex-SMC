@@ -5,6 +5,7 @@ matplotlib.use("Agg")  # Headless rendering
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import pandas as pd
+from config import ZUMIKO_FAST_EMA, ZUMIKO_SLOW_EMA, ZUMIKO_TREND_EMA
 from smc_detector import TradeSetup
 
 plt.style.use("dark_background")
@@ -133,19 +134,24 @@ class ChartGenerator:
                             fontweight="bold"
                         )
 
-            # Draw Zumiko EMAs (EMA 10, EMA 21, EMA 238)
+            # Draw Zumiko EMAs (EMA Fast, EMA Slow, EMA Trend)
             if getattr(setup, "ema_238", 0.0) > 0 or getattr(setup, "strategy_name", "") in ("ZUMIKO", "GOLDEN_COMBO"):
-                e10_full = df["close"].ewm(span=10, adjust=False).mean()
-                e21_full = df["close"].ewm(span=21, adjust=False).mean()
-                e238_full = df["close"].ewm(span=238, adjust=False).mean()
+                e_fast_full = df["close"].ewm(span=ZUMIKO_FAST_EMA, adjust=False).mean()
+                e_slow_full = df["close"].ewm(span=ZUMIKO_SLOW_EMA, adjust=False).mean()
+                e_trend_full = df["close"].ewm(span=ZUMIKO_TREND_EMA, adjust=False).mean()
 
-                e10_sub = e10_full.tail(bars_count).reset_index(drop=True)
-                e21_sub = e21_full.tail(bars_count).reset_index(drop=True)
-                e238_sub = e238_full.tail(bars_count).reset_index(drop=True)
+                e_fast_sub = e_fast_full.tail(bars_count).reset_index(drop=True)
+                e_slow_sub = e_slow_full.tail(bars_count).reset_index(drop=True)
+                e_trend_sub = e_trend_full.tail(bars_count).reset_index(drop=True)
 
-                ax.plot(e10_sub.index, e10_sub.values, color="#00e5ff", linewidth=1.2, label=f"EMA Fast (10): {setup.ema_fast}", alpha=0.9)
-                ax.plot(e21_sub.index, e21_sub.values, color="#f59e0b", linewidth=1.4, label=f"EMA Slow (21): {setup.ema_slow}", alpha=0.9)
-                ax.plot(e238_sub.index, e238_sub.values, color="#a855f7", linewidth=2.0, linestyle="-", label=f"EMA Trend (238): {setup.ema_238}", alpha=0.95)
+                ax.plot(e_fast_sub.index, e_fast_sub.values, color="#00e5ff", linewidth=1.2, label=f"EMA Fast ({ZUMIKO_FAST_EMA}): {setup.ema_fast}", alpha=0.9)
+                ax.plot(e_slow_sub.index, e_slow_sub.values, color="#f59e0b", linewidth=1.4, label=f"EMA Slow ({ZUMIKO_SLOW_EMA}): {setup.ema_slow}", alpha=0.9)
+                ax.plot(e_trend_sub.index, e_trend_sub.values, color="#a855f7", linewidth=2.0, linestyle="-", label=f"EMA Trend ({ZUMIKO_TREND_EMA}): {setup.ema_238}", alpha=0.95)
+
+            # Draw Institutional Daily VWAP if present
+            vwap_val = getattr(setup, "vwap", 0.0)
+            if vwap_val > 0:
+                ax.axhline(vwap_val, color="#38bdf8", linestyle=":", linewidth=1.4, alpha=0.9, label=f"Daily VWAP: {vwap_val}")
 
             # Lines for Entry, SL, TP1, TP2
             ax.axhline(setup.entry_price, color="#2962ff", linestyle=":", linewidth=2.0, label=f"Entry: {setup.entry_price}")
@@ -157,6 +163,8 @@ class ChartGenerator:
             ax.text(x_text, setup.entry_price, f" ENTRY {setup.entry_price}", color="#2962ff", va="center", fontweight="bold", fontsize=9)
             ax.text(x_text, setup.sl_price, f" SL {setup.sl_price}", color="#f23645", va="center", fontweight="bold", fontsize=9)
             ax.text(x_text, setup.tp1_price, f" TP1 {setup.tp1_price}", color="#089981", va="center", fontweight="bold", fontsize=9)
+            if vwap_val > 0:
+                ax.text(x_text, vwap_val, f" VWAP {vwap_val}", color="#38bdf8", va="center", fontsize=8)
 
             # X-axis time ticks
             tick_step = max(1, len(plot_df) // 6)
@@ -182,6 +190,8 @@ class ChartGenerator:
             ]
             if setup.fibo_786 > 0:
                 all_y.extend([setup.fibo_618, setup.fibo_786])
+            if vwap_val > 0 and (chart_low - chart_range * 0.5) <= vwap_val <= (chart_high + chart_range * 0.5):
+                all_y.append(vwap_val)
             for s_lvl in getattr(setup, "swept_levels", []):
                 p = s_lvl.get("price", 0.0)
                 if p > 0:

@@ -828,6 +828,16 @@ class SMCScanner:
 
                 final_setups: List[TradeSetup] = []
 
+                # Detect directional conflict between SMC and Zumiko on the same symbol (Audit Finding 1)
+                smc_dirs = {s.direction for s in smc_setups}
+                zumiko_dirs = {z.direction for z in zumiko_setups}
+                if smc_dirs and zumiko_dirs and smc_dirs != zumiko_dirs:
+                    logger.warning(
+                        f"🛡️ [CONFLICT FILTER] Odrzucono sprzeczne sygnały dla {sym}: "
+                        f"SMC {smc_dirs} vs Zumiko {zumiko_dirs} (brak spójności kierunkowej rynku)."
+                    )
+                    continue
+
                 # Check for Golden Combo (Both SMC & Zumiko agreed on direction)
                 if smc_setups and zumiko_setups:
                     for s_setup in smc_setups:
@@ -846,6 +856,12 @@ class SMCScanner:
                             s_setup.ema_slow = matched_zumiko.ema_slow
                             s_setup.ema_238 = matched_zumiko.ema_238
                             s_setup.swing_pattern = matched_zumiko.swing_pattern
+                            s_setup.vwap = matched_zumiko.vwap
+                            s_setup.poc = matched_zumiko.poc
+                            s_setup.rsi = matched_zumiko.rsi
+                            s_setup.is_ribbon_expanding = matched_zumiko.is_ribbon_expanding
+                            s_setup.is_healthy_ha = matched_zumiko.is_healthy_ha
+                            s_setup.is_main_zumiko_signal = matched_zumiko.is_main_zumiko_signal
                             # Append Zumiko factors to breakdown
                             s_setup.confluence_breakdown.extend(matched_zumiko.confluence_breakdown[:2])
                             final_setups.append(s_setup)
@@ -918,6 +934,17 @@ class SMCScanner:
                     last_alert_t = self._last_alert_by_symbol.get(sym_dir_key, 0.0)
                     if (time.time() - last_alert_t) < (ALERT_COOLDOWN_MINUTES * 60):
                         logger.debug(f"⏳ [COOLDOWN] Pomijam alert dla {setup.symbol} {setup.direction} (aktywny cooldown {ALERT_COOLDOWN_MINUTES}m).")
+                        continue
+
+                    # Anti-Spam Check 3b: Opposing Direction Conflict Cooldown
+                    opp_dir = "SELL" if setup.direction.upper() == "BUY" else "BUY"
+                    opp_key = (clean_symbol(setup.symbol), opp_dir)
+                    last_opp_t = self._last_alert_by_symbol.get(opp_key, 0.0)
+                    if (time.time() - last_opp_t) < (ALERT_COOLDOWN_MINUTES * 60):
+                        logger.info(
+                            f"⏳ [CONFLICT COOLDOWN] Pomijam alert dla {setup.symbol} {setup.direction}: "
+                            f"Niedawno ({int((time.time() - last_opp_t)/60)}m temu) wysłano przeciwny alert {opp_dir}."
+                        )
                         continue
 
                     # Macroeconomic High-Impact News Filter Check

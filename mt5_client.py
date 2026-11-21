@@ -307,9 +307,13 @@ class MT5Client:
         vol_min = sym.volume_min if sym.volume_min > 0 else 0.01
         vol_max = sym.volume_max if sym.volume_max > 0 else 100.0
 
+        vol_digits = len(str(vol_step).split(".")[1]) if ("." in str(vol_step) and not str(vol_step).endswith(".0")) else 2
+        vol_digits = max(2, vol_digits)
+
         steps = round(raw_lot / vol_step)
-        calculated_lot = round(steps * vol_step, 2)
+        calculated_lot = round(steps * vol_step, vol_digits)
         final_lot = max(vol_min, min(calculated_lot, vol_max))
+        final_lot = round(final_lot, vol_digits)
 
         logger.info(
             f"Lot calculated for {resolved}: Balance={acc.balance} {acc.currency}, Risk={risk_percent}%, "
@@ -472,9 +476,17 @@ class MT5Client:
 
         if result is None:
             err = mt5.last_error()
-            return False, f"order_send() returned None: {err}", None, 0.0
+            return False, f"Błąd komunikacji MT5: order_send() zwróciło None ({err})", None, 0.0
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
+            tick = mt5.symbol_info_tick(resolved)
+            if result.retcode == 10015 and tick is not None:
+                if is_buy and price >= tick.ask:
+                    return False, f"Cena rynkowa (Ask: {tick.ask:.{sym_info.digits}f}) wyprzedziła poziom wejścia Limit ({price:.{sym_info.digits}f}). Złóż zlecenie Market lub poczekaj na retest.", None, 0.0
+                elif not is_buy and price <= tick.bid:
+                    return False, f"Cena rynkowa (Bid: {tick.bid:.{sym_info.digits}f}) wyprzedziła poziom wejścia Limit ({price:.{sym_info.digits}f}). Złóż zlecenie Market lub poczekaj na retest.", None, 0.0
+            elif result.retcode == 10016:
+                return False, f"Zlecenie odrzucone przez brokera (kod 10016: Poziom wejścia lub SL/TP narusza minimalny dystans stops_level).", None, 0.0
             return False, f"Pending order failed: retcode={result.retcode} ({result.comment})", None, 0.0
 
         logger.info(
@@ -1383,9 +1395,11 @@ class MT5Client:
                 f"przekraczając dozwolone ryzyko dokładki ({allowed_risk_usd:.2f} USD)"
             )
 
+        vol_digits = len(str(vol_step).split(".")[1]) if ("." in str(vol_step) and not str(vol_step).endswith(".0")) else 2
+        vol_digits = max(2, vol_digits)
         calc_lot = round(calc_lot / vol_step) * vol_step
         calc_lot = max(vol_min, min(vol_max, calc_lot))
-        calc_lot = round(calc_lot, 2)
+        calc_lot = round(calc_lot, vol_digits)
 
         return calc_lot, round(total_locked_usd, 2), round(allowed_risk_usd, 2), "OK"
 

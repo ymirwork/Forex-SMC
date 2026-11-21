@@ -59,10 +59,10 @@ async def main():
 
         async def init_telegram_with_retry():
             nonlocal telegram_task
-            app = telegram_mgr.build_application()
             for attempt in range(1, 4):
                 try:
                     logger.info(f"Connecting to Telegram Bot API (attempt {attempt}/3)...")
+                    app = telegram_mgr.build_application()
                     await app.initialize()
                     await app.start()
                     telegram_task = asyncio.create_task(app.updater.start_polling())
@@ -70,6 +70,14 @@ async def main():
                     return
                 except Exception as e:
                     logger.warning(f"Telegram Bot connection attempt {attempt} failed: {e}")
+                    if telegram_mgr.app:
+                        try:
+                            if getattr(telegram_mgr.app, "_running", False):
+                                await telegram_mgr.app.stop()
+                            if getattr(telegram_mgr.app, "_initialized", False):
+                                await telegram_mgr.app.shutdown()
+                        except Exception:
+                            pass
                     if attempt < 3:
                         await asyncio.sleep(5)
 
@@ -82,6 +90,7 @@ async def main():
                     await asyncio.sleep(30)
                     try:
                         logger.info("Retrying Telegram connection...")
+                        app = telegram_mgr.build_application()
                         await app.initialize()
                         await app.start()
                         telegram_task = asyncio.create_task(app.updater.start_polling())
@@ -89,6 +98,14 @@ async def main():
                         break
                     except Exception as e:
                         logger.debug(f"Background Telegram reconnect attempt failed: {e}")
+                        if telegram_mgr.app:
+                            try:
+                                if getattr(telegram_mgr.app, "_running", False):
+                                    await telegram_mgr.app.stop()
+                                if getattr(telegram_mgr.app, "_initialized", False):
+                                    await telegram_mgr.app.shutdown()
+                            except Exception:
+                                pass
 
             asyncio.create_task(background_reconnect_loop())
 

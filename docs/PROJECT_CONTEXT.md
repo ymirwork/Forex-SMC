@@ -107,11 +107,19 @@ System zaprojektowany jest w architekturze modułowej o wyraźnie rozdzielonych 
   - **Grade A:** Score $70 - 84\%$
   - **Grade B / Reject:** Score $< 70\%$
 
-### 4.2. Strategia Zumiko KillMLM (Multi-Timeframe Trend)
-- **Filtr Trendu Bazowego:** `EMA 238` (Cena > EMA 238 = Tylko BUY; Cena < EMA 238 = Tylko SELL).
-- **Momentum Trigger:** Przebicie/odbicie od wstęgi `EMA 10 (Fast)` oraz `EMA 21 (Slow)`.
-- **Weryfikacja Swingów:** Potwierdzenie formowania Higher Low (HL) dla BUY lub Lower High (LH) dla SELL.
-- **Zgodność Wieloczasowa (MTF):** Weryfikacja kierunku na M15, H1 i H4. Warunek konieczny: trend H1 musi potwierdzać setup (`ZUMIKO_REQUIRE_H1=True`).
+### 4.2. Strategia Zumiko KillMLM (Oficjalny Poradnik PDF i Webinarium ZuMiKo)
+Zaimplementowana ściśle według oficjalnej specyfikacji systemu scalpingowo-trendowego ZuMiKo KillMLM:
+1. **Trend Bazowy:** `EMA 238` (Market Filter: Cena > EMA 238 = dozwolony wyłącznie BUY; Cena < EMA 238 = dozwolony wyłącznie SELL).
+2. **Dynamiczna Wstęga Momentum:** `EMA 9 (Fast)` oraz `EMA 21 (Slow)` (parametry oficjalne ZuMiKo zaktualizowane z EMA 10 na EMA 9).
+3. **Instytucjonalna Kotwica VWAP:** Dzienny Volume Weighted Average Price (`ZUMIKO_REQUIRE_VWAP_ALIGNMENT=True`). Dla BUY cena musi znajdować się powyżej VWAP (potwierdzenie akumulacji), dla SELL poniżej VWAP (potwierdzenie dystrybucji).
+4. **Magnes Wolumenowy POC (Point of Control):** Wyznaczany na bazie profilu wolumenu (lookback 40 barów). W przypadku gdy POC znajduje się pomiędzy wejściem a TP1 z minimalnym zyskiem $\ge 1.5R$, TP1 jest automatycznie docinany do poziomu POC (`ZUMIKO_ENABLE_POC_TARGETING=True`), zabezpieczając zysk przed strefą silnej reakcji wolumenowej.
+5. **Ekspansja Wstęgi (Ribbon Expansion):** Badanie odległości $|EMA 9 - EMA 21|$. Wzrost szerokości wstęgi potwierdza rosnący impet instytucjonalny; zwężenie wstęgi wskazuje na wyczerpanie trendu lub przejście w konsolidację.
+6. **Filtr Wykupienia/Wyprzedania RSI (14):** Zabezpiecza przed wchodzeniem w pozycję po nadmiernym rozciągnięciu rynku (`ZUMIKO_RSI_MAX_BUY=75.0` dla BUY, `ZUMIKO_RSI_MIN_SELL=25.0` dla SELL).
+7. **Filtr Świecowy Heikin-Ashi:** Weryfikacja czystości impulsu (`ZUMIKO_USE_HEIKIN_ASHI_FILTER=True`). Wymaga świecy ze znikomym przeciwnym knotem (flat bottom dla BUY, flat top dla SELL), eliminując fałszywe wybicia z długimi knotami odrzucenia.
+8. **Struktura Rynku:** Weryfikacja formowania Higher Low (HL) dla BUY lub Lower High (LH) dla SELL.
+9. **Klasyfikacja Sygnału:**
+   - **Główny Sygnał ZuMiKo KillMLM (Grade A+):** Zgodność trendu MTF (H1/H4) + Rozszerzająca się wstęga EMA 9/21 + Potwierdzenie pozycji względem VWAP.
+   - **Sygnał Korekcyjny ZuMiKo (Grade A/B):** Odbicie w strefie EMA 9/21 (Pullback) w kierunku trendu bazowego EMA 238.
 
 ### 4.3. Złoty Setup (Golden Combo)
 Występuje, gdy na instrumencie w tym samym czasie wystąpi zbieżność setupu SMC oraz Zumiko:
@@ -124,6 +132,23 @@ Wykrywa strefy płynności zewnętrznej (Buy-Side / Sell-Side Liquidity) i ich f
 - **PWH / PWL:** Previous Week High / Low.
 - **EQH / EQL:** Equal Highs / Equal Lows (podwójne/potrójne szczyty i dołki w tolerancji ATR).
 - **Asian Session High / Low:** Ekstremum sesji azjatyckiej (00:00 - 08:00 UTC).
+
+### 4.5. Zaawansowane Reguły Smart Risk (Smart Risk Mentorship & A+ Setupy)
+Zaimplementowane na bazie instytucjonalnych zasad Smart Money Concepts:
+1. **Strong vs Weak Structural Points (`smc_detector.py`):**
+   - **BUY:** Dołek wybijający strukturę w górę to **Strong Low** (ochrona pozycji), a szczyt niezdolny do jego przebicia to **Weak High** (cel płynnościowy TP).
+   - **SELL:** Szczyt wybijający strukturę w dół to **Strong High** (ochrona pozycji), a dołek to **Weak Low** (cel płynnościowy TP).
+   - `ENFORCE_STRONG_STRUCTURAL_SL`: opcja zakotwiczenia Stop Lossa ściśle za poziomem Strong, eliminująca wycięcia na szumie.
+2. **Filtr Sweep-Engineered OB (`smc_detector.py`):**
+   - Wykrywa Order Blocki, które powstały w wyniku natychmiastowego zgarnięcia płynności (Manipulation Grab / Inducement Sweep) z poprzednich świec przed impulsem BOS/CHoCH.
+   - Setupy oparte o Sweep-Engineered OB otrzymują bonus konfluencji `+15%` (`BONUS_POINTS_SWEEP_OB`) lub mogą stanowić warunek konieczny (`REQUIRE_SWEEP_ENGINEERED_OB=True`).
+3. **Filtr Room-to-Run / Opposite S/D Barrier & TP1 Capping (`smc_detector.py`):**
+   - Weryfikuje przestrzeń do najbliższej nieprzetestowanej strefy przeciwległej na wyższych interwałach (H1/H4).
+   - Zabezpiecza przed kupowaniem tuż pod podażą H1/H4 lub sprzedawaniem tuż nad popytem: jeśli wolna przestrzeń $< 1.5R$ (`ROOM_TO_RUN_HTF_MIN_RR`), trade zostaje odrzucony.
+   - **TP1 Capping:** Jeśli przeciwległa strefa znajduje się w bezpiecznej odległości ($\ge 1.5R$), ale bliżej niż domyślny Take Profit, TP1 jest automatycznie docinany do poziomu bariery, uniemożliwiając celowanie w ceny za strefą odwrócenia.
+4. **Filtr Spójności Kierunkowej (Directional Conflict Shield w `scanner.py`):**
+   - Automatycznie wykrywa i odrzuca przeciwstawne sygnały (np. SMC BUY vs Zumiko SELL na tej samej parze w tym samym skanie lub w oknie cooldownu).
+   - Zapobiega sprzecznym alertom na Telegramie oraz otwieraniu niedozwolonych hedge'y na kontach Prop Firm.
 
 ---
 

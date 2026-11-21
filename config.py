@@ -86,7 +86,10 @@ MIN_TRADES_FOR_OPTIMAL_RR = int(os.getenv("MIN_TRADES_FOR_OPTIMAL_RR", "30"))
 OPTIMAL_RR_MIN_FLOOR = float(os.getenv("OPTIMAL_RR_MIN_FLOOR", "2.0"))
 
 # Rollover & Session Protection
+# 1. New Trade Session Lock (UTC based: 20:00 - 00:00 UTC): blocks scanning & market orders during low-liquidity evening/rollover hours
 BLOCK_ROLLOVER_SESSION = os.getenv("BLOCK_ROLLOVER_SESSION", "True").lower() in ("true", "1")
+
+# 2. Open Trade Rollover SL Shield (Broker Server Time: 23:40 - 00:30 MT5): protects already open positions from midnight spread spikes
 ENABLE_ROLLOVER_SL_SHIELD = os.getenv("ENABLE_ROLLOVER_SL_SHIELD", "True").lower() in ("true", "1")
 ROLLOVER_SHIELD_START_MINUTES = int(os.getenv("ROLLOVER_SHIELD_START_MINUTES", "20"))  # Min before D1 close (23:40 MT5)
 ROLLOVER_SHIELD_END_MINUTES = int(os.getenv("ROLLOVER_SHIELD_END_MINUTES", "30"))      # Min after D1 open (00:30 MT5)
@@ -98,6 +101,20 @@ ROLLOVER_MAX_SPREAD_GOLD_PIPS = float(os.getenv("ROLLOVER_MAX_SPREAD_GOLD_PIPS",
 # Max SL & Structural Room Filtering
 MAX_SL_ATR_MULTIPLIER = float(os.getenv("MAX_SL_ATR_MULTIPLIER", "2.5"))
 REQUIRE_STRUCTURAL_SPACE_FOR_RR = os.getenv("REQUIRE_STRUCTURAL_SPACE_FOR_RR", "True").lower() in ("true", "1")
+
+# ==========================================
+# ADVANCED SMC & SMART RISK SETTINGS (YouTube Smart Risk Mentorship)
+# ==========================================
+# 1. Strong vs Weak Structural Points (SL strictly behind Strong, TP aimed at Weak)
+ENFORCE_STRONG_STRUCTURAL_SL = os.getenv("ENFORCE_STRONG_STRUCTURAL_SL", "False").lower() in ("true", "1")
+
+# 2. Sweep-Engineered OB (Manipulation Grab / Smart Risk Hack #2)
+REQUIRE_SWEEP_ENGINEERED_OB = os.getenv("REQUIRE_SWEEP_ENGINEERED_OB", "False").lower() in ("true", "1")
+BONUS_POINTS_SWEEP_OB = int(os.getenv("BONUS_POINTS_SWEEP_OB", "15"))
+
+# 3. Room-to-Run / Opposite S/D Barrier (Smart Risk Hack #1 & #5)
+ENABLE_ROOM_TO_RUN_HTF_FILTER = os.getenv("ENABLE_ROOM_TO_RUN_HTF_FILTER", "True").lower() in ("true", "1")
+ROOM_TO_RUN_HTF_MIN_RR = float(os.getenv("ROOM_TO_RUN_HTF_MIN_RR", "1.5"))
 
 # Scanner Settings
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))   # Check every 60s
@@ -114,12 +131,17 @@ NEWS_WINDOW_MINUTES = int(os.getenv("NEWS_WINDOW_MINUTES", "45"))      # Check n
 ENABLE_SMC_STRATEGY = os.getenv("ENABLE_SMC_STRATEGY", "True").lower() in ("true", "1")
 ENABLE_ZUMIKO_STRATEGY = os.getenv("ENABLE_ZUMIKO_STRATEGY", "True").lower() in ("true", "1")
 
-# Zumiko KillMLM Strategy Settings
-ZUMIKO_FAST_EMA = int(os.getenv("ZUMIKO_FAST_EMA", "10"))
+# Zumiko KillMLM Strategy Settings (Official PDF & Webinar)
+ZUMIKO_FAST_EMA = int(os.getenv("ZUMIKO_FAST_EMA", "9"))
 ZUMIKO_SLOW_EMA = int(os.getenv("ZUMIKO_SLOW_EMA", "21"))
 ZUMIKO_TREND_EMA = int(os.getenv("ZUMIKO_TREND_EMA", "238"))
 ZUMIKO_SWING_LEN = int(os.getenv("ZUMIKO_SWING_LEN", "10"))
 ZUMIKO_REQUIRE_H1 = os.getenv("ZUMIKO_REQUIRE_H1", "True").lower() in ("true", "1")
+ZUMIKO_REQUIRE_VWAP_ALIGNMENT = os.getenv("ZUMIKO_REQUIRE_VWAP_ALIGNMENT", "True").lower() in ("true", "1")
+ZUMIKO_RSI_MAX_BUY = float(os.getenv("ZUMIKO_RSI_MAX_BUY", "75.0"))
+ZUMIKO_RSI_MIN_SELL = float(os.getenv("ZUMIKO_RSI_MIN_SELL", "25.0"))
+ZUMIKO_USE_HEIKIN_ASHI_FILTER = os.getenv("ZUMIKO_USE_HEIKIN_ASHI_FILTER", "True").lower() in ("true", "1")
+ZUMIKO_ENABLE_POC_TARGETING = os.getenv("ZUMIKO_ENABLE_POC_TARGETING", "True").lower() in ("true", "1")
 
 # ==========================================
 # PROP FIRM SETTINGS

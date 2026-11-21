@@ -70,6 +70,11 @@ class AdaptivePositionManager:
         htf = (htf_trend or "").upper().strip()
         ltf = (ltf_trend or "").upper().strip()
 
+        # Normalize direction representations (BUY -> BULLISH, SELL -> BEARISH)
+        dir_map = {"BUY": "BULLISH", "LONG": "BULLISH", "SELL": "BEARISH", "SHORT": "BEARISH"}
+        htf = dir_map.get(htf, htf)
+        ltf = dir_map.get(ltf, ltf)
+
         if htf in ("BULLISH", "BEARISH") and ltf in ("BULLISH", "BEARISH"):
             if htf == ltf and 40.0 <= atr_val <= 85.0:
                 return MarketRegime.STRONG_TREND

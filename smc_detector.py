@@ -16,7 +16,10 @@ from config import (
     ADD_SPREAD_TO_SL,
     BLOCK_EVENING_ENTRIES,
     BLOCK_ROLLOVER_SESSION,
+    BONUS_POINTS_SWEEP_OB,
     DEFAULT_RR_RATIO,
+    ENABLE_ROOM_TO_RUN_HTF_FILTER,
+    ENFORCE_STRONG_STRUCTURAL_SL,
     LIQUIDITY_SWEEP_LOOKBACK_BARS,
     LTF_TIMEFRAME,
     MAX_SL_ATR_MULTIPLIER,
@@ -29,11 +32,14 @@ from config import (
     REJECTION_WICK_MIN_RATIO,
     REQUIRE_REJECTION_CANDLE,
     REQUIRE_STRUCTURAL_SPACE_FOR_RR,
+    REQUIRE_SWEEP_ENGINEERED_OB,
+    ROOM_TO_RUN_HTF_MIN_RR,
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
     SL_HYBRID_MIN_ATR_MULT,
     TIGHT_SL_MODE,
     USE_OPTIMAL_RR,
+    clean_symbol,
 )
 
 logger = logging.getLogger("ForexSMC.SMCDetector")
@@ -236,6 +242,17 @@ class TradeSetup:
     regime: str = "COMPRESSION"
     dynamic_be_trigger: float = 0.85
     is_adaptive_tp: bool = False
+    strong_level: float = 0.0
+    weak_level: float = 0.0
+    is_sweep_engineered: bool = False
+    htf_barrier_price: float = 0.0
+    htf_barrier_dist_r: float = 0.0
+    vwap: float = 0.0
+    poc: float = 0.0
+    rsi: float = 0.0
+    is_ribbon_expanding: bool = False
+    is_healthy_ha: bool = False
+    is_main_zumiko_signal: bool = False
 
 
 
@@ -302,8 +319,11 @@ class SMCDetector:
         Returns cached (swing_price, atr, point_scale) for symbol from latest M15 scan.
         If is_buy: returns (swing_low, atr, point_scale)
         If not is_buy: returns (swing_high, atr, point_scale)
+        Supports both raw broker symbols (e.g. 'EURUSD.pro') and clean symbols ('EURUSD').
         """
         cached = self._latest_swings.get(symbol.upper(), {})
+        if not cached:
+            cached = self._latest_swings.get(clean_symbol(symbol), {})
         if not cached:
             return 0.0, 0.0, 0.0001
         swing_price = cached.get("swing_low", 0.0) if is_buy else cached.get("swing_high", 0.0)
@@ -374,6 +394,115 @@ class SMCDetector:
 
         return False, "Brak"
 
+    @staticmethod
+    def _check_sweep_engineered_ob(
+        df: pd.DataFrame,
+        ob_bar_idx: int,
+        direction: str,
+        lookback_bars: int = 5,
+    ) -> Tuple[bool, str]:
+        """
+        Checks if the candle forming an Order Block (or its immediate predecessor)
+        performed an institutional liquidity sweep (Manipulation Grab) before breaking structure.
+        (Smart Risk Mentorship Hack #2).
+        """
+        if ob_bar_idx < 1 or df is None or len(df) <= ob_bar_idx:
+            return False, ""
+
+        is_buy = direction == "BUY"
+        win_start = max(0, ob_bar_idx - lookback_bars)
+        prior_bars = df.iloc[win_start:ob_bar_idx]
+        if prior_bars.empty:
+            return False, ""
+
+        if is_buy:
+            prior_min_low = float(prior_bars["low"].min())
+            curr_low = float(df.iloc[ob_bar_idx]["low"])
+            if curr_low < prior_min_low:
+                return True, f"Dołek OB ({curr_low:.5f}) wybił Sell-Side Liquidity ({prior_min_low:.5f})"
+
+            if ob_bar_idx >= 2:
+                prior_2_win = df.iloc[max(0, ob_bar_idx - 1 - lookback_bars):ob_bar_idx - 1]
+                if not prior_2_win.empty and float(df.iloc[ob_bar_idx - 1]["low"]) < float(prior_2_win["low"].min()):
+                    return True, f"Świeca przed OB wybiła Sell-Side Liquidity ({float(prior_2_win['low'].min()):.5f})"
+        else:
+            prior_max_high = float(prior_bars["high"].max())
+            curr_high = float(df.iloc[ob_bar_idx]["high"])
+            if curr_high > prior_max_high:
+                return True, f"Szczyt OB ({curr_high:.5f}) wybił Buy-Side Liquidity ({prior_max_high:.5f})"
+
+            if ob_bar_idx >= 2:
+                prior_2_win = df.iloc[max(0, ob_bar_idx - 1 - lookback_bars):ob_bar_idx - 1]
+                if not prior_2_win.empty and float(df.iloc[ob_bar_idx - 1]["high"]) > float(prior_2_win["high"].max()):
+                    return True, f"Świeca przed OB wybiła Buy-Side Liquidity ({float(prior_2_win['high'].max()):.5f})"
+
+        return False, ""
+
+    @staticmethod
+    def find_nearest_htf_barrier(
+        df_htf: Optional[pd.DataFrame],
+        direction: str,
+        entry_price: float,
+        lookback: int = 150,
+    ) -> Tuple[Optional[float], str]:
+        """
+        Finds the nearest unmitigated opposing HTF Supply/Demand barrier ahead of the price.
+        (Smart Risk Mentorship Hack #1 & #5).
+        Returns: (barrier_price, barrier_desc) or (None, "")
+        """
+        if df_htf is None or len(df_htf) < 30 or entry_price <= 0:
+            return None, ""
+
+        is_buy = direction == "BUY"
+        opposing_ob_val = -1.0 if is_buy else 1.0  # If BUY, oppose with Supply (-1.0); if SELL, Demand (1.0)
+        df_slice = df_htf.iloc[-lookback:] if len(df_htf) > lookback else df_htf
+        current_bar = len(df_slice) - 1
+
+        candidate_barriers: List[Tuple[float, str]] = []
+
+        # 1. Check HTF unmitigated Order Blocks
+        try:
+            swings_htf = smc.swing_highs_lows(df_slice, swing_length=3)
+            ob_htf = smc.ob(df_slice, swings_htf)
+            for _, row in ob_htf.iterrows():
+                if row.get("OB") == opposing_ob_val:
+                    mit = row.get("MitigatedIndex", 0.0)
+                    is_unmitigated = (mit == 0.0 or pd.isna(mit) or mit >= current_bar)
+                    if is_unmitigated:
+                        top, btm = float(row["Top"]), float(row["Bottom"])
+                        if is_buy and btm > entry_price:
+                            candidate_barriers.append((btm, f"HTF Supply OB [{btm:.4f} - {top:.4f}]"))
+                        elif not is_buy and top < entry_price:
+                            candidate_barriers.append((top, f"HTF Demand OB [{btm:.4f} - {top:.4f}]"))
+        except Exception as e:
+            logger.debug(f"Error checking HTF OB barrier: {e}")
+
+        # 2. Check HTF unmitigated Fair Value Gaps
+        try:
+            fvg_htf = smc.fvg(df_slice)
+            for _, row in fvg_htf.iterrows():
+                if row.get("FVG") == opposing_ob_val:
+                    mit = row.get("MitigatedIndex", 0.0)
+                    is_unmitigated = (mit == 0.0 or pd.isna(mit) or mit >= current_bar)
+                    if is_unmitigated:
+                        top, btm = float(row["Top"]), float(row["Bottom"])
+                        if is_buy and btm > entry_price:
+                            candidate_barriers.append((btm, f"HTF Supply FVG [{btm:.4f} - {top:.4f}]"))
+                        elif not is_buy and top < entry_price:
+                            candidate_barriers.append((top, f"HTF Demand FVG [{btm:.4f} - {top:.4f}]"))
+        except Exception as e:
+            logger.debug(f"Error checking HTF FVG barrier: {e}")
+
+        if not candidate_barriers:
+            return None, ""
+
+        if is_buy:
+            nearest = min(candidate_barriers, key=lambda x: x[0])
+            return nearest[0], nearest[1]
+        else:
+            nearest = max(candidate_barriers, key=lambda x: x[0])
+            return nearest[0], nearest[1]
+
     def _check_ob_and_fvg_confluence(
         self,
         df: pd.DataFrame,
@@ -382,10 +511,11 @@ class SMCDetector:
         z_bottom: float,
         z_top: float,
         direction: str,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, bool, str]:
         """
         Checks if an unmitigated Order Block (OB) or Fair Value Gap (FVG)
         originating in the impulse leg aligns with the entry zone [z_bottom, z_top].
+        Returns: (has_zone, zone_description, is_sweep_engineered, sweep_details)
         """
         target_val = 1.0 if direction == "BUY" else -1.0
         current_bar = len(df) - 1
@@ -393,12 +523,14 @@ class SMCDetector:
         ob_details = []
         has_fvg = False
         fvg_details = []
+        is_sweep_ob = False
+        sweep_ob_detail = ""
 
         # 1. Check Order Blocks across the impulse leg
         try:
             ob_df = smc.ob(df, swings)
             obs_in_leg = ob_df.iloc[max(0, leg_start_idx - 5):]
-            for _, row in obs_in_leg.iterrows():
+            for bar_idx, row in obs_in_leg.iterrows():
                 if row.get("OB") == target_val:
                     mit = row.get("MitigatedIndex", 0.0)
                     is_unmitigated = (mit == 0.0 or pd.isna(mit) or mit >= current_bar)
@@ -406,7 +538,13 @@ class SMCDetector:
                         top, btm = float(row["Top"]), float(row["Bottom"])
                         if not (btm > z_top or top < z_bottom):
                             has_ob = True
-                            ob_details.append(f"OB [{btm:.4f} - {top:.4f}]")
+                            is_sw, sw_msg = self._check_sweep_engineered_ob(df, int(bar_idx), direction)
+                            if is_sw:
+                                is_sweep_ob = True
+                                sweep_ob_detail = sw_msg
+                                ob_details.append(f"Sweep-OB [{btm:.4f} - {top:.4f}] ({sw_msg})")
+                            else:
+                                ob_details.append(f"OB [{btm:.4f} - {top:.4f}]")
                             break
         except Exception as e:
             logger.debug(f"Error checking OB overlap: {e}")
@@ -428,13 +566,17 @@ class SMCDetector:
         except Exception as e:
             logger.debug(f"Error checking FVG overlap: {e}")
 
+        zone_desc = ""
         if has_ob and has_fvg:
-            return True, f"Zbieżność {direction} {ob_details[0]} + {fvg_details[0]}"
+            zone_desc = f"Zbieżność {direction} {ob_details[0]} + {fvg_details[0]}"
         elif has_ob:
-            return True, f"Strefa {direction} {ob_details[0]}"
+            zone_desc = f"Strefa {direction} {ob_details[0]}"
         elif has_fvg:
-            return True, f"Strefa {direction} {fvg_details[0]}"
-        return False, "Brak strefy OB/FVG w tym rejonie"
+            zone_desc = f"Strefa {direction} {fvg_details[0]}"
+        else:
+            zone_desc = "Brak strefy OB/FVG w tym rejonie"
+
+        return (has_ob or has_fvg), zone_desc, is_sweep_ob, sweep_ob_detail
 
     def scan_for_setups(
         self,
@@ -484,12 +626,16 @@ class SMCDetector:
             if len(valid_swings) > 0:
                 highs = valid_swings[valid_swings["HighLow"] == 1]["Level"].values
                 lows = valid_swings[valid_swings["HighLow"] == -1]["Level"].values
-                self._latest_swings[symbol.upper()] = {
+                swing_data = {
                     "swing_high": float(highs[-1]) if len(highs) > 0 else 0.0,
                     "swing_low": float(lows[-1]) if len(lows) > 0 else 0.0,
                     "atr": float(atr),
                     "point_scale": point_scale,
                 }
+                self._latest_swings[symbol.upper()] = swing_data
+                clean_k = clean_symbol(symbol)
+                if clean_k and clean_k != symbol.upper():
+                    self._latest_swings[clean_k] = swing_data
         except Exception as e:
             logger.debug(f"Error caching M15 swings for {symbol}: {e}")
 
@@ -609,6 +755,7 @@ class SMCDetector:
                 df_d1=df_d1,
                 df_w1=df_w1,
                 df_h1=df_h1,
+                df_htf=df_htf,
                 structure_age=structure_age,
                 regime=regime.value,
                 dynamic_be=dynamic_be,
@@ -645,6 +792,7 @@ class SMCDetector:
         df_d1: Optional[pd.DataFrame] = None,
         df_w1: Optional[pd.DataFrame] = None,
         df_h1: Optional[pd.DataFrame] = None,
+        df_htf: Optional[pd.DataFrame] = None,
         leg_df: Optional[pd.DataFrame] = None,
         structure_age: int = 5,
         regime: str = "COMPRESSION",
@@ -702,11 +850,17 @@ class SMCDetector:
                     return None
 
             entry = current_price
-            if TIGHT_SL_MODE:
+            strong_level = impulse_low
+            weak_level = impulse_high
+
+            if ENFORCE_STRONG_STRUCTURAL_SL:
+                # Smart Risk Rule: SL strictly protected behind Strong Low
+                structural_sl = strong_level - effective_buffer
+            elif TIGHT_SL_MODE:
                 recent_pullback_low = df_ltf.iloc[-5:]["low"].min()
                 structural_sl = min(fibo_786, recent_pullback_low) - effective_buffer
             else:
-                structural_sl = impulse_low - effective_buffer
+                structural_sl = strong_level - effective_buffer
 
             # Guarantee SL protects beyond swept liquidity levels
             if liq_eval.has_sweep and liq_eval.swept_levels:
@@ -777,11 +931,17 @@ class SMCDetector:
                     return None
 
             entry = current_price
-            if TIGHT_SL_MODE:
+            strong_level = impulse_high
+            weak_level = impulse_low
+
+            if ENFORCE_STRONG_STRUCTURAL_SL:
+                # Smart Risk Rule: SL strictly protected behind Strong High
+                structural_sl = strong_level + effective_buffer
+            elif TIGHT_SL_MODE:
                 recent_pullback_high = df_ltf.iloc[-5:]["high"].max()
                 structural_sl = max(fibo_786, recent_pullback_high) + effective_buffer
             else:
-                structural_sl = impulse_high + effective_buffer
+                structural_sl = strong_level + effective_buffer
 
             # Guarantee SL protects beyond swept liquidity levels
             if liq_eval.has_sweep and liq_eval.swept_levels:
@@ -836,6 +996,45 @@ class SMCDetector:
             zone_top = fibo_786
             zone_bottom = fibo_618
 
+        # Smart Risk Hack #1 & #5: Room to Run & HTF Barrier Filter
+        htf_barrier_price = 0.0
+        htf_barrier_dist_r = 0.0
+
+        if ENABLE_ROOM_TO_RUN_HTF_FILTER and risk > 0:
+            barrier_p, barrier_desc = self.find_nearest_htf_barrier(df_h1, direction, entry)
+            if barrier_p is None and df_htf is not None:
+                barrier_p, barrier_desc = self.find_nearest_htf_barrier(df_htf, direction, entry)
+
+            if barrier_p is not None:
+                htf_barrier_price = barrier_p
+                room_dist = (barrier_p - entry) if is_buy else (entry - barrier_p)
+                room_r = room_dist / risk
+                htf_barrier_dist_r = round(room_r, 2)
+
+                if room_r < ROOM_TO_RUN_HTF_MIN_RR:
+                    logger.info(
+                        f"🛡️ [FILTER] Odrzucono setup {symbol} {direction}: "
+                        f"Zbyt mała przestrzeń do przeciwległej strefy HTF ({room_r:.2f}R < {ROOM_TO_RUN_HTF_MIN_RR:.1f}R, {barrier_desc})."
+                    )
+                    return None
+
+                # Cap TP1 at or before the opposing HTF barrier if barrier is closer than current TP1
+                # (Smart Risk Hack #1 & #5: Never project Take Profit into an unmitigated HTF S/D barrier)
+                if is_buy and barrier_p < tp1:
+                    logger.info(
+                        f"🎯 [TP CAPPING] {symbol} BUY: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f} "
+                        f"({room_r:.1f}R zamiast {actual_rr:.1f}R, {barrier_desc})."
+                    )
+                    tp1 = barrier_p
+                    actual_rr = round(room_r, 1)
+                elif not is_buy and barrier_p > tp1:
+                    logger.info(
+                        f"🎯 [TP CAPPING] {symbol} SELL: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f} "
+                        f"({room_r:.1f}R zamiast {actual_rr:.1f}R, {barrier_desc})."
+                    )
+                    tp1 = barrier_p
+                    actual_rr = round(room_r, 1)
+
         breakdown: List[ConfluenceItem] = []
         total_score = 0
 
@@ -858,12 +1057,17 @@ class SMCDetector:
             detail=h4_desc
         ))
 
-        # 2. Institutional POI: Order Block / FVG Confluence (25%)
+        # 2. Institutional POI: Order Block / FVG Confluence (25%) + Sweep-Engineered OB
         ob_fibo_low = min(fibo_786, fibo_618)
         ob_fibo_high = max(fibo_786, fibo_618)
-        has_ob_fvg, ob_detail = self._check_ob_and_fvg_confluence(
+        has_ob_fvg, ob_detail, is_sweep_ob, sweep_detail = self._check_ob_and_fvg_confluence(
             df_ltf, swings_ltf, leg_start_idx, ob_fibo_low, ob_fibo_high, direction
         )
+
+        if REQUIRE_SWEEP_ENGINEERED_OB and not is_sweep_ob:
+            logger.info(f"🛡️ [FILTER] Odrzucono setup {symbol} {direction}: Wymagany Sweep-Engineered OB (Smart Risk Hack #2).")
+            return None
+
         w2 = 25 if has_ob_fvg else 0
         total_score += w2
         breakdown.append(ConfluenceItem(
@@ -873,19 +1077,50 @@ class SMCDetector:
             detail=f"{ob_detail} (+{w2}%)"
         ))
 
-        # 3. Market Structure Confirmation (CHoCH / BOS) (15%)
+        # Sweep-Engineered OB Bonus (Smart Risk Hack #2)
+        if is_sweep_ob:
+            total_score += BONUS_POINTS_SWEEP_OB
+            breakdown.append(ConfluenceItem(
+                factor="Sweep-Engineered OB (Hack #2)",
+                weight=BONUS_POINTS_SWEEP_OB,
+                achieved=True,
+                detail=f"Instytucjonalny Manipulation Grab: {sweep_detail} (+{BONUS_POINTS_SWEEP_OB}%)"
+            ))
+
+        # 3. Market Structure Confirmation (CHoCH / BOS) (15%) with Smart Risk Strong/Weak Mapping
         choch_label = "szczytu" if is_buy else "dołka"
         event_desc = "Odwrócenie trendu (CHoCH)" if event_name == "CHoCH" else "Kontynuacja trendu (BOS)"
         is_fresh = structure_age <= 10
         w3 = 15 if is_fresh else 10
         total_score += w3
         fresh_desc = "Świeże wybicie" if is_fresh else f"Wybicie ({structure_age} b. temu)"
+        strong_label = "Strong Low" if is_buy else "Strong High"
+        weak_label = "Weak High" if is_buy else "Weak Low"
         breakdown.append(ConfluenceItem(
             factor=f"Potwierdzenie M15 {event_name}",
             weight=15,
             achieved=True,
-            detail=f"{event_desc} ({fresh_desc}): {broken_level:.{digits}f} (+{w3}%)"
+            detail=f"{event_desc} ({fresh_desc}): {broken_level:.{digits}f} [{strong_label}: {strong_level:.{digits}f} -> {weak_label}: {weak_level:.{digits}f}] (+{w3}%)"
         ))
+
+        # Room to Run HTF confluence (Hack #1 & #5)
+        if ENABLE_ROOM_TO_RUN_HTF_FILTER and (df_h1 is not None or df_htf is not None):
+            if htf_barrier_price > 0:
+                breakdown.append(ConfluenceItem(
+                    factor="Room to Run HTF",
+                    weight=5,
+                    achieved=True,
+                    detail=f"Czysta droga: {htf_barrier_dist_r:.1f}R do strefy HTF ({htf_barrier_price:.{digits}f}) (+5%)"
+                ))
+                total_score += 5
+            else:
+                breakdown.append(ConfluenceItem(
+                    factor="Room to Run HTF",
+                    weight=5,
+                    achieved=True,
+                    detail="Czysta droga: brak przeciwnych stref Supply/Demand HTF na wykresie (+5%)"
+                ))
+                total_score += 5
 
         # 4. Advanced Liquidity Sweep (15% base + 5% bonus for Multi-Sweep / HTF)
         has_sweep = liq_eval.has_sweep
@@ -988,4 +1223,9 @@ class SMCDetector:
             regime=regime,
             dynamic_be_trigger=dynamic_be,
             is_adaptive_tp=is_optimal_rr,
+            strong_level=round(strong_level, digits),
+            weak_level=round(weak_level, digits),
+            is_sweep_engineered=is_sweep_ob,
+            htf_barrier_price=round(htf_barrier_price, digits) if htf_barrier_price > 0 else 0.0,
+            htf_barrier_dist_r=htf_barrier_dist_r,
         )

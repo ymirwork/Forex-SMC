@@ -4,6 +4,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from config import clean_symbol
+
 logger = logging.getLogger("ForexSMC.TradeInsights")
 
 
@@ -111,8 +113,8 @@ class TradeInsightEngine:
 
         result = {}
 
-        # 1. By Symbol
-        result["symbol"] = self._group_by(trades, lambda t: t.get("symbol", "").upper(), "symbol")
+        # 1. By Symbol (normalized via clean_symbol to unify broker suffixes)
+        result["symbol"] = self._group_by(trades, lambda t: clean_symbol(t.get("symbol", "")), "symbol")
 
         # 2. By Session
         result["session"] = self._group_by(
@@ -238,9 +240,11 @@ class TradeInsightEngine:
         evaluation = SetupEvaluation()
         weak_hits = []
 
+        clean_target_sym = clean_symbol(symbol)
+
         # Check symbol edge
         for m in edge_data.get("symbol", []):
-            if m.label.upper() == symbol.upper() and m.n_trades >= self.min_sample_size and m.is_weak:
+            if clean_symbol(m.label) == clean_target_sym and m.n_trades >= self.min_sample_size and m.is_weak:
                 weak_hits.append(
                     f"⚠️ {symbol}: EV {m.ev_per_trade:+.2f}R | WinRate {m.winrate:.0f}% | PF {m.profit_factor:.2f} (n={m.n_trades})"
                 )
@@ -271,7 +275,7 @@ class TradeInsightEngine:
         closed = self._cached_closed_trades or self._get_closed_trades()
         sym_sess_trades = [
             t for t in closed
-            if t.get("symbol", "").upper() == symbol.upper()
+            if clean_symbol(t.get("symbol", "")) == clean_target_sym
             and (t.get("session_name") or self._infer_session(t.get("timestamp", ""))) == session_name
         ]
         if len(sym_sess_trades) >= self.min_sample_size:

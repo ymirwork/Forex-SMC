@@ -33,6 +33,13 @@ class TestAdaptivePositionManager(unittest.TestCase):
         regime_bear = self.manager.classify_regime("BEARISH", "BEARISH", atr_percentile=45.0, is_news_window=False)
         self.assertEqual(regime_bear, MarketRegime.STRONG_TREND)
 
+        # Direction string normalization (BUY -> BULLISH, SELL -> BEARISH)
+        regime_buy = self.manager.classify_regime("BULLISH", "BUY", atr_percentile=60.0, is_news_window=False)
+        self.assertEqual(regime_buy, MarketRegime.STRONG_TREND)
+
+        regime_sell = self.manager.classify_regime("BEARISH", "SELL", atr_percentile=50.0, is_news_window=False)
+        self.assertEqual(regime_sell, MarketRegime.STRONG_TREND)
+
     def test_regime_classification_compression(self):
         # Conflicting timeframes
         regime_conflict = self.manager.classify_regime("BULLISH", "BEARISH", atr_percentile=60.0)

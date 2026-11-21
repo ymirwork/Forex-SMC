@@ -8,7 +8,6 @@ recovers damaged tables, and optionally reconciles state with MetaTrader 5 and N
 import argparse
 import asyncio
 import os
-import sqlite3
 import sys
 
 from trade_journal import TradeJournal

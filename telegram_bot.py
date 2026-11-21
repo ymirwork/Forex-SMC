@@ -570,8 +570,6 @@ class TelegramBotManager:
             )
             return
 
-        await self._safe_answer_query(query)
-
         data = query.data or ""
         parts = data.split(":")
         action = parts[0]
@@ -603,10 +601,12 @@ class TelegramBotManager:
                 self.mute_symbol(setup.symbol, setup.direction, hours=DISMISS_MUTE_HOURS)
                 mute_txt = f"\n\n🔇 **Powiadomienia dla {setup.symbol} [{setup.direction}] wyciszone na {DISMISS_MUTE_HOURS:.1f}h.**"
 
+            await self._safe_answer_query(query, text="Setup odrzucony.")
             await self._safe_edit_message(query, f"{orig_caption}\n\n❌ **Setup odrzucony przez użytkownika.**{mute_txt}")
             return
 
         if not setup:
+            await self._safe_answer_query(query, text="Ten setup wygasł lub został już przetworzony.", show_alert=True)
             await self._safe_edit_message(query, f"{orig_caption}\n\n⚠️ **Ten setup wygasł lub został już przetworzony.**")
             return
 
@@ -698,10 +698,7 @@ class TelegramBotManager:
 
         grade_val = getattr(setup, "grade", "")
         if not grade_val and setup.confluence_score > 0:
-            if strat_name_db == "Zumiko KillMLM":
-                grade_val = "A+" if setup.confluence_score >= 90 else ("A" if setup.confluence_score >= 75 else "B")
-            else:
-                grade_val = "A+" if setup.confluence_score >= 85 else ("A" if setup.confluence_score >= 70 else "B")
+            grade_val = "A+" if setup.confluence_score >= 85 else ("A" if setup.confluence_score >= 70 else "B")
 
         if action == "market":
             comment_str = f"{strat_prefix} {'Pyr L' + str(pyr_level) + ' ' if is_pyr else ''}{setup.setup_type[:10]}"[:31]
@@ -769,8 +766,10 @@ class TelegramBotManager:
                     f"🎯 **SL:** `{setup.sl_price}` | **TP:** `{setup.tp1_price}`"
                     f"{trail_msg}"
                 )
+                await self._safe_answer_query(query, text=f"✅ Zlecenie Market #{ticket} wykonane!")
                 await self._safe_edit_message(query, new_caption)
             else:
+                await self._safe_answer_query(query, text=f"❌ Błąd MT5: {msg[:180]}", show_alert=True)
                 await self._safe_edit_message(
                     query,
                     f"{orig_caption}\n\n❌ **Błąd wykonania w MT5:** {msg}"
@@ -832,8 +831,10 @@ class TelegramBotManager:
                     f"📍 **Cena Limit:** `{setup.entry_price}`\n"
                     f"📦 **Wolumen:** `{lot} lot`"
                 )
+                await self._safe_answer_query(query, text=f"🟡 Zlecenie Limit #{ticket} złożone!")
                 await self._safe_edit_message(query, new_caption)
             else:
+                await self._safe_answer_query(query, text=f"❌ Błąd limit MT5: {msg[:180]}", show_alert=True)
                 await self._safe_edit_message(
                     query,
                     f"{orig_caption}\n\n❌ **Błąd zlecenia limit w MT5:** {msg}"
@@ -934,7 +935,11 @@ class TelegramBotManager:
         # Zumiko indicators line
         zumiko_text = ""
         if getattr(setup, "ema_238", 0.0) > 0:
-            zumiko_text = f"📈 **Zumiko:** EMA 10/21: `{setup.ema_fast:.{digits}f}/{setup.ema_slow:.{digits}f}` | 🌟 EMA 238: `{setup.ema_238:.{digits}f}` | {setup.swing_pattern}\n"
+            vwap_part = f" | 🧭 VWAP: `{setup.vwap:.{digits}f}`" if getattr(setup, "vwap", 0.0) > 0 else ""
+            poc_part = f" | 🎯 POC: `{setup.poc:.{digits}f}`" if getattr(setup, "poc", 0.0) > 0 else ""
+            rsi_part = f" | RSI: `{setup.rsi:.1f}`" if getattr(setup, "rsi", 0.0) > 0 else ""
+            ribbon_tag = " 🚀" if getattr(setup, "is_ribbon_expanding", False) else ""
+            zumiko_text = f"📈 **ZuMiKo:** EMA: `{setup.ema_fast:.{digits}f}/{setup.ema_slow:.{digits}f}`{ribbon_tag} | 🌟 EMA 238: `{setup.ema_238:.{digits}f}`{vwap_part}{poc_part}{rsi_part} | {setup.swing_pattern}\n"
 
         # Swept Liquidity highlight line
         liq_line = ""
@@ -959,6 +964,21 @@ class TelegramBotManager:
                 edge_warning_text += f"📉 _Ryzyko automatycznie zredukowane o {int((1-setup._risk_multiplier)*100)}%_\n"
             edge_warning_text += "\n"
 
+        # Smart Risk Structure & Sweep-Engineered OB lines
+        smart_risk_line = ""
+        strong_lvl = getattr(setup, "strong_level", 0.0)
+        weak_lvl = getattr(setup, "weak_level", 0.0)
+        if strong_lvl > 0 and weak_lvl > 0:
+            strong_label = "Strong Low" if setup.direction == "BUY" else "Strong High"
+            weak_label = "Weak High" if setup.direction == "BUY" else "Weak Low"
+            sweep_ob_tag = " 🌪️ [Sweep-OB]" if getattr(setup, "is_sweep_engineered", False) else ""
+            smart_risk_line = f"🏛️ **Struktura Smart Risk:** `{strong_label}: {strong_lvl:.{digits}f}` | `{weak_label}: {weak_lvl:.{digits}f}`{sweep_ob_tag}\n"
+
+        barrier_line = ""
+        htf_barr = getattr(setup, "htf_barrier_price", 0.0)
+        if htf_barr > 0:
+            barrier_line = f"🚪 **Room to Run HTF:** `{setup.htf_barrier_dist_r:.1f}R` do strefy `{htf_barr:.{digits}f}`\n"
+
         caption = (
             f"{header_title}\n"
             f"🎯 **Ocena:** `{setup.confluence_score}%` {grade_emoji}\n\n"
@@ -971,6 +991,8 @@ class TelegramBotManager:
             f"🎯 **Strategia:** `{setup.setup_type}`\n\n"
             f"{mtf_text}"
             f"{zumiko_text}"
+            f"{smart_risk_line}"
+            f"{barrier_line}"
             f"{fibo_text}"
             f"{liq_line}"
             f"{confluence_lines}"
