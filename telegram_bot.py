@@ -867,7 +867,8 @@ class TelegramBotManager:
             if not achieved_items:
                 achieved_items = setup.confluence_breakdown[:3]
             for item in achieved_items:
-                confluence_lines += f"• ✅ `[+{item.weight}%]` {item.factor}\n"
+                tag = f"[+{item.weight}%]" if item.weight > 0 else "[FILTR OK]"
+                confluence_lines += f"• ✅ `{tag}` {item.factor}\n"
             confluence_lines += "\n"
 
         session_badge = f"🕒 **Sesja:** `{setup.session_name}`" + (" ⚡" if setup.is_killzone else "")

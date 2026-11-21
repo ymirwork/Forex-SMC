@@ -345,11 +345,7 @@ class TradeJournal:
     ) -> int:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if not grade and confluence_score > 0:
-            strat_upper = str(strategy).upper()
-            if "ZUMIKO" in strat_upper or "KILLMLM" in strat_upper:
-                grade = "A+" if confluence_score >= 90 else ("A" if confluence_score >= 75 else "B")
-            else:
-                grade = "A+" if confluence_score >= 85 else ("A" if confluence_score >= 70 else "B")
+            grade = "A+" if confluence_score >= 85 else ("A" if confluence_score >= 70 else "B")
 
         with self._get_connection() as conn:
             cur = conn.cursor()
