@@ -1,6 +1,8 @@
 import asyncio
+import html
 import logging
 import os
+import re
 import time
 from typing import Dict, Optional, Tuple
 
@@ -41,6 +43,98 @@ from trade_journal import TradeJournal
 from trade_insights import TradeInsightEngine
 
 logger = logging.getLogger("ForexSMC.TelegramBot")
+
+
+def md_to_telegram_html(text: str) -> str:
+    """Converts standard markdown (**bold**, `code`, _italic_, [link](url)) to safe Telegram HTML."""
+    if not text:
+        return ""
+
+    code_blocks = []
+    inline_codes = []
+
+    def repl_block(m):
+        code_blocks.append(m.group(1))
+        return f"\x00BLOCK{len(code_blocks)-1}\x00"
+
+    def repl_inline(m):
+        inline_codes.append(m.group(1))
+        return f"\x00INLINE{len(inline_codes)-1}\x00"
+
+    # 1. Protect code blocks ```...```
+    text = re.sub(r"```(?:[a-zA-Z0-9_+-]+)?\n?(.*?)```", repl_block, text, flags=re.DOTALL)
+
+    # 2. Protect inline code `...`
+    text = re.sub(r"`([^`\n]+)`", repl_inline, text)
+
+    # 3. Escape HTML entities in the remaining text
+    text = html.escape(text, quote=False)
+
+    # 4. Convert markdown links: [text](url) -> <a href="url">text</a>
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # 5. Convert bold: **text** -> <b>text</b>
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
+
+    # 6. Convert italic: _text_ -> <i>text</i> (only when not inside words or numbers)
+    text = re.sub(r"(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])", r"<i>\1</i>", text)
+
+    # 7. Restore protected inline code: <code>escaped(code)</code>
+    for idx, code in enumerate(inline_codes):
+        escaped_code = html.escape(code, quote=False)
+        text = text.replace(f"\x00INLINE{idx}\x00", f"<code>{escaped_code}</code>")
+
+    # 8. Restore protected code blocks: <pre>escaped(block)</pre>
+    for idx, block in enumerate(code_blocks):
+        escaped_block = html.escape(block, quote=False)
+        text = text.replace(f"\x00BLOCK{idx}\x00", f"<pre>{escaped_block}</pre>")
+
+    return text
+
+
+def truncate_telegram_html(html_text: str, max_rendered_len: int = 1000) -> str:
+    """Safely truncates HTML text so rendered length doesn't exceed limit, properly closing tags."""
+    clean_text = re.sub(r"<[^>]+>", "", html_text)
+    if len(clean_text) <= max_rendered_len:
+        return html_text
+
+    rendered_count = 0
+    open_tags = []
+    tag_regex = re.compile(r"</?([a-zA-Z0-9]+)[^>]*>")
+    last_newline_idx = -1
+    last_newline_open_tags = []
+
+    i = 0
+    while i < len(html_text):
+        m = tag_regex.match(html_text, i)
+        if m:
+            tag_name = m.group(1).lower()
+            is_closing = html_text[i + 1] == "/"
+            if is_closing:
+                if open_tags and open_tags[-1] == tag_name:
+                    open_tags.pop()
+            else:
+                open_tags.append(tag_name)
+            i = m.end()
+        else:
+            if html_text[i] == "\n":
+                last_newline_idx = i
+                last_newline_open_tags = list(open_tags)
+            rendered_count += 1
+            if rendered_count >= max_rendered_len:
+                break
+            i += 1
+
+    if last_newline_idx > 0:
+        result = html_text[:last_newline_idx]
+        for tag in reversed(last_newline_open_tags):
+            result += f"</{tag}>"
+        return result
+    else:
+        result = html_text[:i]
+        for tag in reversed(open_tags):
+            result += f"</{tag}>"
+        return result
 
 
 class TelegramBotManager:
@@ -132,15 +226,16 @@ class TelegramBotManager:
         return (user_id in self.allowed_chat_ids) or (chat_id in self.allowed_chat_ids)
 
     @staticmethod
-    async def _safe_edit_message(query, text: str, parse_mode: str = "Markdown"):
+    async def _safe_edit_message(query, text: str, parse_mode: str = "HTML"):
         """Safely edits message caption (for photo alerts) or message text (for text alerts)."""
         if not query.message:
             return
+        formatted = md_to_telegram_html(text) if parse_mode == "HTML" else text
         try:
             if query.message.caption is not None:
-                await query.edit_message_caption(caption=text, parse_mode=parse_mode)
+                await query.edit_message_caption(caption=formatted, parse_mode=parse_mode)
             else:
-                await query.edit_message_text(text=text, parse_mode=parse_mode)
+                await query.edit_message_text(text=formatted, parse_mode=parse_mode)
         except Exception as e:
             logger.debug(f"Error in _safe_edit_message: {e}")
 
@@ -161,11 +256,13 @@ class TelegramBotManager:
         if not self._is_authorized(update):
             user_id = update.effective_user.id if update.effective_user else 0
             await update.message.reply_text(
-                f"⛔ **Brak uprawnień do korzystania z tego bota.**\n\n"
-                f"👤 Twoje prywatne User ID: `{user_id}`\n\n"
-                f"Aby autoryzować swoje konto, dopisz to ID do `TELEGRAM_CHAT_ID` w pliku `.env`:\n"
-                f"`TELEGRAM_CHAT_ID=-1004455323838,{user_id}`",
-                parse_mode="Markdown",
+                md_to_telegram_html(
+                    f"⛔ **Brak uprawnień do korzystania z tego bota.**\n\n"
+                    f"👤 Twoje prywatne User ID: `{user_id}`\n\n"
+                    f"Aby autoryzować swoje konto, dopisz to ID do `TELEGRAM_CHAT_ID` w pliku `.env`:\n"
+                    f"`TELEGRAM_CHAT_ID=-1004455323838,{user_id}`"
+                ),
+                parse_mode="HTML",
             )
             return
 
@@ -190,7 +287,7 @@ class TelegramBotManager:
             "• `/insights` - Analiza słabych stron i mocnych zagrań (Edge Report)\n"
             "• `/adaptive` - Silnik adaptacyjny (reżimy rynku, dynamiczny BE i trailing)\n"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
 
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -255,7 +352,7 @@ class TelegramBotManager:
                     f"• Pozostały bufor: `{metrics['remaining_buffer_usd']:.2f} {metrics['currency']}`\n"
                     f"• Slot pozycji: `{metrics['open_positions_count']}/{metrics['max_open_trades']}`"
                 )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
 
     async def prop_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Displays comprehensive Prop Firm Risk Dashboard."""
@@ -294,7 +391,7 @@ class TelegramBotManager:
             f"• Niezrealizowany PnL: `{total_pnl:+.2f} {metrics['currency']}`\n\n"
             "💡 Użyj komendy `/be`, aby przestawiać zyskowne pozycje na Break-Even!"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
 
     async def scan_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -354,7 +451,7 @@ class TelegramBotManager:
             f"{recent_lines}\n"
             "💡 Wpisz `/optimizer`, aby obliczyć Take Profit, lub `/notionsync` dla bazy Notion!"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
 
     async def notionsync_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Syncs all historical or unsynced trades between MT5, trades.db, and Notion."""
@@ -376,7 +473,7 @@ class TelegramBotManager:
                 "   `NOTION_DATABASE_ID=twoj_database_id`\n"
                 "7. Ustaw `ENABLE_NOTION=True` w `.env` i wpisz tutaj `/notionsync`!"
             )
-            await update.message.reply_text(help_msg, parse_mode="Markdown")
+            await update.message.reply_text(md_to_telegram_html(help_msg), parse_mode="HTML")
             return
 
         await update.message.reply_text("🔄 Rozpoczynam pełną synchronizację (MT5 <--> trades.db <--> Notion)...")
@@ -384,9 +481,12 @@ class TelegramBotManager:
             from sync_journal import sync_all
             await sync_all()
             await update.message.reply_text(
-                "🎉 **Pełna synchronizacja zakończona sukcesem!**\n\n"
-                "✅ Wszystkie transakcje z terminala MT5, bazy lokalnej trades.db oraz Notion są teraz w 100% zgodne.\n"
-                "Wpisz `/status` lub `/journal`, aby sprawdzić aktualne podsumowanie."
+                md_to_telegram_html(
+                    "🎉 **Pełna synchronizacja zakończona sukcesem!**\n\n"
+                    "✅ Wszystkie transakcje z terminala MT5, bazy lokalnej trades.db oraz Notion są teraz w 100% zgodne.\n"
+                    "Wpisz `/status` lub `/journal`, aby sprawdzić aktualne podsumowanie."
+                ),
+                parse_mode="HTML",
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Błąd podczas synchronizacji: {e}")
@@ -403,7 +503,7 @@ class TelegramBotManager:
         report_msg = RROptimizer.format_optimizer_report(
             RROptimizer.calculate_best_rr(trades)
         )
-        await update.message.reply_text(report_msg, parse_mode="Markdown")
+        await update.message.reply_text(md_to_telegram_html(report_msg), parse_mode="HTML")
 
     async def adaptive_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Displays status and statistics of Adaptive Position Management engine."""
@@ -436,7 +536,7 @@ class TelegramBotManager:
             f"• 🔴 **HIGH_VOLATILITY:** BE: `+{ADAPTIVE_BE_VOLATILE_R:.2f}R` | Próba w bazie: `{len(vol_trades)}/{ADAPTIVE_MIN_REGIME_SAMPLES}` | Piramida: `ZABLOKOWANA`\n\n"
             f"💡 *Gdy próbka w reżimie osiągnie {ADAPTIVE_MIN_REGIME_SAMPLES} zagrań, Take Profit jest optymalizowany automatycznie pod kątem najwyższego EV.*"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
 
     async def addtrade_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Allows manual addition of trades from phone: /addtrade XAUUSD BUY YES 1.0 2.8"""
@@ -452,7 +552,7 @@ class TelegramBotManager:
                 "`/addtrade XAUUSD BUY YES 1.0 2.8`\n"
                 "*(Wygrana długa pozycja na złocie zamknięta przy +1.0R, max peak MFE 2.8R)*"
             )
-            await update.message.reply_text(help_msg, parse_mode="Markdown")
+            await update.message.reply_text(md_to_telegram_html(help_msg), parse_mode="HTML")
             return
 
         try:
@@ -490,9 +590,12 @@ class TelegramBotManager:
                 comment=f"Dodano ręcznie przez Telegram [{direction}]",
             )
             await update.message.reply_text(
-                f"✅ Dodano transakcję #{trade_id} do dziennika!\n"
-                f"• {symbol} [{direction}] [{status}]: Wynik `{realized_r:+.1f}R` | Max R: `{max_r:.1f}R`\n\n"
-                f"Wpisz `/optimizer`, aby zobaczyć zaktualizowany Best RR!"
+                md_to_telegram_html(
+                    f"✅ Dodano transakcję #{trade_id} do dziennika!\n"
+                    f"• {symbol} [{direction}] [{status}]: Wynik `{realized_r:+.1f}R` | Max R: `{max_r:.1f}R`\n\n"
+                    f"Wpisz `/optimizer`, aby zobaczyć zaktualizowany Best RR!"
+                ),
+                parse_mode="HTML",
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Błąd zapisu: {e}")
@@ -503,26 +606,31 @@ class TelegramBotManager:
             return
 
         if not self.insight_engine:
-            await update.message.reply_text("ℹ️ Silnik analityczny jest wyłączony. Ustaw `ENABLE_DYNAMIC_EDGE_FILTER=True` w `.env`.")
+            await update.message.reply_text(
+                md_to_telegram_html("ℹ️ Silnik analityczny jest wyłączony. Ustaw `ENABLE_DYNAMIC_EDGE_FILTER=True` w `.env`."),
+                parse_mode="HTML",
+            )
             return
 
         await update.message.reply_text("🔍 Analizuję historię transakcji...")
         report = self.insight_engine.generate_insights_report()
 
+        html_report = md_to_telegram_html(report)
         # Split long reports for Telegram's 4096 char limit
-        if len(report) <= 4096:
-            await update.message.reply_text(report, parse_mode="Markdown")
+        clean_len = len(re.sub(r"<[^>]+>", "", html_report))
+        if clean_len <= 4096:
+            await update.message.reply_text(html_report, parse_mode="HTML")
         else:
             parts = report.split("\n\n")
             chunk = ""
             for part in parts:
-                if len(chunk) + len(part) + 2 > 4000:
-                    await update.message.reply_text(chunk, parse_mode="Markdown")
+                if len(chunk) + len(part) + 2 > 3500:
+                    await update.message.reply_text(md_to_telegram_html(chunk), parse_mode="HTML")
                     chunk = part
                 else:
                     chunk = chunk + "\n\n" + part if chunk else part
             if chunk:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
+                await update.message.reply_text(md_to_telegram_html(chunk), parse_mode="HTML")
 
     async def be_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Moves Stop Loss of open position to Break-Even."""
@@ -533,10 +641,13 @@ class TelegramBotManager:
             try:
                 ticket_num = int(context.args[0])
                 ok, msg = self.mt5_client.move_sl_to_breakeven(ticket_num)
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
                 return
             except ValueError:
-                await update.message.reply_text("❌ Podaj poprawny numer ticketu, np. `/be 105626168`", parse_mode="Markdown")
+                await update.message.reply_text(
+                    md_to_telegram_html("❌ Podaj poprawny numer ticketu, np. `/be 105626168`"),
+                    parse_mode="HTML",
+                )
                 return
 
         positions = self.mt5_client.get_open_positions()
@@ -581,7 +692,7 @@ class TelegramBotManager:
                 ok, msg = self.mt5_client.move_sl_to_breakeven(ticket_num)
                 await self._safe_answer_query(query, text=msg[:190], show_alert=True)
                 if ok and query.message:
-                    await query.message.reply_text(msg, parse_mode="Markdown")
+                    await query.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
             except Exception as e:
                 await self._safe_answer_query(query, text=f"Błąd BE: {e}", show_alert=True)
             return
@@ -1038,19 +1149,22 @@ class TelegramBotManager:
 
         try:
             target_chat = self.alert_channel
+            html_caption = md_to_telegram_html(caption)
+            clean_len = len(re.sub(r"<[^>]+>", "", html_caption))
+
             if chart_path and os.path.exists(chart_path):
                 with open(chart_path, "rb") as photo:
-                    if len(caption) <= 1024:
+                    if clean_len <= 1024:
                         try:
                             await self.app.bot.send_photo(
                                 chat_id=target_chat,
                                 photo=photo,
-                                caption=caption,
-                                parse_mode="Markdown",
+                                caption=html_caption,
+                                parse_mode="HTML",
                                 reply_markup=reply_markup,
                             )
                         except Exception as e:
-                            logger.warning(f"Failed to send photo with Markdown, retrying plain text: {e}")
+                            logger.warning(f"Failed to send photo with HTML, retrying plain text: {e}")
                             photo.seek(0)
                             await self.app.bot.send_photo(
                                 chat_id=target_chat,
@@ -1060,62 +1174,54 @@ class TelegramBotManager:
                                 reply_markup=reply_markup,
                             )
                     else:
-                        # Truncate cleanly at 1000 characters to never exceed Telegram 1024 limit
-                        safe_caption = caption[:1000].rsplit("\n", 1)[0]
-                        if safe_caption.count("`") % 2 != 0:
-                            safe_caption += "`"
-                        if safe_caption.count("**") % 2 != 0:
-                            safe_caption += "**"
-                        if safe_caption.count("*") % 2 != 0:
-                            safe_caption += "*"
-                        if safe_caption.count("_") % 2 != 0:
-                            safe_caption += "_"
+                        safe_caption = truncate_telegram_html(html_caption, max_rendered_len=1000)
                         try:
                             msg = await self.app.bot.send_photo(
                                 chat_id=target_chat,
                                 photo=photo,
                                 caption=safe_caption,
-                                parse_mode="Markdown",
+                                parse_mode="HTML",
                                 reply_markup=reply_markup,
                             )
                         except Exception as e:
-                            logger.warning(f"Failed to send truncated photo alert with Markdown: {e}")
+                            logger.warning(f"Failed to send truncated photo alert with HTML: {e}")
                             photo.seek(0)
                             msg = await self.app.bot.send_photo(
                                 chat_id=target_chat,
                                 photo=photo,
-                                caption=safe_caption,
+                                caption=caption,
                                 parse_mode=None,
                                 reply_markup=reply_markup,
                             )
                         # Send full specification as follow-up reply (capped to fit Telegram limit)
-                        follow_up = f"📋 **Szczegóły setupu:**\n\n{caption}"
-                        if len(follow_up) > 4000:
-                            follow_up = follow_up[:3996] + "..."
+                        follow_up = f"📋 <b>Szczegóły setupu:</b>\n\n{html_caption}"
+                        if len(re.sub(r"<[^>]+>", "", follow_up)) > 4000:
+                            follow_up = truncate_telegram_html(follow_up, max_rendered_len=3950)
                         try:
                             await self.app.bot.send_message(
                                 chat_id=target_chat,
                                 text=follow_up,
-                                parse_mode="Markdown",
+                                parse_mode="HTML",
                                 reply_to_message_id=msg.message_id,
                             )
                         except Exception:
                             await self.app.bot.send_message(
                                 chat_id=target_chat,
-                                text=follow_up,
+                                text=caption,
                                 parse_mode=None,
                                 reply_to_message_id=msg.message_id,
                             )
             else:
-                if len(caption) <= 4096:
+                if clean_len <= 4096:
                     try:
                         await self.app.bot.send_message(
                             chat_id=target_chat,
-                            text=caption,
-                            parse_mode="Markdown",
+                            text=html_caption,
+                            parse_mode="HTML",
                             reply_markup=reply_markup,
                         )
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"Failed to send text alert with HTML: {e}")
                         await self.app.bot.send_message(
                             chat_id=target_chat,
                             text=caption,
@@ -1123,18 +1229,19 @@ class TelegramBotManager:
                             reply_markup=reply_markup,
                         )
                 else:
-                    safe_msg = caption[:4000]
+                    safe_msg = truncate_telegram_html(html_caption, max_rendered_len=4000)
                     try:
                         await self.app.bot.send_message(
                             chat_id=target_chat,
                             text=safe_msg,
-                            parse_mode="Markdown",
+                            parse_mode="HTML",
                             reply_markup=reply_markup,
                         )
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"Failed to send long text alert with HTML: {e}")
                         await self.app.bot.send_message(
                             chat_id=target_chat,
-                            text=safe_msg,
+                            text=caption,
                             parse_mode=None,
                             reply_markup=reply_markup,
                         )
@@ -1154,14 +1261,14 @@ class TelegramBotManager:
             logger.error(f"Error logging trade to Notion in background: {e}")
 
     async def send_message(self, text: str):
-        """Sends a markdown text message to the alert channel."""
+        """Sends an HTML formatted text message to the alert channel."""
         if not self.app or not self.alert_channel:
             return
         try:
             await self.app.bot.send_message(
                 chat_id=self.alert_channel,
-                text=text,
-                parse_mode="Markdown",
+                text=md_to_telegram_html(text),
+                parse_mode="HTML",
             )
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")

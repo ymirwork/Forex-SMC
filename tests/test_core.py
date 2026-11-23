@@ -555,5 +555,38 @@ class TestSyncJournalDirectionFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs.get("direction"), "SELL")  # Fell back to comment!
 
 
+class TestTelegramHtmlFormatting(unittest.TestCase):
+    def test_md_to_telegram_html_basic(self):
+        from telegram_bot import md_to_telegram_html
+
+        sample = "🔔 **SMC SETUP: EURJPY**\n🎯 **Ocena:** `90%` 🔥 [Grade A+ Setup]"
+        html_out = md_to_telegram_html(sample)
+        self.assertIn("<b>SMC SETUP: EURJPY</b>", html_out)
+        self.assertIn("<b>Ocena:</b> <code>90%</code>", html_out)
+        self.assertNotIn("**", html_out)
+        self.assertNotIn("`", html_out)
+        self.assertIn("[Grade A+ Setup]", html_out)
+
+    def test_md_to_telegram_html_special_chars_and_regimes(self):
+        from telegram_bot import md_to_telegram_html
+
+        sample = "🧠 **Reżim:** `[STRONG_TREND]` (Fibo >= 61.8% & < 78.6%)"
+        html_out = md_to_telegram_html(sample)
+        self.assertIn("<code>[STRONG_TREND]</code>", html_out)
+        self.assertIn("&gt;=", html_out)
+        self.assertIn("&lt;", html_out)
+        self.assertIn("&amp;", html_out)
+        self.assertNotIn("<i>", html_out)  # Underscore inside code shouldn't become italic
+
+    def test_truncate_telegram_html(self):
+        from telegram_bot import truncate_telegram_html
+
+        long_html = "<b>Header</b>\n" + "\n".join([f"• Line {i}: <code>Val {i}</code> and <b>bold {i}</b>" for i in range(20)])
+        trunc = truncate_telegram_html(long_html, max_rendered_len=150)
+        # Should close all tags properly
+        self.assertTrue(trunc.count("<b>") == trunc.count("</b>"))
+        self.assertTrue(trunc.count("<code>") == trunc.count("</code>"))
+
+
 if __name__ == "__main__":
     unittest.main()
