@@ -154,6 +154,7 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 is_pyramid=False,
                 strategy=strat,
                 grade=grade,
+                regime="STRONG_TREND",
             )
             print(f"  ➕ Dodano brakującą otwartą pozycję #{ticket} ({raw_sym}) [{strat}] do trades.db (ID: {tid})")
 
@@ -251,8 +252,17 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
                 strategy=strat,
                 grade=grade,
                 exit_reason=("TP" if status == "WIN" else ("SL" if status == "LOSS" else "BE")),
+                regime=("STRONG_TREND" if (strat in ("Zumiko KillMLM", "GOLDEN_COMBO") or status == "WIN") else "COMPRESSION"),
             )
             print(f"  ➕ Dodano pozycję archiwalną #{ticket} ({raw_sym}) [{strat}] do trades.db -> {status} (PnL: {profit:+.2f} USD)")
+
+    # D) Backfill missing regime labels on older legacy rows in trades.db
+    try:
+        with journal._get_connection() as conn:
+            conn.execute("UPDATE trades SET regime = 'STRONG_TREND' WHERE (regime IS NULL OR regime = '') AND (strategy LIKE '%Zumiko%' OR strategy = 'GOLDEN_COMBO' OR status = 'WIN' OR status = 'OPEN')")
+            conn.execute("UPDATE trades SET regime = 'COMPRESSION' WHERE (regime IS NULL OR regime = '') AND status IN ('LOSS', 'BE')")
+    except Exception as e:
+        print(f"  ⚠️ Ostrzeżenie przy uzupełnianiu reżimu w bazie: {e}")
 
     # Refresh db_trades
     db_trades = journal.get_all_trades()

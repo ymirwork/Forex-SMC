@@ -35,6 +35,7 @@ from config import (
     PROP_MAX_OPEN_TRADES,
     PROP_SAFETY_BUFFER_PERCENT,
     PYRAMID_AUTO_EXECUTE,
+    PYRAMID_EXECUTION_TIMEFRAME,
     PYRAMID_LOCK_PREVIOUS_PROFIT,
     PYRAMID_MIN_PROFIT_R,
     PYRAMID_MIN_RR_TO_TP,
@@ -54,6 +55,7 @@ from config import (
     ZUMIKO_SWING_LEN,
     ZUMIKO_TREND_EMA,
     clean_symbol,
+    parse_currencies,
 )
 from mt5_client import MT5Client
 from news_filter import NewsFilter
@@ -765,24 +767,6 @@ class SMCScanner:
             pyramid_status = self.mt5_client.get_pyramid_status(sym) if ENABLE_PYRAMIDING else {"is_eligible": False}
             is_pyramid = pyramid_status.get("is_eligible", False)
 
-            # Adaptive Pyramiding Filter: strictly require STRONG_TREND regime
-            if is_pyramid and self.adaptive_manager.enabled:
-                base_ticket = pyramid_status.get("base_ticket")
-                base_trade = self.journal.get_trade_by_ticket(base_ticket) if base_ticket else None
-                base_regime_str = (base_trade.get("regime") if base_trade else "") or "COMPRESSION"
-                try:
-                    base_regime = MarketRegime(base_regime_str)
-                except ValueError:
-                    base_regime = MarketRegime.COMPRESSION
-
-                if not self.adaptive_manager.can_pyramid(base_regime):
-                    logger.info(
-                        f"🛡️ [ADAPTIVE PYRAMID FILTER] {sym}: Reżim pozycji bazowej [{base_regime.value}] "
-                        f"nie dopuszcza piramidowania (wymagany STRONG_TREND)."
-                    )
-                    is_pyramid = False
-                    pyramid_status["is_eligible"] = False
-
             # Active Position Lock: Skip symbol if it currently has an open position and is NOT eligible for pyramiding
             if sym.upper() in busy_symbols and not is_pyramid:
                 logger.info(f"🔒 [SYMBOL LOCK] {sym} posiada aktywną pozycję/zlecenie w MT5. Pomijam skanowanie do czasu zamknięcia.")
@@ -806,6 +790,43 @@ class SMCScanner:
                 if df_ltf is None or df_htf is None:
                     continue
 
+                # Adaptive Pyramiding Filter: dynamically verify live market regime & news
+                if is_pyramid and self.adaptive_manager.enabled:
+                    has_news = False
+                    if self.news_filter:
+                        has_news, news_msg, _ = self.news_filter.check_news(sym)
+                    if has_news:
+                        logger.info(f"🛡️ [ADAPTIVE PYRAMID FILTER] {sym}: Aktywne okno wiadomości makroekonomicznych ({news_msg}). Wstrzymuję dokładkę.")
+                        continue
+
+                    htf_dir = self.smc_detector.determine_htf_trend(df_htf)
+                    rolling_bars = (df_ltf["high"] - df_ltf["low"]).tail(min(len(df_ltf), 100))
+                    curr_rng = float(df_ltf["high"].iloc[-1] - df_ltf["low"].iloc[-1]) if not df_ltf.empty else 0.0
+                    atr_p = (sum(1 for val in rolling_bars if curr_rng >= val) / len(rolling_bars)) * 100.0 if len(rolling_bars) > 0 else 50.0
+                    pyr_dir = pyramid_status.get("direction", "")
+
+                    live_regime = self.adaptive_manager.classify_regime(
+                        htf_trend=htf_dir,
+                        ltf_trend=pyr_dir,
+                        atr_percentile=atr_p,
+                        is_news_window=has_news,
+                    )
+
+                    if not self.adaptive_manager.can_pyramid(live_regime):
+                        logger.info(
+                            f"🛡️ [ADAPTIVE PYRAMID FILTER] {sym}: Bieżący reżim na żywo [{live_regime.value}] "
+                            f"(HTF: {htf_dir}, ATR%: {atr_p:.1f}) nie dopuszcza piramidowania (wymagany STRONG_TREND)."
+                        )
+                        continue
+
+                # Multi-Timeframe Execution Selection: Hybrid M5 for scale-ins, M15 for base entries
+                df_exec = df_ltf
+                if is_pyramid and PYRAMID_EXECUTION_TIMEFRAME != LTF_TIMEFRAME:
+                    df_m5 = self.mt5_client.fetch_ohlcv(sym, PYRAMID_EXECUTION_TIMEFRAME, scan_bars)
+                    if df_m5 is not None and not df_m5.empty:
+                        df_exec = df_m5
+                        logger.info(f"⚡ [PYRAMID M5 SCAN] {sym}: Skanuję interwał {PYRAMID_EXECUTION_TIMEFRAME} pod kątem dokładki.")
+
                 smc_setups: List[TradeSetup] = []
                 zumiko_setups: List[TradeSetup] = []
 
@@ -815,7 +836,7 @@ class SMCScanner:
                 if ENABLE_SMC_STRATEGY:
                     smc_setups = self.smc_detector.scan_for_setups(
                         sym,
-                        df_ltf,
+                        df_exec,
                         df_htf,
                         spread=spread_val,
                         df_d1=df_d1,
@@ -824,7 +845,7 @@ class SMCScanner:
                     )
 
                 if ENABLE_ZUMIKO_STRATEGY:
-                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_ltf, df_h1, df_htf, spread=spread_val)
+                    zumiko_setups = self.zumiko_detector.scan_for_setups(sym, df_exec, df_h1, df_htf, spread=spread_val)
 
                 final_setups: List[TradeSetup] = []
 
@@ -897,12 +918,13 @@ class SMCScanner:
                             setup.tp1_price = master_tp
 
                         setup.is_pyramid = True
+                        setup.timeframe = PYRAMID_EXECUTION_TIMEFRAME
                         setup.parent_ticket = pyramid_status.get("base_ticket")
                         setup.pyramid_level = pyramid_status.get("next_level", 2)
                         setup.pyramid_profit_r = pyramid_status.get("profit_r", 0.0)
                         setup.cluster_tickets = pyramid_status.get("cluster_tickets", [])
                         setup.cluster_locked_profit_usd = pyramid_status.get("profit_usd", 0.0)
-                        setup.setup_type = f"[DOKŁADKA TRENDOWA L{setup.pyramid_level}] {setup.setup_type}"
+                        setup.setup_type = f"[DOKŁADKA TRENDOWA L{setup.pyramid_level} {PYRAMID_EXECUTION_TIMEFRAME}] {setup.setup_type}"
 
                         # Strict Risk-Neutral volume verification
                         pyr_lot, locked_usd, allowed_risk, pyr_reason = self.mt5_client.calculate_pyramid_position_size(
@@ -995,9 +1017,81 @@ class SMCScanner:
                     )
 
                     # Generate visual chart with Fibo or EMAs in worker thread (non-blocking)
-                    chart_path = await asyncio.to_thread(self.chart_gen.generate_setup_chart, df_ltf, setup)
+                    chart_path = await asyncio.to_thread(self.chart_gen.generate_setup_chart, df_exec, setup)
 
-                    # Send to Telegram
+                    # Pyramiding Auto-Execution Mode (MT5 Instant Scale-In & Cluster SL Sync)
+                    if getattr(setup, "is_pyramid", False) and PYRAMID_AUTO_EXECUTE:
+                        pyr_lot = getattr(setup, "_pyramid_lot", 0.0)
+                        if pyr_lot <= 0:
+                            calc_l, _, _, _ = self.mt5_client.calculate_pyramid_position_size(
+                                symbol=setup.symbol,
+                                entry_price=setup.entry_price,
+                                sl_price=setup.sl_price,
+                                setup_grade=getattr(setup, "grade", "A"),
+                                cluster_status=pyramid_status,
+                            )
+                            pyr_lot = calc_l
+
+                        if pyr_lot > 0:
+                            strat_p = "Zumiko" if "ZUMIKO" in str(setup.strategy_name).upper() else "SMC"
+                            cmt = f"Auto Pyr L{setup.pyramid_level} {strat_p}"[:31]
+                            success, msg, ticket, fill_price = self.mt5_client.execute_market_order(
+                                symbol=setup.symbol,
+                                direction=setup.direction,
+                                volume=pyr_lot,
+                                sl=setup.sl_price,
+                                tp=setup.tp1_price,
+                                comment=cmt,
+                            )
+                            if success:
+                                actual_entry = fill_price if fill_price > 0 else setup.entry_price
+                                synced_cnt = 0
+                                if PYRAMID_LOCK_PREVIOUS_PROFIT:
+                                    sync_res = self.mt5_client.sync_cluster_stop_loss(
+                                        symbol=setup.symbol,
+                                        new_sl=setup.sl_price,
+                                    )
+                                    synced_cnt = sum(1 for _, ok, _ in sync_res if ok)
+
+                                # Record scale-in in Journal
+                                self.journal.add_trade(
+                                    symbol=setup.symbol,
+                                    direction=setup.direction,
+                                    entry_price=actual_entry,
+                                    sl_price=setup.sl_price,
+                                    tp_price=setup.tp1_price,
+                                    confluence_score=setup.confluence_score,
+                                    status="OPEN",
+                                    chart_path=chart_path or "",
+                                    mt5_ticket=ticket,
+                                    comment=f"Piramida L{setup.pyramid_level} Auto-Execute | {setup.setup_type}",
+                                    parent_ticket=getattr(setup, "parent_ticket", None),
+                                    is_pyramid=1,
+                                    pyramid_level=getattr(setup, "pyramid_level", 2),
+                                    strategy=setup.strategy_name,
+                                    setup_type=setup.setup_type,
+                                    grade=getattr(setup, "grade", "A"),
+                                    regime=getattr(setup, "regime", ""),
+                                )
+
+                                # Send auto-executed alert to Telegram
+                                if self.telegram:
+                                    if hasattr(self.telegram, "send_pyramid_execution_alert"):
+                                        await self.telegram.send_pyramid_execution_alert(
+                                            setup=setup,
+                                            chart_path=chart_path,
+                                            ticket=ticket,
+                                            fill_price=actual_entry,
+                                            volume=pyr_lot,
+                                            synced_count=synced_cnt,
+                                        )
+                                    else:
+                                        await self.telegram.send_setup_alert(setup, chart_path, setup_id)
+                                break
+                            else:
+                                logger.error(f"❌ [PYRAMID AUTO-EXEC ERROR] Błąd zlecenia MT5 dla {setup.symbol}: {msg}. Przekazuję do alertu ręcznego.")
+
+                    # Send to Telegram (Manual alert with interactive buttons)
                     if self.telegram:
                         await self.telegram.send_setup_alert(setup, chart_path, setup_id)
 

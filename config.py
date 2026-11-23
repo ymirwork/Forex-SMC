@@ -231,10 +231,12 @@ NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 # ==========================================
 ENABLE_PYRAMIDING = os.getenv("ENABLE_PYRAMIDING", "True").lower() in ("true", "1")
 MAX_PYRAMID_LEVEL = int(os.getenv("MAX_PYRAMID_LEVEL", "3"))               # Max poziomy (np. 3: Baza + L2 + L3)
+PYRAMID_EXECUTION_TIMEFRAME = os.getenv("PYRAMID_EXECUTION_TIMEFRAME", "M5") # Interwał szukania wejść dla dokładek (M5)
 PYRAMID_MIN_PROFIT_R = float(os.getenv("PYRAMID_MIN_PROFIT_R", "1.0"))     # Każda poprzednia pozycja musi osiągnąć min. +1.0R
-PYRAMID_MIN_RR_TO_TP = float(os.getenv("PYRAMID_MIN_RR_TO_TP", "1.5"))     # Minimalna przestrzeń do Master TP (min 1.5R)
-PYRAMID_AUTO_EXECUTE = os.getenv("PYRAMID_AUTO_EXECUTE", "False").lower() in ("true", "1") # Auto wejście vs przyciski TG
+PYRAMID_MIN_RR_TO_TP = float(os.getenv("PYRAMID_MIN_RR_TO_TP", "1.0"))     # Minimalna przestrzeń do Master TP (min 1.0R dla M5)
+PYRAMID_AUTO_EXECUTE = os.getenv("PYRAMID_AUTO_EXECUTE", "True").lower() in ("true", "1") # Auto wejście w MT5 vs przyciski TG
 PYRAMID_MAX_RISK_FINANCE_RATIO = float(os.getenv("PYRAMID_MAX_RISK_FINANCE_RATIO", "0.75")) # Max % zablokowanego zysku na ryzyko dokładki (75%)
+PYRAMID_ALLOW_MIN_LOT_FLOAT = os.getenv("PYRAMID_ALLOW_MIN_LOT_FLOAT", "True").lower() in ("true", "1") # Zezwolenie na min. lot 0.01 jeśli mieści się w zablokowanym zysku
 PYRAMID_LOCK_PREVIOUS_PROFIT = os.getenv("PYRAMID_LOCK_PREVIOUS_PROFIT", "True").lower() in ("true", "1") # Lock profit on parent trade
 PYRAMID_LEVEL_DECAY = {2: 0.50, 3: 0.25, 4: 0.125}                        # Mnożnik bazowego ryzyka dla dokładek
 PYRAMID_GRADE_WEIGHTS = {"A+": 1.0, "A": 0.75, "B": 0.50}                  # Wagi Grade dla dokładek

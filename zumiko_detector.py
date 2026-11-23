@@ -848,6 +848,7 @@ class ZumikoDetector:
             poc=round(poc, digits) if poc > 0.0 else 0.0,
             rsi=round(rsi, 1),
             is_ribbon_expanding=is_ribbon_expanding,
+            regime="STRONG_TREND",
             is_healthy_ha=ha_ok,
             is_main_zumiko_signal=is_main_signal,
         )

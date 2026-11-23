@@ -356,6 +356,161 @@ class TestPyramidCluster(unittest.TestCase):
             # Verify cluster Stop Loss synchronization was triggered
             mock_sync.assert_called_once_with(symbol="EURUSD", new_sl=1.08200)
 
+    @patch("MetaTrader5.symbol_info")
+    @patch("MetaTrader5.account_info")
+    @patch.object(MT5Client, "ensure_connection", return_value=True)
+    def test_small_account_risk_neutral_lot_float(self, mock_conn, mock_acc, mock_sym):
+        # Setup symbol & account info for a small $686 account with 0.01 min lot
+        mock_acc_inst = MagicMock()
+        mock_acc_inst.balance = 686.0
+        mock_acc_inst.equity = 690.0
+        mock_acc.return_value = mock_acc_inst
+
+        mock_sym_inst = MagicMock()
+        mock_sym_inst.volume_min = 0.01
+        mock_sym_inst.volume_max = 100.0
+        mock_sym_inst.volume_step = 0.01
+        mock_sym_inst.point = 0.001
+        mock_sym_inst.trade_tick_size = 0.001
+        mock_sym_inst.trade_tick_value = 0.65  # e.g. JPY cross
+        mock_sym.return_value = mock_sym_inst
+
+        # Cluster status where base trade is in profit and locks $3.50 of profit at new SL
+        cluster_status = {
+            "is_eligible": True,
+            "next_level": 2,
+            "direction": "SELL",
+            "positions": [{
+                "ticket": 5001,
+                "price_open": 86.890,
+                "volume": 0.03,
+            }]
+        }
+
+        with patch.object(self.client, "resolve_symbol", return_value="NZDJPY"), \
+             patch.object(self.client, "get_pip_size", return_value=0.01):
+            # Scale-in setup: entry 86.600, SL 86.750 (15 pips SL).
+            # Base entry 86.890 -> SL 86.750 locks 14 pips on 0.03 lot = 42 pips * 0.65 = $2.73
+            # max_risk_usd = 2.73 * 0.75 = $2.05
+            # target_risk_usd for $686 @ 0.5% * 0.5 (decay) * 0.75 (grade A) = $1.28
+            # 0.01 lot loss for 15 pips (150 ticks * 0.65) = $0.97 <= $1.28 -> 0.01 lot
+            lot, locked, allowed, reason = self.client.calculate_pyramid_position_size(
+                symbol="NZDJPY",
+                entry_price=86.600,
+                sl_price=86.750,
+                setup_grade="A",
+                cluster_status=cluster_status,
+            )
+            self.assertEqual(reason, "OK")
+            self.assertGreaterEqual(lot, 0.01)
+
+            # Now test SL distance where 0.01 lot loss is $1.45 (which exceeds $1.28 target risk,
+            # but is <= $2.05 max_risk_usd funded by locked profit)
+            # With PYRAMID_ALLOW_MIN_LOT_FLOAT=True, it should allow 0.01 lot instead of rejecting!
+            lot2, locked2, allowed2, reason2 = self.client.calculate_pyramid_position_size(
+                symbol="NZDJPY",
+                entry_price=86.500,
+                sl_price=86.720,  # 22 pips -> loss ~ $1.43 > $1.28
+                setup_grade="A",
+                cluster_status=cluster_status,
+            )
+            self.assertEqual(reason2, "OK")
+            self.assertEqual(lot2, 0.01)
+
+    @patch("scanner.PYRAMID_AUTO_EXECUTE", True)
+    def test_scanner_auto_execute_scale_in(self):
+        from scanner import SMCScanner
+        from smc_detector import TradeSetup
+
+        mock_telegram = MagicMock()
+        mock_telegram.is_symbol_muted.return_value = False
+        mock_telegram.send_pyramid_execution_alert = unittest.mock.AsyncMock()
+        mock_telegram.send_setup_alert = unittest.mock.AsyncMock()
+
+        scanner = SMCScanner(
+            mt5_client=self.client,
+            telegram_manager=mock_telegram,
+            journal=self.journal,
+        )
+
+        pyr_status = {
+            "is_eligible": True,
+            "count": 1,
+            "current_level": 1,
+            "next_level": 2,
+            "direction": "SELL",
+            "base_ticket": 5001,
+            "base_entry": 86.890,
+            "base_sl": 86.880,
+            "master_tp": 86.200,
+            "profit_r": 1.4,
+            "profit_usd": 6.0,
+            "cluster_tickets": [5001],
+        }
+
+        import pandas as pd
+        mock_setup = TradeSetup(
+            symbol="NZDJPY",
+            direction="SELL",
+            timeframe="M5",
+            setup_type="M5 CHoCH + Fibo OTE",
+            entry_price=86.600,
+            sl_price=86.750,
+            tp1_price=86.200,
+            tp2_price=86.000,
+            rr_ratio=2.6,
+            htf_trend="BEARISH",
+            zone_top=86.800,
+            zone_bottom=86.600,
+            reason="Test M5 Scale-in",
+            timestamp=pd.Timestamp.now(),
+            confluence_score=85,
+            strategy_name="SMC",
+        )
+
+        with patch.object(self.client, "get_pyramid_status", return_value=pyr_status), \
+             patch.object(self.client, "get_busy_symbols", return_value={"NZDJPY"}), \
+             patch.object(self.client, "fetch_ohlcv", return_value=MagicMock(empty=False)), \
+             patch.object(self.client, "get_symbol_spread", return_value=0.0), \
+             patch.object(self.client, "can_open_new_trade", return_value=(True, "OK")), \
+             patch.object(self.client, "calculate_pyramid_position_size", return_value=(0.01, 3.5, 1.5, "OK")), \
+             patch.object(self.client, "execute_market_order", return_value=(True, "OK", 6001, 86.600)) as mock_exec, \
+             patch.object(self.client, "sync_cluster_stop_loss", return_value=[(5001, True, "OK")]) as mock_sync, \
+             patch("session_manager.SessionManager.get_current_session", return_value={"session_name": "London Open", "is_killzone": True, "is_evening_blocked": False, "is_rollover": False}), \
+             patch.object(scanner.adaptive_manager, "can_pyramid", return_value=True), \
+             patch.object(scanner.smc_detector, "determine_htf_trend", return_value="BEARISH"), \
+             patch.object(scanner.smc_detector, "scan_for_setups", return_value=[mock_setup]), \
+             patch.object(scanner.zumiko_detector, "scan_for_setups", return_value=[]), \
+             patch.object(scanner.chart_gen, "generate_setup_chart", return_value="test_chart.png"), \
+             patch.object(scanner.news_filter, "check_news", return_value=(False, None, None)), \
+             patch("scanner.SYMBOLS", ["NZDJPY"]):
+            found = asyncio.run(scanner.scan_once())
+            self.assertEqual(found, 1)
+
+            # 1. Assert market order execution in MT5
+            mock_exec.assert_called_once()
+            call_kwargs = mock_exec.call_args.kwargs
+            self.assertEqual(call_kwargs["symbol"], "NZDJPY")
+            self.assertEqual(call_kwargs["direction"], "SELL")
+            self.assertEqual(call_kwargs["volume"], 0.01)
+            self.assertEqual(call_kwargs["sl"], 86.750)
+            self.assertEqual(call_kwargs["tp"], 86.200)
+
+            # 2. Assert parent Stop Loss synchronization
+            mock_sync.assert_called_once_with(symbol="NZDJPY", new_sl=86.750)
+
+            # 3. Assert database journal entry
+            trade = self.journal.get_trade_by_ticket(6001)
+            self.assertIsNotNone(trade)
+            self.assertEqual(trade["symbol"], "NZDJPY")
+            self.assertEqual(trade["status"], "OPEN")
+            self.assertEqual(trade["is_pyramid"], 1)
+            self.assertEqual(trade["pyramid_level"], 2)
+            self.assertEqual(trade["parent_ticket"], 5001)
+
+            # 4. Assert Telegram auto-execution alert dispatched
+            mock_telegram.send_pyramid_execution_alert.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

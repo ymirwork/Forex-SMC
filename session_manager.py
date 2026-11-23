@@ -17,12 +17,20 @@ def get_broker_utc_offset() -> int:
     """
     try:
         import MetaTrader5 as mt5
-        tick = mt5.symbol_info_tick("EURUSD") or mt5.symbol_info_tick("XAUUSD")
-        if tick and tick.time > 0:
-            now_utc = int(datetime.now(timezone.utc).timestamp())
-            diff_hours = round((tick.time - now_utc) / 3600.0)
-            if -12 <= diff_hours <= 14:
-                return int(diff_hours)
+        symbols_to_try = ["EURUSD", "XAUUSD"]
+        all_syms = mt5.symbols_get()
+        if all_syms:
+            for s in all_syms:
+                if any(base in s.name for base in ("EURUSD", "XAUUSD")):
+                    symbols_to_try.append(s.name)
+
+        for sym_name in symbols_to_try:
+            tick = mt5.symbol_info_tick(sym_name)
+            if tick and tick.time > 0:
+                now_utc = int(datetime.now(timezone.utc).timestamp())
+                diff_hours = round((tick.time - now_utc) / 3600.0)
+                if -12 <= diff_hours <= 14:
+                    return int(diff_hours)
     except Exception:
         pass
     return BROKER_UTC_OFFSET_HOURS

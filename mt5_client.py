@@ -21,6 +21,7 @@ from config import (
     PROP_MAX_SAME_CURRENCY_TRADES,
     PROP_RISK_PER_TRADE_PERCENT,
     PROP_SAFETY_BUFFER_PERCENT,
+    PYRAMID_ALLOW_MIN_LOT_FLOAT,
     PYRAMID_GRADE_WEIGHTS,
     PYRAMID_LEVEL_DECAY,
     PYRAMID_LOCK_PREVIOUS_PROFIT,
@@ -224,6 +225,25 @@ class MT5Client:
             "leverage": acc.leverage,
         }
 
+    @staticmethod
+    def _extract_symbol_tick_value(sym_info) -> float:
+        """Extracts valid tick value from MT5 symbol_info, preferring loss value."""
+        if not sym_info:
+            return 0.0
+        tick_val_attr = getattr(sym_info, "trade_tick_value", 0.0)
+        loss_val_attr = getattr(sym_info, "trade_tick_value_loss", 0.0)
+        try:
+            val_loss = float(loss_val_attr) if loss_val_attr is not None else 0.0
+            val_base = float(tick_val_attr) if tick_val_attr is not None else 0.0
+            val = val_loss if val_loss > 0 else val_base
+            return val if val > 0 else 0.0
+        except (TypeError, ValueError):
+            try:
+                val = float(tick_val_attr) if tick_val_attr is not None else 0.0
+                return val if val > 0 else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
     def calculate_lot_size(
         self,
         symbol: str,
@@ -258,31 +278,14 @@ class MT5Client:
             return sym.volume_min
 
         tick_size = sym.trade_tick_size if sym.trade_tick_size > 0 else sym.point
-        tick_val_attr = getattr(sym, "trade_tick_value", 0.0)
-        loss_val_attr = getattr(sym, "trade_tick_value_loss", 0.0)
-        try:
-            val_loss = float(loss_val_attr) if loss_val_attr is not None else 0.0
-            val_base = float(tick_val_attr) if tick_val_attr is not None else 0.0
-            tick_value = val_loss if val_loss > 0 else val_base
-        except (TypeError, ValueError):
-            try:
-                tick_value = float(tick_val_attr) if tick_val_attr is not None else 1.0
-            except (TypeError, ValueError):
-                tick_value = 1.0
+        tick_value = self._extract_symbol_tick_value(sym)
 
         if tick_value <= 0:
             # Refresh symbol info and ensure selection in MarketWatch to load conversion rates
             mt5.symbol_select(resolved, True)
             fresh_sym = mt5.symbol_info(resolved)
-            if fresh_sym:
-                f_tick = getattr(fresh_sym, "trade_tick_value", 0.0)
-                f_loss = getattr(fresh_sym, "trade_tick_value_loss", 0.0)
-                try:
-                    vf_loss = float(f_loss) if f_loss is not None else 0.0
-                    vf_base = float(f_tick) if f_tick is not None else 0.0
-                    tick_value = vf_loss if vf_loss > 0 else vf_base
-                except (TypeError, ValueError):
-                    pass
+            tick_value = self._extract_symbol_tick_value(fresh_sym)
+
         if tick_value <= 0:
             tick_value = 1.0
 
@@ -1370,7 +1373,7 @@ class MT5Client:
 
         # Calculate locked profit across positions when trailed to sl_price (Review finding 1)
         total_locked_usd = 0.0
-        tick_value = getattr(sym_info, "trade_tick_value", 1.0) or 1.0
+        tick_value = self._extract_symbol_tick_value(sym_info) or 1.0
         tick_size = getattr(sym_info, "trade_tick_size", sym_info.point) or sym_info.point
         point = sym_info.point
 
@@ -1423,11 +1426,15 @@ class MT5Client:
         vol_step = sym_info.volume_step if sym_info.volume_step > 0 else 0.01
 
         # Strict risk check: if minimum lot exceeds allowed risk, reject pyramid scale-in
+        # unless floating min lot is permitted and 100% funded by locked profit (small account support)
         if (vol_min * loss_per_lot) > allowed_risk_usd:
-            return 0.0, round(total_locked_usd, 2), round(allowed_risk_usd, 2), (
-                f"Minimalny wolumen ({vol_min}) ryzykuje {vol_min * loss_per_lot:.2f} USD, "
-                f"przekraczając dozwolone ryzyko dokładki ({allowed_risk_usd:.2f} USD)"
-            )
+            if PYRAMID_ALLOW_MIN_LOT_FLOAT and (vol_min * loss_per_lot) <= max_risk_usd:
+                calc_lot = vol_min
+            else:
+                return 0.0, round(total_locked_usd, 2), round(allowed_risk_usd, 2), (
+                    f"Minimalny wolumen ({vol_min}) ryzykuje {vol_min * loss_per_lot:.2f} USD, "
+                    f"przekraczając dozwolone ryzyko dokładki ({allowed_risk_usd:.2f} USD)"
+                )
 
         vol_digits = len(str(vol_step).split(".")[1]) if ("." in str(vol_step) and not str(vol_step).endswith(".0")) else 2
         vol_digits = max(2, vol_digits)

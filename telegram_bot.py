@@ -1274,6 +1274,59 @@ class TelegramBotManager:
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")
 
+    async def send_pyramid_execution_alert(
+        self,
+        setup: TradeSetup,
+        chart_path: str,
+        ticket: int,
+        fill_price: float,
+        volume: float,
+        synced_count: int,
+    ):
+        """Sends rich notification for automatically executed pyramid scale-in."""
+        if not self.app or not self.alert_channel:
+            logger.warning("Telegram Bot application not running or alert channel not set.")
+            return
+
+        digits = 2 if "JPY" in setup.symbol or "XAU" in setup.symbol else 4
+        point_scale = 0.01 if digits == 2 else 0.0001
+        sl_pips = abs(fill_price - setup.sl_price) / point_scale
+        pyr_level = getattr(setup, "pyramid_level", 2)
+        dir_emoji = "🟢 BUY (DŁUGA)" if setup.direction == "BUY" else "🔴 SELL (KRÓTKA)"
+
+        caption = (
+            f"⚡ <b>ZREALIZOWANO AUTOMATYCZNE PIRAMIDOWANIE (L{pyr_level})</b>\n\n"
+            f"• <b>Symbol:</b> <code>{setup.symbol}</code> ({dir_emoji})\n"
+            f"• <b>Bilet MT5:</b> <code>#{ticket}</code> (Baza: <code>#{getattr(setup, 'parent_ticket', 'N/A')}</code>)\n"
+            f"• <b>Wolumen:</b> <code>{volume:.2f} lot</code>\n"
+            f"• <b>Cena wejścia:</b> <code>{fill_price:.{digits}f}</code>\n"
+            f"• <b>Zabezpieczenie SL:</b> <code>{setup.sl_price:.{digits}f}</code> ({sl_pips:.1f} pips)\n"
+            f"• <b>Wspólny Master TP:</b> <code>{setup.tp1_price:.{digits}f}</code>\n"
+            f"• <b>Interwał egzekucji:</b> <code>{setup.timeframe}</code>\n"
+            f"• <b>Synchronizacja SL klastra:</b> <code>{synced_count}</code> pozycji przestawionych na <code>{setup.sl_price:.{digits}f}</code>\n\n"
+            f"🛡️ <i>Pozycja w 100% zrealizowana w trybie Risk-Neutral (sfinansowana ze zbywalnego zysku pozycji bazowej).</i>"
+        )
+
+        target_chat = self.alert_channel
+        try:
+            if chart_path and os.path.exists(chart_path):
+                with open(chart_path, "rb") as photo:
+                    await self.app.bot.send_photo(
+                        chat_id=target_chat,
+                        photo=photo,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+            else:
+                await self.app.bot.send_message(
+                    chat_id=target_chat,
+                    text=caption,
+                    parse_mode="HTML",
+                )
+            logger.info(f"Pyramid auto-execution alert sent to Telegram for {setup.symbol} L{pyr_level}")
+        except Exception as e:
+            logger.error(f"Failed to send pyramid auto-execution Telegram alert: {e}")
+
     async def _log_trade_to_notion(self, trade_dict: dict):
         """Asynchronously logs an executed trade to Notion in the background."""
         if not self.notion.is_configured():
