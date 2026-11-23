@@ -67,6 +67,23 @@ def clean_symbol(symbol: str) -> str:
     return clean
 
 
+def parse_currencies(symbol: str) -> tuple[str, str]:
+    """
+    Parses base and quote currency from standard Forex/Metals pairs.
+    E.g. EURUSD -> ('EUR', 'USD'), XAUUSD -> ('XAU', 'USD'), USDJPY -> ('USD', 'JPY')
+    """
+    sym = clean_symbol(symbol)
+    if not sym:
+        return "", ""
+    if "XAU" in sym or "GOLD" in sym:
+        return "XAU", "USD"
+    if "XAG" in sym or "SILVER" in sym:
+        return "XAG", "USD"
+    if len(sym) >= 6:
+        return sym[:3], sym[3:6]
+    return sym, ""
+
+
 # Timeframe Settings
 # HTF (Higher Timeframe) for Trend & Major Market Structure
 HTF_TIMEFRAME = os.getenv("HTF_TIMEFRAME", "H4")  # H4 as primary HTF

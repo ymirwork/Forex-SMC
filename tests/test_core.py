@@ -588,5 +588,99 @@ class TestTelegramHtmlFormatting(unittest.TestCase):
         self.assertTrue(trunc.count("<code>") == trunc.count("</code>"))
 
 
+    def test_md_to_telegram_html_links_with_underscores(self):
+        from telegram_bot import md_to_telegram_html
+
+        sample = "Check [API Docs](https://example.com/_api_/endpoint_v1) for details."
+        html_out = md_to_telegram_html(sample)
+        self.assertIn('<a href="https://example.com/_api_/endpoint_v1">API Docs</a>', html_out)
+        self.assertNotIn("<i>", html_out)
+
+    def test_safe_edit_message_truncation_and_remove_keyboard(self):
+        import asyncio
+        from telegram_bot import TelegramBotManager
+
+        mock_query = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.caption = "Original setup caption"
+        mock_query.message = mock_msg
+
+        # Long text over 1200 characters
+        long_text = "<b>Result:</b>\n" + ("• Detailed analysis line.\n" * 50)
+        self.assertGreater(len(long_text), 1100)
+
+        mock_query.edit_message_caption = unittest.mock.AsyncMock()
+
+        asyncio.run(TelegramBotManager._safe_edit_message(mock_query, text=long_text))
+        mock_query.edit_message_caption.assert_called_once()
+        _, kwargs = mock_query.edit_message_caption.call_args
+        self.assertLessEqual(len(kwargs["caption"]), 1024)
+        self.assertIsNone(kwargs["reply_markup"])
+
+    def test_group_callback_rejected_without_user_id(self):
+        from telegram_bot import TelegramBotManager
+
+        client_mock = MagicMock()
+        mgr = TelegramBotManager(mt5_client=client_mock, allowed_ids=[-100123456789])
+
+        update_mock = MagicMock()
+        update_mock.callback_query = MagicMock()
+        update_mock.effective_user.id = 888999  # User ID not in allowed positive IDs
+        update_mock.effective_chat.id = -100123456789  # Group ID in allowed
+
+        self.assertFalse(mgr._is_authorized(update_mock))
+
+
+class TestAuditAndReviewFixes(unittest.TestCase):
+    @patch("mt5_client.mt5")
+    def test_lot_size_over_risk_rejection(self, mock_mt5):
+        # Account: $600 balance, risk: 0.5% ($3.00), tolerance: 1.35x ($4.05 max tolerated)
+        acc_mock = MagicMock()
+        acc_mock.balance = 600.0
+        acc_mock.currency = "USD"
+        mock_mt5.account_info.return_value = acc_mock
+
+        # Gold: min volume = 0.01 lot, tick size = 0.01, tick val = 1.0
+        sym_mock = MagicMock()
+        sym_mock.digits = 2
+        sym_mock.trade_tick_size = 0.01
+        sym_mock.trade_tick_value = 1.0
+        sym_mock.trade_tick_value_loss = 1.0
+        sym_mock.volume_min = 0.01
+        sym_mock.volume_max = 100.0
+        sym_mock.volume_step = 0.01
+        mock_mt5.symbol_info.return_value = sym_mock
+
+        client = MT5Client()
+        client.is_connected = True
+        client.ensure_connection = MagicMock(return_value=True)
+        client.resolve_symbol = MagicMock(return_value="XAUUSD")
+
+        # SL distance = $30.00 (300 pips on Gold). Loss at 0.01 lot = $30.00!
+        # Target risk is $3.00, tolerated is $4.05. Loss ($30.00) > $4.05 -> MUST return 0.0 lot!
+        lot = client.calculate_lot_size("XAUUSD", risk_percent=0.5, sl_price=2620.0, entry_price=2650.0)
+        self.assertEqual(lot, 0.0)
+
+    def test_gold_min_sl_distance_consistently_30_dollars(self):
+        from smc_detector import get_min_sl_distance
+
+        # Broker with 2 digits (point_scale = 0.01)
+        dist_2digit = get_min_sl_distance("XAUUSD", point_scale=0.01)
+        self.assertEqual(dist_2digit, 30.0)
+
+        # Broker with 3 digits (point_scale = 0.001) - previously bugged to 0.30!
+        dist_3digit = get_min_sl_distance("XAUUSD", point_scale=0.001)
+        self.assertEqual(dist_3digit, 30.0)
+
+    def test_parse_currencies_unified(self):
+        from config import parse_currencies
+
+        self.assertEqual(parse_currencies("EURUSD"), ("EUR", "USD"))
+        self.assertEqual(parse_currencies("GBPUSD.pro"), ("GBP", "USD"))
+        self.assertEqual(parse_currencies("XAUUSD"), ("XAU", "USD"))
+        self.assertEqual(parse_currencies("XAUUSD.raw"), ("XAU", "USD"))
+        self.assertEqual(parse_currencies("EURUSDm"), ("EUR", "USD"))
+
+
 if __name__ == "__main__":
     unittest.main()

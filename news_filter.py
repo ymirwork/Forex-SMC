@@ -4,7 +4,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 import httpx
 
-from config import NEWS_WINDOW_MINUTES, clean_symbol
+from config import NEWS_WINDOW_MINUTES, clean_symbol, parse_currencies
 
 logger = logging.getLogger("ForexSMC.NewsFilter")
 
@@ -26,12 +26,10 @@ class NewsFilter:
 
     def _extract_currencies(self, symbol: str) -> List[str]:
         """Extracts relevant currency codes from symbol (e.g. EURUSD -> ['EUR', 'USD'], XAUUSD -> ['USD'])."""
-        clean = clean_symbol(symbol)
-        if "XAU" in clean or "GOLD" in clean:
+        base, quote = parse_currencies(symbol)
+        if base in ("XAU", "GOLD", "XAG", "SILVER"):
             return ["USD"]
-        if len(clean) >= 6:
-            return [clean[:3], clean[3:6]]
-        return ["USD"]
+        return [c for c in (base, quote) if c]
 
     def _parse_and_cache(self, raw_data: list, now: float):
         parsed = []

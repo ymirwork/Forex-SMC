@@ -65,7 +65,8 @@ def get_min_sl_distance(symbol: str, point_scale: float = 0.0001) -> float:
         return 0.0
     sym = symbol.upper()
     if "XAU" in sym or "GOLD" in sym:
-        gold_pip = 0.10 if point_scale >= 0.01 else point_scale
+        # 1 standard Gold pip = $0.10 (300 pips = $30.00) regardless of broker 2-digit or 3-digit point scale
+        gold_pip = 0.10
         return MIN_SL_PIPS_GOLD * gold_pip
     if "GBP" in sym:
         return MIN_SL_PIPS_GBP * point_scale

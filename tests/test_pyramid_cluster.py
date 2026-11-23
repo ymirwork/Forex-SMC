@@ -293,7 +293,8 @@ class TestPyramidCluster(unittest.TestCase):
             self.assertIn("Zbyt blisko", msg)
             mock_order.assert_not_called()
 
-    def test_session_manager_broker_offset(self):
+    @patch("MetaTrader5.symbol_info_tick", return_value=None)
+    def test_session_manager_broker_offset(self, mock_tick):
         from session_manager import get_broker_utc_offset, SessionManager
         offset = get_broker_utc_offset()
         self.assertIsInstance(offset, int)
@@ -343,6 +344,9 @@ class TestPyramidCluster(unittest.TestCase):
 
         with patch.object(self.client, "sync_cluster_stop_loss", return_value=[(100001, True, "OK")]) as mock_sync, \
              patch.object(self.client, "get_open_positions", return_value=[mock_pos]), \
+             patch.object(self.client, "get_closed_deal_info", return_value=None), \
+             patch.object(self.client, "ensure_connection", return_value=True), \
+             patch.object(scanner.smc_detector, "get_latest_m15_swing", return_value=(0.0, 0.0, 0.0001)), \
              patch.object(self.client, "get_position_mfe", return_value=0.5):
             asyncio.run(scanner.monitor_open_trades())
             # Verify trade transitioned to OPEN

@@ -1,3 +1,4 @@
+from config import clean_symbol
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import functools
@@ -430,7 +431,7 @@ class TradeJournal:
         """Retrieves all trades (open and closed) associated with a pyramid cluster."""
         with self._get_connection() as conn:
             cur = conn.cursor()
-            clean = symbol.upper().replace(".PRO", "").replace(".RAW", "")
+            clean = clean_symbol(symbol)
             if parent_ticket:
                 cur.execute("""
                     SELECT * FROM trades

@@ -28,6 +28,7 @@ from config import (
     PYRAMID_MIN_PROFIT_R,
     PYRAMID_MIN_RR_TO_TP,
     clean_symbol,
+    parse_currencies,
 )
 
 logger = logging.getLogger("ForexSMC.MT5Client")
@@ -310,6 +311,16 @@ class MT5Client:
         vol_digits = len(str(vol_step).split(".")[1]) if ("." in str(vol_step) and not str(vol_step).endswith(".0")) else 2
         vol_digits = max(2, vol_digits)
 
+        # Enforce maximum tolerated risk limit: if minimum lot exceeds tolerated risk, do not trade!
+        max_tolerated_risk_usd = risk_amount * MAX_RISK_DEVIATION_TOLERANCE
+        loss_at_min_lot = loss_per_one_lot * vol_min
+        if loss_at_min_lot > max_tolerated_risk_usd:
+            logger.warning(
+                f"Calculated risk at minimum volume for {resolved} ({vol_min} lot = {loss_at_min_lot:.2f} {acc.currency}) "
+                f"exceeds max tolerated risk ({max_tolerated_risk_usd:.2f} {acc.currency}, target {risk_amount:.2f}). Returning 0.0 lot."
+            )
+            return 0.0
+
         steps = round(raw_lot / vol_step)
         calculated_lot = round(steps * vol_step, vol_digits)
         final_lot = max(vol_min, min(calculated_lot, vol_max))
@@ -357,6 +368,9 @@ class MT5Client:
         tick = mt5.symbol_info_tick(resolved)
         if sym_info is None or tick is None:
             return False, f"Failed to get tick info for {resolved}", None, 0.0
+
+        if volume <= 0:
+            return False, "Order volume is 0.0 (risk exceeds maximum allowed limits)", None, 0.0
 
         is_buy = direction.upper() == "BUY"
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
@@ -434,6 +448,9 @@ class MT5Client:
         sym_info = mt5.symbol_info(resolved)
         if sym_info is None:
             return False, f"Failed to get symbol info for {resolved}", None, 0.0
+
+        if volume <= 0:
+            return False, "Order volume is 0.0 (risk exceeds maximum allowed limits)", None, 0.0
 
         is_buy = direction.upper() == "BUY"
         order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
@@ -1018,15 +1035,7 @@ class MT5Client:
         Parses base and quote currency from standard Forex/Metals pairs.
         E.g. EURUSD -> ('EUR', 'USD'), XAUUSD -> ('XAU', 'USD'), USDJPY -> ('USD', 'JPY')
         """
-        sym = clean_symbol(symbol_clean)
-
-        if len(sym) == 6:
-            return sym[:3], sym[3:]
-        elif "XAU" in sym:
-            return "XAU", sym.replace("XAU", "")
-        elif "XAG" in sym:
-            return "XAG", sym.replace("XAG", "")
-        return sym, ""
+        return parse_currencies(symbol_clean)
 
     def get_prop_metrics(self) -> dict:
         """
@@ -1097,6 +1106,31 @@ class MT5Client:
         5. Scalable % Risk vs Minimum Lot Constraint
         """
         if not PROP_FIRM_MODE:
+            # Scalable minimum lot risk protection for personal accounts
+            if sl_distance > 0:
+                resolved = self.resolve_symbol(symbol)
+                sym_info = mt5.symbol_info(resolved) if resolved else None
+                acc_info = mt5.account_info()
+                if sym_info and acc_info and acc_info.balance > 0:
+                    vol_min = sym_info.volume_min if sym_info.volume_min > 0 else 0.01
+                    tick_size = sym_info.trade_tick_size if sym_info.trade_tick_size > 0 else sym_info.point
+                    tick_val = sym_info.trade_tick_value if sym_info.trade_tick_value > 0 else 1.0
+
+                    ticks = sl_distance / tick_size
+                    loss_at_min_lot = ticks * tick_val * vol_min
+
+                    target_risk_pct = DEFAULT_RISK_PERCENT
+                    target_risk_usd = acc_info.balance * (target_risk_pct / 100.0)
+                    max_tolerated_risk_usd = target_risk_usd * MAX_RISK_DEVIATION_TOLERANCE
+
+                    if loss_at_min_lot > max_tolerated_risk_usd:
+                        actual_risk_pct = (loss_at_min_lot / acc_info.balance) * 100.0
+                        return (
+                            False,
+                            f"🛡️ Ryzyko SL zbyt duże dla salda ({acc_info.balance:.0f} {acc_info.currency}): "
+                            f"min. lot ({vol_min}) dałby stratę {loss_at_min_lot:.2f} {acc_info.currency} ({actual_risk_pct:.2f}% kapitału), "
+                            f"przekraczając dopuszczalny limit {target_risk_pct}% (max z tolerancją: {max_tolerated_risk_usd:.2f} {acc_info.currency}).",
+                        )
             return True, "OK"
 
         metrics = self.get_prop_metrics()

@@ -67,11 +67,17 @@ def md_to_telegram_html(text: str) -> str:
     # 2. Protect inline code `...`
     text = re.sub(r"`([^`\n]+)`", repl_inline, text)
 
-    # 3. Escape HTML entities in the remaining text
-    text = html.escape(text, quote=False)
+    links = []
 
-    # 4. Convert markdown links: [text](url) -> <a href="url">text</a>
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", r'<a href="\2">\1</a>', text)
+    def repl_link(m):
+        links.append((m.group(1), m.group(2)))
+        return f"\x00LINK{len(links)-1}\x00"
+
+    # 3. Protect markdown links: [text](url) so underscores in URLs are not converted to italic
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", repl_link, text)
+
+    # 4. Escape HTML entities in the remaining text
+    text = html.escape(text, quote=False)
 
     # 5. Convert bold: **text** -> <b>text</b>
     text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
@@ -79,12 +85,18 @@ def md_to_telegram_html(text: str) -> str:
     # 6. Convert italic: _text_ -> <i>text</i> (only when not inside words or numbers)
     text = re.sub(r"(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])", r"<i>\1</i>", text)
 
-    # 7. Restore protected inline code: <code>escaped(code)</code>
+    # 7. Restore protected links: <a href="url">text</a>
+    for idx, (lt, lu) in enumerate(links):
+        escaped_lt = html.escape(lt, quote=False)
+        escaped_lu = lu.replace('"', "%22")
+        text = text.replace(f"\x00LINK{idx}\x00", f'<a href="{escaped_lu}">{escaped_lt}</a>')
+
+    # 8. Restore protected inline code: <code>escaped(code)</code>
     for idx, code in enumerate(inline_codes):
         escaped_code = html.escape(code, quote=False)
         text = text.replace(f"\x00INLINE{idx}\x00", f"<code>{escaped_code}</code>")
 
-    # 8. Restore protected code blocks: <pre>escaped(block)</pre>
+    # 9. Restore protected code blocks: <pre>escaped(block)</pre>
     for idx, block in enumerate(code_blocks):
         escaped_block = html.escape(block, quote=False)
         text = text.replace(f"\x00BLOCK{idx}\x00", f"<pre>{escaped_block}</pre>")
@@ -212,11 +224,11 @@ class TelegramBotManager:
                     f"Rejecting callback from user_id={user_id} (allowed user IDs: {positive_user_ids})"
                 )
                 return False
-            # If only negative channel/group IDs are configured in .env, allow actions from that channel
-            if chat_id in self.allowed_chat_ids:
-                return True
+            # If only negative channel/group IDs are configured in .env, require personal user ID for trades
             logger.warning(
-                f"Rejecting callback from user_id={user_id} in chat_id={chat_id} (allowed: {self.allowed_chat_ids})"
+                f"Rejecting trading action callback from user_id={user_id} in chat_id={chat_id}: "
+                f"Only channel/group ID is configured in TELEGRAM_CHAT_ID. "
+                f"Please add your personal numeric Telegram user ID to TELEGRAM_CHAT_ID in .env to authorize trade execution."
             )
             return False
 
@@ -226,16 +238,29 @@ class TelegramBotManager:
         return (user_id in self.allowed_chat_ids) or (chat_id in self.allowed_chat_ids)
 
     @staticmethod
-    async def _safe_edit_message(query, text: str, parse_mode: str = "HTML"):
+    async def _safe_edit_message(query, text: str, parse_mode: str = "HTML", remove_keyboard: bool = True):
         """Safely edits message caption (for photo alerts) or message text (for text alerts)."""
         if not query.message:
             return
         formatted = md_to_telegram_html(text) if parse_mode == "HTML" else text
+        reply_markup = None if remove_keyboard else getattr(query.message, "reply_markup", None)
         try:
             if query.message.caption is not None:
-                await query.edit_message_caption(caption=formatted, parse_mode=parse_mode)
+                safe_caption = truncate_telegram_html(formatted, max_rendered_len=1020) if parse_mode == "HTML" else formatted[:1020]
+                try:
+                    await query.edit_message_caption(caption=safe_caption, parse_mode=parse_mode, reply_markup=reply_markup)
+                except Exception as e:
+                    logger.warning(f"Failed to edit message caption with {parse_mode}: {e}")
+                    plain_caption = re.sub(r"<[^>]+>", "", safe_caption)[:1020]
+                    await query.edit_message_caption(caption=plain_caption, parse_mode=None, reply_markup=reply_markup)
             else:
-                await query.edit_message_text(text=formatted, parse_mode=parse_mode)
+                safe_text = truncate_telegram_html(formatted, max_rendered_len=4090) if parse_mode == "HTML" else formatted[:4090]
+                try:
+                    await query.edit_message_text(text=safe_text, parse_mode=parse_mode, reply_markup=reply_markup)
+                except Exception as e:
+                    logger.warning(f"Failed to edit message text with {parse_mode}: {e}")
+                    plain_text = re.sub(r"<[^>]+>", "", safe_text)[:4090]
+                    await query.edit_message_text(text=plain_text, parse_mode=None, reply_markup=reply_markup)
         except Exception as e:
             logger.debug(f"Error in _safe_edit_message: {e}")
 
@@ -1189,7 +1214,7 @@ class TelegramBotManager:
                             msg = await self.app.bot.send_photo(
                                 chat_id=target_chat,
                                 photo=photo,
-                                caption=caption,
+                                caption=caption[:1020],
                                 parse_mode=None,
                                 reply_markup=reply_markup,
                             )
@@ -1207,7 +1232,7 @@ class TelegramBotManager:
                         except Exception:
                             await self.app.bot.send_message(
                                 chat_id=target_chat,
-                                text=caption,
+                                text=caption[:4000],
                                 parse_mode=None,
                                 reply_to_message_id=msg.message_id,
                             )
@@ -1241,7 +1266,7 @@ class TelegramBotManager:
                         logger.warning(f"Failed to send long text alert with HTML: {e}")
                         await self.app.bot.send_message(
                             chat_id=target_chat,
-                            text=caption,
+                            text=caption[:4000],
                             parse_mode=None,
                             reply_markup=reply_markup,
                         )
