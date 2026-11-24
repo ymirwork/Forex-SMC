@@ -60,6 +60,7 @@ charts/*.png
 charts/*.jpg
 charts/*.jpeg
 !charts/.gitkeep
+docs/audits/.*
 
 # ==========================================
 # IDE & EDITOR SETTINGS

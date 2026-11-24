@@ -106,6 +106,7 @@ class TradeJournal:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticket ON trades(mt5_ticket);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);")
             for col, col_def in [
                 ("notion_page_id", "TEXT"),
                 ("parent_ticket", "INTEGER"),

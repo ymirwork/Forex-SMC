@@ -284,7 +284,7 @@ ADAPTIVE_TRAILING_ATR_MULT = float(os.getenv("ADAPTIVE_TRAILING_ATR_MULT", "1.0"
 # AI STRATEGY & TRADE AUDITOR SETTINGS
 # ==========================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 AUDIT_DEFAULT_RANGE = os.getenv("AUDIT_DEFAULT_RANGE", "30d")

@@ -6,6 +6,7 @@ to provide institutional diagnostic insights and actionable parameter tuning.
 """
 
 import argparse
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import json
@@ -445,49 +446,9 @@ def query_gemini_api(prompt: str, api_key: str, model_name: str = "gemini-flash-
 
 async def query_gemini_api_async(prompt: str, api_key: str, model_name: str = "gemini-flash-lite-latest") -> Tuple[bool, str]:
     """
-    Asynchronously queries Google Gemini API via official REST endpoint using httpx with automatic model fallback.
+    Asynchronously queries Google Gemini API by delegating to thread pool executor.
     """
-    if not api_key:
-        return False, "Brak klucza GEMINI_API_KEY w konfiguracji."
-
-    models_to_try = [model_name]
-    for fallback_m in ("gemini-flash-lite-latest", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-pro-latest"):
-        if fallback_m not in models_to_try:
-            models_to_try.append(fallback_m)
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 4096,
-        },
-    }
-
-    last_err = ""
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        for m in models_to_try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
-            try:
-                resp = await client.post(url, json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        full_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
-                        if full_text:
-                            return True, full_text
-                    return False, f"Brak treści w odpowiedzi Gemini ({m}): {data}"
-                elif resp.status_code in (404, 429, 503):
-                    last_err = f"Model {m} zwrócił {resp.status_code}: {resp.text[:200]}"
-                    continue
-                else:
-                    return False, f"Błąd Gemini API ({m}, {resp.status_code}): {resp.text[:300]}"
-            except Exception as e:
-                last_err = f"Wyjątek dla modelu {m}: {e}"
-                continue
-
-    return False, f"Wszystkie próby modeli Gemini zawiodły. Ostatni błąd: {last_err}"
+    return await asyncio.to_thread(query_gemini_api, prompt, api_key, model_name)
 
 
 def deterministic_fallback_report(metrics: Dict[str, Any]) -> str:
@@ -725,7 +686,7 @@ def run_audit(
     prompt = format_audit_prompt(metrics)
 
     key = api_key or GEMINI_API_KEY
-    mdl = model or GEMINI_MODEL or "gemini-1.5-pro"
+    mdl = model or GEMINI_MODEL or "gemini-flash-lite-latest"
 
     if key:
         logger.info(f"Odpytuję Gemini Pro ({mdl}) dla audytu {range_spec}...")

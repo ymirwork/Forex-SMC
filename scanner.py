@@ -143,10 +143,30 @@ class SMCScanner:
         self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
         self.adaptive_manager = AdaptivePositionManager(journal=self.journal, mt5_client=self.mt5_client)
         self._trailed_sl_levels: Dict[int, float] = {}
-        self._last_sunday_audit_date: str = ""
+        self._audit_state_file = os.path.join("docs", "audits", ".last_sunday_audit")
+        self._last_sunday_audit_date: str = self._load_last_sunday_audit_date()
         self._shadow_reported_be: Set[int] = set()
         self._shadow_reported_trail: Dict[int, float] = {}
         self._cleanup_old_charts(max_days=3)
+
+    def _load_last_sunday_audit_date(self) -> str:
+        """Loads persistent record of last dispatched Sunday audit to prevent duplicate alerts on restart."""
+        try:
+            if os.path.exists(self._audit_state_file):
+                with open(self._audit_state_file, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+        except Exception:
+            pass
+        return ""
+
+    def _save_last_sunday_audit_date(self, date_str: str):
+        """Persists date of dispatched Sunday audit to disk."""
+        try:
+            os.makedirs(os.path.dirname(self._audit_state_file), exist_ok=True)
+            with open(self._audit_state_file, "w", encoding="utf-8") as f:
+                f.write(date_str)
+        except Exception as e:
+            logger.debug(f"Could not persist sunday audit state: {e}")
 
     def _cleanup_old_charts(self, max_days: int = 3):
         """Removes generated chart PNGs older than max_days to prevent disk accumulation."""
@@ -1166,6 +1186,7 @@ class SMCScanner:
                     today_str = now_utc.strftime("%Y-%m-%d")
                     if self._last_sunday_audit_date != today_str:
                         self._last_sunday_audit_date = today_str
+                        self._save_last_sunday_audit_date(today_str)
                         try:
                             if hasattr(self.telegram, "send_scheduled_sunday_audit"):
                                 await self.telegram.send_scheduled_sunday_audit(range_spec=AUDIT_DEFAULT_RANGE)

@@ -641,26 +641,13 @@ class TelegramBotManager:
 
         await update.message.reply_text("🔍 Analizuję historię transakcji...")
         report = self.insight_engine.generate_insights_report()
-
-        html_report = md_to_telegram_html(report)
-        # Split long reports for Telegram's 4096 char limit
-        clean_len = len(re.sub(r"<[^>]+>", "", html_report))
-        if clean_len <= 4096:
-            await update.message.reply_text(html_report, parse_mode="HTML")
-        else:
-            parts = report.split("\n\n")
-            chunk = ""
-            for part in parts:
-                if len(chunk) + len(part) + 2 > 3500:
-                    await update.message.reply_text(md_to_telegram_html(chunk), parse_mode="HTML")
-                    chunk = part
-                else:
-                    chunk = chunk + "\n\n" + part if chunk else part
-            if chunk:
-                await update.message.reply_text(md_to_telegram_html(chunk), parse_mode="HTML")
+        await self._send_chunked_html(update.message, report)
 
     async def _send_chunked_html(self, target, text: str):
-        """Sends potentially long text to Telegram as HTML, splitting at paragraphs when exceeding limit."""
+        """Sends potentially long text to Telegram as HTML, safely splitting across paragraphs and lines."""
+        if not text:
+            return
+
         html_text = md_to_telegram_html(text)
         clean_len = len(re.sub(r"<[^>]+>", "", html_text))
         if clean_len <= 3800:
@@ -670,18 +657,31 @@ class TelegramBotManager:
                 await self.app.bot.send_message(chat_id=target, text=html_text, parse_mode="HTML")
             return
 
-        parts = text.split("\n\n")
+        # Atomic decomposition: split by \n\n, then \n, then slice if any line exceeds 3500 chars
+        atomic_pieces = []
+        for part in text.split("\n\n"):
+            if len(part) <= 3500:
+                atomic_pieces.append(part)
+            else:
+                for line in part.split("\n"):
+                    if len(line) <= 3500:
+                        atomic_pieces.append(line)
+                    else:
+                        for i in range(0, len(line), 3500):
+                            atomic_pieces.append(line[i : i + 3500])
+
         chunk = ""
-        for part in parts:
-            if len(chunk) + len(part) + 2 > 3500:
+        for piece in atomic_pieces:
+            if len(chunk) + len(piece) + 2 > 3500:
                 chunk_html = md_to_telegram_html(chunk)
                 if hasattr(target, "reply_text"):
                     await target.reply_text(chunk_html, parse_mode="HTML")
                 elif self.app:
                     await self.app.bot.send_message(chat_id=target, text=chunk_html, parse_mode="HTML")
-                chunk = part
+                chunk = piece
             else:
-                chunk = chunk + "\n\n" + part if chunk else part
+                chunk = chunk + "\n\n" + piece if chunk else piece
+
         if chunk:
             chunk_html = md_to_telegram_html(chunk)
             if hasattr(target, "reply_text"):

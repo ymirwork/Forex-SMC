@@ -260,7 +260,7 @@ class TestAIAuditor(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(text, "Raport AI z sukcesem.")
 
-    @patch("httpx.AsyncClient.post")
+    @patch("httpx.Client.post")
     def test_query_gemini_api_async_success(self, mock_post):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -271,7 +271,7 @@ class TestAIAuditor(unittest.TestCase):
         }
         mock_post.return_value = mock_resp
 
-        ok, text = asyncio.run(query_gemini_api_async("Test prompt", api_key="dummy_key", model_name="gemini-1.5-pro"))
+        ok, text = asyncio.run(query_gemini_api_async("Test prompt", api_key="dummy_key", model_name="gemini-flash-lite-latest"))
         self.assertTrue(ok)
         self.assertEqual(text, "Raport AI async z sukcesem.")
 
@@ -314,6 +314,26 @@ class TestTelegramAIAuditIntegration(unittest.IsolatedAsyncioTestCase):
         rec_call = update.message.reply_text.call_args_list[2][0][0]
         self.assertIn("ZAPROPONOWANE PARAMETRY DO WDROŻENIA", rec_call)
         self.assertIn("AUTO_BE_R_TRIGGER", rec_call)
+
+    async def test_send_chunked_html_handles_large_unbroken_text(self):
+        from telegram_bot import TelegramBotManager
+
+        mock_mt5 = MagicMock()
+        manager = TelegramBotManager(mt5_client=mock_mt5)
+        mock_target = MagicMock()
+        mock_target.reply_text = AsyncMock()
+
+        # 8500 characters of unbroken text without \n\n
+        long_text = "Linia audytu " * 650
+        self.assertGreater(len(long_text), 8000)
+
+        await manager._send_chunked_html(mock_target, long_text)
+
+        # Ensure all sent chunks are safely under Telegram's 4096 limit
+        self.assertGreaterEqual(mock_target.reply_text.call_count, 2)
+        for call_item in mock_target.reply_text.call_args_list:
+            chunk_sent = call_item[0][0]
+            self.assertLessEqual(len(chunk_sent), 4000)
 
 
 if __name__ == "__main__":
