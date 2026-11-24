@@ -216,6 +216,8 @@ EVENING_BLOCK_END_HOUR_UTC = int(os.getenv("EVENING_BLOCK_END_HOUR_UTC", "23")) 
 # ==========================================
 # Minimalny czas (w minutach) pomiędzy kolejnymi alertami na tym samym symbolu i kierunku
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
+# Minimalny czas (w minutach) kwarantanny po uderzeniu w Stop Loss na danym symbolu (ochrona przed revenge tradingiem)
+POST_LOSS_COOLDOWN_MINUTES = int(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "60"))
 # Czas (w godzinach) wyciszenia alertów po kliknięciu "Odrzuć" na Telegramie
 DISMISS_MUTE_HOURS = float(os.getenv("DISMISS_MUTE_HOURS", "2.0"))
 
@@ -234,7 +236,7 @@ MAX_PYRAMID_LEVEL = int(os.getenv("MAX_PYRAMID_LEVEL", "3"))               # Max
 PYRAMID_EXECUTION_TIMEFRAME = os.getenv("PYRAMID_EXECUTION_TIMEFRAME", "M5") # Interwał szukania wejść dla dokładek (M5)
 PYRAMID_MIN_PROFIT_R = float(os.getenv("PYRAMID_MIN_PROFIT_R", "1.0"))     # Każda poprzednia pozycja musi osiągnąć min. +1.0R
 PYRAMID_MIN_RR_TO_TP = float(os.getenv("PYRAMID_MIN_RR_TO_TP", "1.0"))     # Minimalna przestrzeń do Master TP (min 1.0R dla M5)
-PYRAMID_AUTO_EXECUTE = os.getenv("PYRAMID_AUTO_EXECUTE", "True").lower() in ("true", "1") # Auto wejście w MT5 vs przyciski TG
+PYRAMID_AUTO_EXECUTE = os.getenv("PYRAMID_AUTO_EXECUTE", "False").lower() in ("true", "1") # Auto wejście w MT5 vs przyciski TG
 PYRAMID_MAX_RISK_FINANCE_RATIO = float(os.getenv("PYRAMID_MAX_RISK_FINANCE_RATIO", "0.75")) # Max % zablokowanego zysku na ryzyko dokładki (75%)
 PYRAMID_ALLOW_MIN_LOT_FLOAT = os.getenv("PYRAMID_ALLOW_MIN_LOT_FLOAT", "True").lower() in ("true", "1") # Zezwolenie na min. lot 0.01 jeśli mieści się w zablokowanym zysku
 PYRAMID_LOCK_PREVIOUS_PROFIT = os.getenv("PYRAMID_LOCK_PREVIOUS_PROFIT", "True").lower() in ("true", "1") # Lock profit on parent trade
@@ -277,6 +279,17 @@ ADAPTIVE_BE_CHOP_R = float(os.getenv("ADAPTIVE_BE_CHOP_R", "0.80"))        # Szy
 ADAPTIVE_BE_VOLATILE_R = float(os.getenv("ADAPTIVE_BE_VOLATILE_R", "0.85")) # BE przy podwyższonej zmienności
 ADAPTIVE_TRAILING_MIN_STEP_R = float(os.getenv("ADAPTIVE_TRAILING_MIN_STEP_R", "0.40")) # Min. krok zysku do przesunięcia SL
 ADAPTIVE_TRAILING_ATR_MULT = float(os.getenv("ADAPTIVE_TRAILING_ATR_MULT", "1.0"))       # Min. dystans SL od ceny (1.0 * ATR)
+
+# ==========================================
+# AI STRATEGY & TRADE AUDITOR SETTINGS
+# ==========================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+AUDIT_DEFAULT_RANGE = os.getenv("AUDIT_DEFAULT_RANGE", "30d")
+ENABLE_SUNDAY_AUDIT_REPORT = os.getenv("ENABLE_SUNDAY_AUDIT_REPORT", "True").lower() in ("true", "1")
+SUNDAY_AUDIT_HOUR_UTC = int(os.getenv("SUNDAY_AUDIT_HOUR_UTC", "19")) # 19:00 UTC = 20:00 CET
 
 
 

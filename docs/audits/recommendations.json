@@ -1,0 +1,21 @@
+{
+  "summary": "Bot posiada solidny fundament w strategii SMC oraz sesji Londyn, jednak jego wyniki są drastycznie drenowane przez stratną strategię Zumiko, handel w sesji azjatyckiej oraz zbyt wczesne przestawianie pozycji na Break-Even.",
+  "capital_leaks": [
+    "Handel podczas sesji Azjatyckiej (EV -0.58R, WR 10.0%) i NY PM (EV -0.46R)",
+    "Obecność toksycznej strategii Zumiko KillMLM (Net -3.78R, WR 17.1%)",
+    "Handel na niskopłynnych lub nieskutecznych parach forex (szczególnie crossy JPY typu GBPJPY, USDJPY)"
+  ],
+  "strategy_critique": "Bot wchodzi w transakcje w złym momencie cyklu rynkowego (szczególnie w reżimie STRONG_TREND, gdzie próbuje kontrariańskich wejść), a sztywne i zbyt czułe reguły Break-Even duszą potencjalne zyski.",
+  "recommended_config": {
+    "AUTO_BE_R_TRIGGER": 1.75,
+    "MIN_CONFLUENCE_SCORE": 75
+  },
+  "action_items": [
+    "Całkowicie wyłączyć handel w sesji Azjatyckiej oraz NY PM w pliku konfiguracyjnym",
+    "Zwiększyć AUTO_BE_R_TRIGGER do 1.75R w celu redukcji przedwczesnych wyjść na BE (obecnie 11 przypadków)",
+    "Ograniczyć listę instrumentów handlowych (Watchlist) wyłącznie do par z dodatnim EV (m.in. EURCHF, EURAUD, GBPUSD, XAUUSD)",
+    "Podnieść próg MIN_CONFLUENCE_SCORE z 70 do 75, aby eliminować fałszywe sygnały o ocenach A/A+"
+  ],
+  "generated_at": "2026-11-24T12:40:13.835905+00:00",
+  "source_report": "audit_all_20261124_134013.md"
+}

@@ -54,9 +54,10 @@ class TestAdaptivePositionManager(unittest.TestCase):
         self.assertEqual(regime_neutral, MarketRegime.COMPRESSION)
 
     def test_dynamic_be_triggers(self):
-        self.assertEqual(self.manager.get_dynamic_be_trigger(MarketRegime.STRONG_TREND), 1.15)
-        self.assertEqual(self.manager.get_dynamic_be_trigger(MarketRegime.COMPRESSION), 0.80)
-        self.assertEqual(self.manager.get_dynamic_be_trigger(MarketRegime.HIGH_VOLATILITY), 0.85)
+        from config import ADAPTIVE_BE_TREND_R, ADAPTIVE_BE_CHOP_R, ADAPTIVE_BE_VOLATILE_R
+        self.assertEqual(self.manager.get_dynamic_be_trigger(MarketRegime.STRONG_TREND), ADAPTIVE_BE_TREND_R)
+        self.assertEqual(self.manager.get_dynamic_be_trigger(MarketRegime.COMPRESSION), ADAPTIVE_BE_CHOP_R)
+        self.assertEqual(self.manager.get_dynamic_be_trigger(MarketRegime.HIGH_VOLATILITY), ADAPTIVE_BE_VOLATILE_R)
 
     def test_pyramiding_qualification_gate(self):
         self.assertTrue(self.manager.can_pyramid(MarketRegime.STRONG_TREND))

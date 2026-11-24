@@ -261,6 +261,7 @@ async def sync_all(client: Optional[MT5Client] = None, journal: Optional[TradeJo
         with journal._get_connection() as conn:
             conn.execute("UPDATE trades SET regime = 'STRONG_TREND' WHERE (regime IS NULL OR regime = '') AND (strategy LIKE '%Zumiko%' OR strategy = 'GOLDEN_COMBO' OR status = 'WIN' OR status = 'OPEN')")
             conn.execute("UPDATE trades SET regime = 'COMPRESSION' WHERE (regime IS NULL OR regime = '') AND status IN ('LOSS', 'BE')")
+            conn.commit()
     except Exception as e:
         print(f"  ⚠️ Ostrzeżenie przy uzupełnianiu reżimu w bazie: {e}")
 

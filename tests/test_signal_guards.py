@@ -638,7 +638,10 @@ class TestSignalGuards(unittest.TestCase):
             {"time": datetime.now(timezone.utc), "open": 1.1000, "high": 1.1010, "low": 1.0990, "close": 1.1005}
         ] * 300)
 
-        scanner = SMCScanner(mt5_client=mock_mt5)
+        mock_news = MagicMock()
+        mock_news.check_news.return_value = (False, None, None)
+        mock_news.fetch_calendar_async = unittest.mock.AsyncMock()
+        scanner = SMCScanner(mt5_client=mock_mt5, news_filter=mock_news)
 
         # Mock SMC finding BUY and Zumiko finding SELL on EURUSD
         smc_buy = TradeSetup(
@@ -658,6 +661,7 @@ class TestSignalGuards(unittest.TestCase):
 
         with patch.object(scanner.smc_detector, "scan_for_setups", return_value=[smc_buy]), \
              patch.object(scanner.zumiko_detector, "scan_for_setups", return_value=[zumiko_sell]), \
+             patch("scanner.ENABLE_ZUMIKO_STRATEGY", True), \
              patch("scanner.SYMBOLS", ["EURUSD"]), \
              patch("scanner.PROP_FIRM_MODE", False), \
              patch("scanner.BLOCK_ROLLOVER_SESSION", False):

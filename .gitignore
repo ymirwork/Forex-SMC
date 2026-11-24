@@ -2,6 +2,7 @@
 # SECRETS & SENSITIVE CONFIGURATION (CRITICAL)
 # ==========================================
 .env
+.env.*
 .env*.local
 *.key
 *.pem

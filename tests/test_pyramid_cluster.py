@@ -221,7 +221,9 @@ class TestPyramidCluster(unittest.TestCase):
         self.assertGreater(lot, 0.0)
         self.assertLessEqual(lot, 1.0)
 
-        # Sub-test C: Grade B should receive half the risk of Grade A+
+        # Sub-test C: Grade B should receive proportioned risk relative to Grade A+
+        from config import PYRAMID_GRADE_WEIGHTS
+        ratio = PYRAMID_GRADE_WEIGHTS["B"] / PYRAMID_GRADE_WEIGHTS["A+"]
         lot_b, _, allowed_b, _ = self.client.calculate_pyramid_position_size(
             symbol="EURUSD",
             entry_price=1.08350,
@@ -229,7 +231,7 @@ class TestPyramidCluster(unittest.TestCase):
             setup_grade="B",
             cluster_status=cluster_status,
         )
-        self.assertAlmostEqual(allowed_b, allowed * 0.5, delta=1.0)
+        self.assertAlmostEqual(allowed_b, allowed * ratio, delta=1.0)
         self.assertLess(lot_b, lot)
 
     @patch("MetaTrader5.order_send")
@@ -417,8 +419,9 @@ class TestPyramidCluster(unittest.TestCase):
             self.assertEqual(reason2, "OK")
             self.assertEqual(lot2, 0.01)
 
+    @patch.object(MT5Client, "ensure_connection", return_value=True)
     @patch("scanner.PYRAMID_AUTO_EXECUTE", True)
-    def test_scanner_auto_execute_scale_in(self):
+    def test_scanner_auto_execute_scale_in(self, mock_conn):
         from scanner import SMCScanner
         from smc_detector import TradeSetup
 
@@ -427,10 +430,15 @@ class TestPyramidCluster(unittest.TestCase):
         mock_telegram.send_pyramid_execution_alert = unittest.mock.AsyncMock()
         mock_telegram.send_setup_alert = unittest.mock.AsyncMock()
 
+        mock_news = MagicMock()
+        mock_news.check_news.return_value = (False, None, None)
+        mock_news.fetch_calendar_async = unittest.mock.AsyncMock()
+
         scanner = SMCScanner(
             mt5_client=self.client,
             telegram_manager=mock_telegram,
             journal=self.journal,
+            news_filter=mock_news,
         )
 
         pyr_status = {

@@ -69,8 +69,12 @@ class SessionManager:
         is_asian_session = dtime(0, 0) <= t < dtime(7, 0)
         is_rollover = dtime(20, 0) <= t or t < dtime(0, 15)
 
-        # Evening entry block (e.g. 17:00 - 23:00 UTC) to avoid low-liquidity chop and midnight spread blowouts
-        is_evening_blocked = BLOCK_EVENING_ENTRIES and (dtime(EVENING_BLOCK_START_HOUR_UTC, 0) <= t < dtime(EVENING_BLOCK_END_HOUR_UTC, 0))
+        # Evening entry block (e.g. 17:00 - 07:00 UTC) to avoid low-liquidity chop, rollover and Asian session losses
+        if EVENING_BLOCK_START_HOUR_UTC > EVENING_BLOCK_END_HOUR_UTC:
+            in_evening_window = (t >= dtime(EVENING_BLOCK_START_HOUR_UTC, 0)) or (t < dtime(EVENING_BLOCK_END_HOUR_UTC, 0))
+        else:
+            in_evening_window = dtime(EVENING_BLOCK_START_HOUR_UTC, 0) <= t < dtime(EVENING_BLOCK_END_HOUR_UTC, 0)
+        is_evening_blocked = BLOCK_EVENING_ENTRIES and in_evening_window
 
         if is_london_killzone:
             session_name = "London Open Killzone"

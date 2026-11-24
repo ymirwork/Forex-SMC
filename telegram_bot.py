@@ -17,6 +17,7 @@ from telegram.request import HTTPXRequest
 
 from config import (
     ALLOWED_CHAT_IDS,
+    AUDIT_DEFAULT_RANGE,
     DEFAULT_RISK_PERCENT,
     DISMISS_MUTE_HOURS,
     DYNAMIC_FILTER_MODE,
@@ -310,6 +311,7 @@ class TelegramBotManager:
             "• `/optimizer` - Optymalizator BEST RR (szukanie idealnego Take Profit)\n"
             "• `/addtrade` - Ręczne dodanie zagrania do dziennika\n"
             "• `/insights` - Analiza słabych stron i mocnych zagrań (Edge Report)\n"
+            "• `/ai_audit` [30d|all|7d] - Autonomiczny audyt AI, diagnostyka wycieków i rekomendacje\n"
             "• `/adaptive` - Silnik adaptacyjny (reżimy rynku, dynamiczny BE i trailing)\n"
         )
         await update.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
@@ -656,6 +658,91 @@ class TelegramBotManager:
                     chunk = chunk + "\n\n" + part if chunk else part
             if chunk:
                 await update.message.reply_text(md_to_telegram_html(chunk), parse_mode="HTML")
+
+    async def _send_chunked_html(self, target, text: str):
+        """Sends potentially long text to Telegram as HTML, splitting at paragraphs when exceeding limit."""
+        html_text = md_to_telegram_html(text)
+        clean_len = len(re.sub(r"<[^>]+>", "", html_text))
+        if clean_len <= 3800:
+            if hasattr(target, "reply_text"):
+                await target.reply_text(html_text, parse_mode="HTML")
+            elif self.app:
+                await self.app.bot.send_message(chat_id=target, text=html_text, parse_mode="HTML")
+            return
+
+        parts = text.split("\n\n")
+        chunk = ""
+        for part in parts:
+            if len(chunk) + len(part) + 2 > 3500:
+                chunk_html = md_to_telegram_html(chunk)
+                if hasattr(target, "reply_text"):
+                    await target.reply_text(chunk_html, parse_mode="HTML")
+                elif self.app:
+                    await self.app.bot.send_message(chat_id=target, text=chunk_html, parse_mode="HTML")
+                chunk = part
+            else:
+                chunk = chunk + "\n\n" + part if chunk else part
+        if chunk:
+            chunk_html = md_to_telegram_html(chunk)
+            if hasattr(target, "reply_text"):
+                await target.reply_text(chunk_html, parse_mode="HTML")
+            elif self.app:
+                await self.app.bot.send_message(chat_id=target, text=chunk_html, parse_mode="HTML")
+
+    async def ai_audit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Generates and dispatches deep AI Strategy & Trade Audit report."""
+        if not self._is_authorized(update):
+            return
+
+        range_arg = context.args[0] if (context and context.args) else AUDIT_DEFAULT_RANGE
+        await update.message.reply_text(
+            f"🧠 <b>Rozpoczynam audyt AI strategii</b> (zakres: <code>{range_arg}</code>)...\n"
+            f"<i>Pobieram metryki egzekucji, badam wycieki kapitału i odpytuję Gemini Pro...</i>",
+            parse_mode="HTML",
+        )
+
+        try:
+            from ai_auditor import run_audit
+            report, metrics, rec_data = await asyncio.to_thread(run_audit, range_spec=range_arg)
+            await self._send_chunked_html(update.message, report)
+
+            if rec_data and rec_data.get("recommended_config"):
+                cfg = rec_data["recommended_config"]
+                rec_lines = [f"• <code>{k}</code>: <code>{v}</code>" for k, v in cfg.items()]
+                rec_msg = (
+                    "💡 <b>ZAPROPONOWANE PARAMETRY DO WDROŻENIA:</b>\n"
+                    + "\n".join(rec_lines) + "\n\n"
+                    + "<i>Aby wdrożyć zmiany na serwerze, wpisz w konsoli:</i>\n"
+                    + "<code>python ai_auditor.py --apply</code>"
+                )
+                await update.message.reply_text(rec_msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error during AI audit command: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Wystąpił błąd podczas audytu AI: {e}")
+
+    async def send_scheduled_sunday_audit(self, range_spec: str = "30d"):
+        """Sends automated weekend AI audit briefing to the alert channel."""
+        if not self.app or not self.alert_channel:
+            return
+
+        try:
+            from ai_auditor import run_audit
+            logger.info("Uruchamiam zaplanowany niedzielny audyt AI...")
+            report, metrics, rec_data = await asyncio.to_thread(run_audit, range_spec=range_spec)
+            header = "📋 <b>COTYGODNIOWY NIEDZIELNY AUDYT STRATEGII (AI BRIEFING)</b>\n\n"
+            await self._send_chunked_html(self.alert_channel, header + report)
+
+            if rec_data and rec_data.get("recommended_config"):
+                cfg = rec_data["recommended_config"]
+                rec_lines = [f"• <code>{k}</code>: <code>{v}</code>" for k, v in cfg.items()]
+                rec_msg = (
+                    "🎯 <b>REKOMENDACJE NA NADCHODZĄCY TYDZIEŃ:</b>\n"
+                    + "\n".join(rec_lines) + "\n\n"
+                    + "<i>Zatwierdź zmiany w konsoli:</i> <code>python ai_auditor.py --apply</code>"
+                )
+                await self.app.bot.send_message(chat_id=self.alert_channel, text=rec_msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed to dispatch Sunday AI audit: {e}", exc_info=True)
 
     async def be_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Moves Stop Loss of open position to Break-Even."""
@@ -1384,6 +1471,8 @@ class TelegramBotManager:
         self.app.add_handler(CommandHandler("addtrade", self.addtrade_cmd))
         self.app.add_handler(CommandHandler("insights", self.insights_cmd))
         self.app.add_handler(CommandHandler("adaptive", self.adaptive_cmd))
+        self.app.add_handler(CommandHandler("ai_audit", self.ai_audit_cmd))
+        self.app.add_handler(CommandHandler("audit", self.ai_audit_cmd))
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
         return self.app

@@ -12,9 +12,11 @@ from config import (
     ADAPTIVE_M15_TRAILING,
     ADD_SPREAD_TO_SL,
     ALERT_COOLDOWN_MINUTES,
+    AUDIT_DEFAULT_RANGE,
     AUTO_BE_AT_1R,
     AUTO_BE_OFFSET_PIPS,
     AUTO_BE_R_TRIGGER,
+    BLOCK_EVENING_ENTRIES,
     BLOCK_ON_HIGH_IMPACT_NEWS,
     BLOCK_ROLLOVER_SESSION,
     DYNAMIC_FILTER_MODE,
@@ -22,6 +24,7 @@ from config import (
     ENABLE_PYRAMIDING,
     ENABLE_ROLLOVER_SL_SHIELD,
     ENABLE_SMC_STRATEGY,
+    ENABLE_SUNDAY_AUDIT_REPORT,
     ENABLE_ZUMIKO_STRATEGY,
     HTF_TIMEFRAME,
     INSIGHTS_MIN_SAMPLE_SIZE,
@@ -29,6 +32,7 @@ from config import (
     LTF_TIMEFRAME,
     MAX_PYRAMID_LEVEL,
     MIN_CONFLUENCE_SCORE,
+    POST_LOSS_COOLDOWN_MINUTES,
     PROP_ENFORCE_NEWS_FILTER,
     PROP_FIRM_MODE,
     PROP_MAX_DRAWDOWN_PERCENT,
@@ -47,6 +51,7 @@ from config import (
     ROLLOVER_SHIELD_START_MINUTES,
     SCAN_INTERVAL_SECONDS,
     TRADE_MONITOR_INTERVAL_SECONDS,
+    SUNDAY_AUDIT_HOUR_UTC,
     SWING_LENGTH,
     SYMBOLS,
     ZUMIKO_FAST_EMA,
@@ -120,6 +125,7 @@ class SMCScanner:
         self.is_running = False
         self.notified_setups: Dict[str, float] = {}
         self._last_alert_by_symbol: Dict[Tuple[str, str], float] = {}
+        self._last_loss_by_symbol: Dict[str, float] = {}
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
         self._shielded_trades: Dict[int, float] = {}
@@ -137,6 +143,7 @@ class SMCScanner:
         self.insight_engine = TradeInsightEngine(self.journal, min_sample_size=INSIGHTS_MIN_SAMPLE_SIZE) if ENABLE_DYNAMIC_EDGE_FILTER else None
         self.adaptive_manager = AdaptivePositionManager(journal=self.journal, mt5_client=self.mt5_client)
         self._trailed_sl_levels: Dict[int, float] = {}
+        self._last_sunday_audit_date: str = ""
         self._shadow_reported_be: Set[int] = set()
         self._shadow_reported_trail: Dict[int, float] = {}
         self._cleanup_old_charts(max_days=3)
@@ -335,6 +342,7 @@ class SMCScanner:
                 elif profit < 0 or realized_r < -0.2:
                     status = "LOSS"
                     status_desc = "🛑 STOP LOSS TRAFIONY" if reason == 4 else "📉 ZAMKNIĘCIE ZE STRATĄ"
+                    self._last_loss_by_symbol[clean_symbol(t.get("symbol", ""))] = time.time()
                 else:
                     status = "BE"
                     status_desc = "🛡️ ZAMKNIĘCIE NA BREAK-EVEN (0.0R)"
@@ -727,13 +735,14 @@ class SMCScanner:
         # Refresh macroeconomic news calendar asynchronously
         await self.news_filter.fetch_calendar_async()
 
-        # Rollover & Low Liquidity Session Lock
-        if BLOCK_ROLLOVER_SESSION:
+        # Rollover & Low Liquidity Session Lock (including Asian / evening block)
+        if BLOCK_ROLLOVER_SESSION or BLOCK_EVENING_ENTRIES:
             curr_session = SessionManager.get_current_session()
-            if "Rollover" in curr_session.get("session_name", ""):
+            sess_name = curr_session.get("session_name", "")
+            if curr_session.get("is_rollover") or curr_session.get("is_evening_blocked") or "Rollover" in sess_name:
                 logger.info(
-                    f"🛡️ [SESSION LOCK] Aktywna sesja {curr_session.get('session_name')}. "
-                    f"Wstrzymano skanowanie rynków z powodu niskiej płynności i rozszerzonych spreadów (BLOCK_ROLLOVER_SESSION=True)."
+                    f"🛡️ [SESSION LOCK] Aktywna sesja {sess_name} (Blokada wieczorno-nocna/rollover aktywna). "
+                    f"Wstrzymano skanowanie rynków z powodu niskiej płynności i rozszerzonych spreadów."
                 )
                 return 0
 
@@ -800,9 +809,13 @@ class SMCScanner:
                         continue
 
                     htf_dir = self.smc_detector.determine_htf_trend(df_htf)
-                    rolling_bars = (df_ltf["high"] - df_ltf["low"]).tail(min(len(df_ltf), 100))
-                    curr_rng = float(df_ltf["high"].iloc[-1] - df_ltf["low"].iloc[-1]) if not df_ltf.empty else 0.0
-                    atr_p = (sum(1 for val in rolling_bars if curr_rng >= val) / len(rolling_bars)) * 100.0 if len(rolling_bars) > 0 else 50.0
+                    # Evaluate volatility using completed candles rather than the forming candle
+                    if len(df_ltf) >= 2:
+                        closed_bars = (df_ltf["high"].iloc[:-1] - df_ltf["low"].iloc[:-1]).tail(min(len(df_ltf) - 1, 100))
+                        last_closed_rng = float(df_ltf["high"].iloc[-2] - df_ltf["low"].iloc[-2])
+                        atr_p = (sum(1 for val in closed_bars if last_closed_rng >= val) / len(closed_bars)) * 100.0 if len(closed_bars) > 0 else 50.0
+                    else:
+                        atr_p = 50.0
                     pyr_dir = pyramid_status.get("direction", "")
 
                     live_regime = self.adaptive_manager.classify_regime(
@@ -950,6 +963,17 @@ class SMCScanner:
                     setup_key = f"{setup.symbol}_{setup.direction}_{setup.strategy_name}_{candle_str}"
                     if setup_key in self.notified_setups:
                         continue  # Already notified for this M15 candle
+
+                    # Anti-Spam Check 2b: Post-Loss Symbol Cooldown (Protection against revenge trading)
+                    clean_sym = clean_symbol(setup.symbol)
+                    last_loss_t = self._last_loss_by_symbol.get(clean_sym, 0.0)
+                    if (time.time() - last_loss_t) < (POST_LOSS_COOLDOWN_MINUTES * 60):
+                        elapsed_min = int((time.time() - last_loss_t) / 60)
+                        logger.info(
+                            f"⏳ [POST-LOSS COOLDOWN] Pomijam alert dla {setup.symbol} {setup.direction}: "
+                            f"Niedawno ({elapsed_min}m temu) uderzono w Stop Loss (okres ochronny: {POST_LOSS_COOLDOWN_MINUTES}m)."
+                        )
+                        continue
 
                     # Anti-Spam Check 3: Time Cooldown per Symbol & Direction
                     sym_dir_key = (clean_symbol(setup.symbol), setup.direction.upper())
@@ -1133,6 +1157,20 @@ class SMCScanner:
                         logger.info(f"📈 Zaktualizowano kontrfaktyczne MFE dla {updated_cnt} zamkniętych transakcji.")
                 except Exception as cf_err:
                     logger.debug(f"Błąd okresowego backfillu MFE: {cf_err}")
+
+            # Automated Sunday AI Audit briefing before market open
+            if ENABLE_SUNDAY_AUDIT_REPORT and self.telegram:
+                from datetime import timezone
+                now_utc = datetime.now(timezone.utc)
+                if now_utc.weekday() == 6 and now_utc.hour >= SUNDAY_AUDIT_HOUR_UTC:
+                    today_str = now_utc.strftime("%Y-%m-%d")
+                    if self._last_sunday_audit_date != today_str:
+                        self._last_sunday_audit_date = today_str
+                        try:
+                            if hasattr(self.telegram, "send_scheduled_sunday_audit"):
+                                await self.telegram.send_scheduled_sunday_audit(range_spec=AUDIT_DEFAULT_RANGE)
+                        except Exception as sa_err:
+                            logger.error(f"Error dispatching Sunday AI audit: {sa_err}")
 
             await asyncio.sleep(TRADE_MONITOR_INTERVAL_SECONDS)
 
