@@ -107,7 +107,17 @@ System zaprojektowany jest w architekturze modułowej o wyraźnie rozdzielonych 
   - **Grade A:** Score $70 - 84\%$
   - **Grade B / Reject:** Score $< 70\%$
 
-### 4.2. Strategia Zumiko KillMLM (Oficjalny Poradnik PDF i Webinarium ZuMiKo)
+### 4.2. Strategia Swap Zone (Flip / Breaker Zone - Poradnik SnD str. 49-50)
+Model wejścia na zmianie roli strefy popytu/podaży po gwałtownym przełamaniu bazy:
+1. **Demand ➔ Supply Flip (Niedźwiedzi Swap):** Baza popytu (Bullish Order Block), która zostaje dynamicznie przebita w dół z zamknięciem świecy poniżej `Bottom`, staje się strefą Supply. Przy powrocie (re-teście) do bazy z odrzuceniem świecowym generowany jest setup SELL.
+2. **Supply ➔ Demand Flip (Byczy Swap):** Baza podaży (Bearish Order Block), która zostaje przebita w górę z zamknięciem świecy powyżej `Top`, staje się strefą Demand. Retest od góry generuje setup BUY.
+3. **Kryteria Jakości i Unieważnienia:**
+   - Wymóg czystego odejścia (`departure_dist >= 1.5 * buffer`).
+   - Wiek przełamania $\le$ `SWAP_ZONE_MAX_AGE_BARS` (domyślnie 40 świec M15).
+   - Unieważnienie w przypadku zamknięcia ciała świecy po przeciwległej stronie strefy.
+   - Weryfikacja bariery HTF (Room-to-Run) oraz przycinanie TP1 (`TP Capping`).
+
+### 4.3. Strategia Zumiko KillMLM (Oficjalny Poradnik PDF i Webinarium ZuMiKo)
 Zaimplementowana ściśle według oficjalnej specyfikacji systemu scalpingowo-trendowego ZuMiKo KillMLM:
 1. **Trend Bazowy:** `EMA 238` (Market Filter: Cena > EMA 238 = dozwolony wyłącznie BUY; Cena < EMA 238 = dozwolony wyłącznie SELL).
 2. **Dynamiczna Wstęga Momentum:** `EMA 9 (Fast)` oraz `EMA 21 (Slow)` (parametry oficjalne ZuMiKo zaktualizowane z EMA 10 na EMA 9).

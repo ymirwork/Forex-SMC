@@ -1203,6 +1203,10 @@ class TelegramBotManager:
         if htf_barr > 0:
             barrier_line = f"🚪 **Room to Run HTF:** `{setup.htf_barrier_dist_r:.1f}R` do strefy `{htf_barr:.{digits}f}`\n"
 
+        swap_zone_line = ""
+        if "SWAP" in getattr(setup, "setup_type", "").upper() and setup.zone_top > 0 and setup.zone_bottom > 0:
+            swap_zone_line = f"🔄 **Strefa Swap (Baza):** `{min(setup.zone_bottom, setup.zone_top):.{digits}f}` ➔ `{max(setup.zone_bottom, setup.zone_top):.{digits}f}`\n"
+
         caption = (
             f"{header_title}\n"
             f"🎯 **Ocena:** `{setup.confluence_score}%` {grade_emoji}\n\n"
@@ -1217,6 +1221,7 @@ class TelegramBotManager:
             f"{zumiko_text}"
             f"{smart_risk_line}"
             f"{barrier_line}"
+            f"{swap_zone_line}"
             f"{fibo_text}"
             f"{liq_line}"
             f"{confluence_lines}"

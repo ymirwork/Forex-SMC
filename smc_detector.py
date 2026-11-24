@@ -19,6 +19,7 @@ from config import (
     BONUS_POINTS_SWEEP_OB,
     DEFAULT_RR_RATIO,
     ENABLE_ROOM_TO_RUN_HTF_FILTER,
+    ENABLE_SWAP_ZONE_STRATEGY,
     ENFORCE_STRONG_STRUCTURAL_SL,
     LIQUIDITY_SWEEP_LOOKBACK_BARS,
     LTF_TIMEFRAME,
@@ -37,6 +38,8 @@ from config import (
     SL_ATR_MULTIPLIER,
     SL_CALCULATION_MODE,
     SL_HYBRID_MIN_ATR_MULT,
+    SWAP_ZONE_MAX_AGE_BARS,
+    SWAP_ZONE_MIN_RR,
     TIGHT_SL_MODE,
     USE_OPTIMAL_RR,
     clean_symbol,
@@ -765,6 +768,30 @@ class SMCDetector:
                 setups.append(setup)
                 break
 
+        # Scan for Swap Zone Retests (SnD Guide pages 49-50: Demand <-> Supply Flips)
+        if ENABLE_SWAP_ZONE_STRATEGY:
+            swap_setups = self._detect_swap_zones(
+                symbol=symbol,
+                df_ltf=df_ltf,
+                swings_ltf=swings_ltf,
+                current_candle=current_candle,
+                current_time=current_time,
+                digits=digits,
+                point_scale=point_scale,
+                buffer=buffer,
+                spread=spread,
+                htf_trend=htf_trend,
+                session_info=session_info,
+                news_warn=news_warn,
+                df_h1=df_h1,
+                df_htf=df_htf,
+                df_d1=df_d1,
+                df_w1=df_w1,
+            )
+            for sw in swap_setups:
+                if not any(s.direction == sw.direction for s in setups):
+                    setups.append(sw)
+
         return setups
 
     def _build_smc_setup(
@@ -1230,3 +1257,448 @@ class SMCDetector:
             htf_barrier_price=round(htf_barrier_price, digits) if htf_barrier_price > 0 else 0.0,
             htf_barrier_dist_r=htf_barrier_dist_r,
         )
+
+    def _detect_swap_zones(
+        self,
+        symbol: str,
+        df_ltf: pd.DataFrame,
+        swings_ltf: pd.DataFrame,
+        current_candle: pd.Series,
+        current_time: pd.Timestamp,
+        digits: int,
+        point_scale: float,
+        buffer: float,
+        spread: float,
+        htf_trend: str,
+        session_info: Dict,
+        news_warn: Optional[str],
+        df_h1: Optional[pd.DataFrame] = None,
+        df_htf: Optional[pd.DataFrame] = None,
+        df_d1: Optional[pd.DataFrame] = None,
+        df_w1: Optional[pd.DataFrame] = None,
+    ) -> List[TradeSetup]:
+        """
+        Detects high-probability Swap Zone (Flip / Breaker Zone) setups based on
+        classical Supply & Demand (SnD Guide pages 49-50):
+        1. Demand Zone (Bullish OB) that gets broken to the downside transforms into a Supply Zone (SELL retest).
+        2. Supply Zone (Bearish OB) that gets broken to the upside transforms into a Demand Zone (BUY retest).
+        3. Enforces displacement, zone freshness, invalidation rules, and candle rejection.
+        """
+        if not ENABLE_SWAP_ZONE_STRATEGY or df_ltf is None or len(df_ltf) < 40:
+            return []
+
+        try:
+            ob_df = smc.ob(df_ltf, swings_ltf)
+        except Exception as e:
+            logger.debug(f"Error computing OB for Swap Zone on {symbol}: {e}")
+            return []
+
+        if ob_df is None or ob_df.empty:
+            return []
+
+        current_bar_idx = len(df_ltf) - 1
+        curr_open = float(current_candle["open"])
+        curr_high = float(current_candle["high"])
+        curr_low = float(current_candle["low"])
+        curr_close = float(current_candle["close"])
+        min_sl_dist = get_min_sl_distance(symbol, point_scale)
+
+        swap_setups: List[TradeSetup] = []
+
+        # Iterate over historical Order Blocks from most recent backwards
+        for i in range(len(ob_df) - 3, -1, -1):
+            row = ob_df.iloc[i]
+            ob_type = row.get("OB")
+            if pd.isna(ob_type) or ob_type == 0:
+                continue
+
+            ob_bar = i
+            # Lookback limit
+            if ob_bar < max(0, current_bar_idx - 150):
+                break
+
+            ob_val = float(ob_type)
+            top = float(row.get("Top", 0.0))
+            bottom = float(row.get("Bottom", 0.0))
+            if top <= bottom:
+                continue
+
+            # CASE A: Demand Zone (Bullish OB, ob_val == 1.0) broken downwards -> Bearish Swap Zone (Supply -> SELL)
+            if ob_val == 1.0:
+                break_idx = None
+                for j in range(ob_bar + 1, current_bar_idx):
+                    if df_ltf["close"].iloc[j] < bottom:
+                        break_idx = j
+                        break
+
+                if break_idx is None:
+                    continue  # Not broken
+
+                bars_since_break = current_bar_idx - break_idx
+                if bars_since_break < 1 or bars_since_break > SWAP_ZONE_MAX_AGE_BARS:
+                    continue
+
+                lowest_post_break = float(df_ltf["low"].iloc[break_idx:current_bar_idx].min())
+                departure_dist = bottom - lowest_post_break
+                if departure_dist < (buffer * 1.5):
+                    continue
+
+                # Invalidation: price must NOT have closed above top after break_idx
+                if any(df_ltf["close"].iloc[k] > top for k in range(break_idx, current_bar_idx)):
+                    continue
+
+                # Retest: current candle is testing the zone from below
+                is_testing = (curr_high >= (bottom - buffer)) and (curr_low <= (top + buffer))
+                if not is_testing:
+                    continue
+
+                if curr_close > (top + (point_scale * 2)):
+                    continue
+
+                has_rejection, wick_msg = self._check_candle_rejection(current_candle, "SELL")
+                is_bearish_candle = curr_close < curr_open
+                if not (has_rejection or is_bearish_candle):
+                    continue
+
+                direction = "SELL"
+                entry = round(curr_close, digits)
+                sl = round(top + buffer + spread, digits)
+                risk_dist = abs(entry - sl)
+                if risk_dist < min_sl_dist:
+                    sl = round(entry + min_sl_dist, digits)
+                    risk_dist = abs(entry - sl)
+
+                target_dist = abs(entry - lowest_post_break)
+                calc_rr = (target_dist / risk_dist) if risk_dist > 0 else 0.0
+
+                if calc_rr >= SWAP_ZONE_MIN_RR:
+                    tp1 = round(lowest_post_break, digits)
+                    actual_rr = round(calc_rr, 1)
+                else:
+                    actual_rr = max(DEFAULT_RR_RATIO, SWAP_ZONE_MIN_RR)
+                    tp1 = round(entry - (risk_dist * actual_rr), digits)
+
+                tp2 = round(entry - (risk_dist * (actual_rr + 1.0)), digits)
+
+                htf_barrier_price = 0.0
+                htf_barrier_dist_r = 99.0
+                if ENABLE_ROOM_TO_RUN_HTF_FILTER and (df_h1 is not None or df_htf is not None):
+                    barrier_p, barrier_desc = self._find_nearest_opposing_htf_barrier(
+                        df_ltf=df_ltf,
+                        df_h1=df_h1,
+                        df_htf=df_htf,
+                        entry_price=entry,
+                        direction=direction,
+                        current_bar=current_bar_idx,
+                    )
+                    if barrier_p is not None and barrier_p > 0:
+                        room_dist = abs(entry - barrier_p)
+                        room_r = (room_dist / risk_dist) if risk_dist > 0 else 0.0
+                        htf_barrier_price = barrier_p
+                        htf_barrier_dist_r = room_r
+                        if room_r < ROOM_TO_RUN_HTF_MIN_RR:
+                            logger.info(
+                                f"🛡️ [FILTER] Odrzucono setup Swap Zone {symbol} SELL: "
+                                f"Zbyt mała przestrzeń do strefy HTF ({room_r:.2f}R < {ROOM_TO_RUN_HTF_MIN_RR}R, {barrier_desc})."
+                            )
+                            continue
+                        elif barrier_p > tp1:
+                            logger.info(
+                                f"🎯 [TP CAPPING] Swap Zone {symbol} SELL: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f}."
+                            )
+                            tp1 = round(barrier_p, digits)
+                            actual_rr = round(room_r, 1)
+
+                total_score = 0
+                breakdown: List[ConfluenceItem] = []
+
+                total_score += 30
+                breakdown.append(ConfluenceItem(
+                    factor="Strefa Swap Zone (Demand ➔ Supply)",
+                    weight=30,
+                    achieved=True,
+                    detail=f"Przełamana baza Demand [{bottom:.{digits}f} - {top:.{digits}f}] stała się strefą Supply (+30%)",
+                ))
+
+                h4_match = (htf_trend == "BEARISH")
+                if h4_match:
+                    w_h4 = 25
+                    h4_desc = f"H4 zgodny ({htf_trend}) (+25%)"
+                elif htf_trend == "NEUTRAL":
+                    w_h4 = 10
+                    h4_desc = f"H4 neutralny (+10%)"
+                else:
+                    w_h4 = -15
+                    h4_desc = f"H4 przeciwny: {htf_trend} (-15% KARA)"
+                total_score += w_h4
+                breakdown.append(ConfluenceItem(
+                    factor="Zgodność z trendem H4",
+                    weight=25,
+                    achieved=h4_match,
+                    detail=h4_desc,
+                ))
+
+                total_score += 15
+                breakdown.append(ConfluenceItem(
+                    factor="Dynamika przełamania (Displacement)",
+                    weight=15,
+                    achieved=True,
+                    detail=f"Czyste odejście na {departure_dist / point_scale:.1f} pipsów ({bars_since_break} b. temu) (+15%)",
+                ))
+
+                is_killzone = session_info.get("is_killzone", False)
+                w_sess = 10 if is_killzone else 5
+                total_score += w_sess
+                breakdown.append(ConfluenceItem(
+                    factor="Timing Sesyjny",
+                    weight=10,
+                    achieved=is_killzone,
+                    detail=f"Sesja: {session_info.get('session_name', 'Standard')} (+{w_sess}%)",
+                ))
+
+                w_rej = 10 if has_rejection else 5
+                total_score += w_rej
+                breakdown.append(ConfluenceItem(
+                    factor="Odrzucenie w strefie Swap",
+                    weight=10,
+                    achieved=has_rejection,
+                    detail=f"{wick_msg if has_rejection else 'Świeca spadkowa'} (+{w_rej}%)",
+                ))
+
+                w_room = 10 if htf_barrier_dist_r >= 2.0 else 5
+                total_score += w_room
+                breakdown.append(ConfluenceItem(
+                    factor="Czysta droga (Room to Run)",
+                    weight=10,
+                    achieved=True,
+                    detail=f"Przestrzeń do celu: {actual_rr:.1f}R (+{w_room}%)",
+                ))
+
+                total_score = max(0, min(100, total_score))
+                if total_score < self.min_confluence_score:
+                    continue
+
+                grade = "A+" if total_score >= 85 else ("A" if total_score >= 70 else "B")
+
+                setup = TradeSetup(
+                    symbol=symbol,
+                    direction="SELL",
+                    timeframe=LTF_TIMEFRAME,
+                    setup_type="M15 Swap Zone Retest (Demand ➔ Supply Flip)",
+                    entry_price=entry,
+                    sl_price=sl,
+                    tp1_price=tp1,
+                    tp2_price=tp2,
+                    rr_ratio=actual_rr,
+                    htf_trend=htf_trend,
+                    zone_top=round(top, digits),
+                    zone_bottom=round(bottom, digits),
+                    reason=f"M15 Swap Zone Retest [{grade} - {total_score}% Confluence]. Przełamanie bazy {bottom:.{digits}f}-{top:.{digits}f}.",
+                    timestamp=current_time,
+                    confluence_score=total_score,
+                    grade=grade,
+                    confluence_breakdown=breakdown,
+                    session_name=session_info.get("session_name", ""),
+                    is_killzone=is_killzone,
+                    news_warning=news_warn,
+                    is_optimal_rr=False,
+                    rr_source_info="Swap Zone Target",
+                    strategy_name="SMC",
+                    spread_used=spread if ADD_SPREAD_TO_SL else 0.0,
+                    sl_mode="SWAP_ZONE_BUFFER",
+                    htf_barrier_price=htf_barrier_price,
+                    htf_barrier_dist_r=htf_barrier_dist_r,
+                )
+                swap_setups.append(setup)
+                break  # Take freshest valid swap zone
+
+            # CASE B: Supply Zone (Bearish OB, ob_val == -1.0) broken upwards -> Bullish Swap Zone (Demand -> BUY)
+            elif ob_val == -1.0:
+                break_idx = None
+                for j in range(ob_bar + 1, current_bar_idx):
+                    if df_ltf["close"].iloc[j] > top:
+                        break_idx = j
+                        break
+
+                if break_idx is None:
+                    continue
+
+                bars_since_break = current_bar_idx - break_idx
+                if bars_since_break < 1 or bars_since_break > SWAP_ZONE_MAX_AGE_BARS:
+                    continue
+
+                highest_post_break = float(df_ltf["high"].iloc[break_idx:current_bar_idx].max())
+                departure_dist = highest_post_break - top
+                if departure_dist < (buffer * 1.5):
+                    continue
+
+                # Invalidation: price must NOT have closed below bottom after break_idx
+                if any(df_ltf["close"].iloc[k] < bottom for k in range(break_idx, current_bar_idx)):
+                    continue
+
+                # Retest: current candle is testing the zone from above
+                is_testing = (curr_low <= (top + buffer)) and (curr_high >= (bottom - buffer))
+                if not is_testing:
+                    continue
+
+                if curr_close < (bottom - (point_scale * 2)):
+                    continue
+
+                has_rejection, wick_msg = self._check_candle_rejection(current_candle, "BUY")
+                is_bullish_candle = curr_close > curr_open
+                if not (has_rejection or is_bullish_candle):
+                    continue
+
+                direction = "BUY"
+                entry = round(curr_close, digits)
+                sl = round(bottom - buffer, digits)
+                risk_dist = abs(entry - sl)
+                if risk_dist < min_sl_dist:
+                    sl = round(entry - min_sl_dist, digits)
+                    risk_dist = abs(entry - sl)
+
+                target_dist = abs(highest_post_break - entry)
+                calc_rr = (target_dist / risk_dist) if risk_dist > 0 else 0.0
+
+                if calc_rr >= SWAP_ZONE_MIN_RR:
+                    tp1 = round(highest_post_break, digits)
+                    actual_rr = round(calc_rr, 1)
+                else:
+                    actual_rr = max(DEFAULT_RR_RATIO, SWAP_ZONE_MIN_RR)
+                    tp1 = round(entry + (risk_dist * actual_rr), digits)
+
+                tp2 = round(entry + (risk_dist * (actual_rr + 1.0)), digits)
+
+                htf_barrier_price = 0.0
+                htf_barrier_dist_r = 99.0
+                if ENABLE_ROOM_TO_RUN_HTF_FILTER and (df_h1 is not None or df_htf is not None):
+                    barrier_p, barrier_desc = self._find_nearest_opposing_htf_barrier(
+                        df_ltf=df_ltf,
+                        df_h1=df_h1,
+                        df_htf=df_htf,
+                        entry_price=entry,
+                        direction=direction,
+                        current_bar=current_bar_idx,
+                    )
+                    if barrier_p is not None and barrier_p > 0:
+                        room_dist = abs(barrier_p - entry)
+                        room_r = (room_dist / risk_dist) if risk_dist > 0 else 0.0
+                        htf_barrier_price = barrier_p
+                        htf_barrier_dist_r = room_r
+                        if room_r < ROOM_TO_RUN_HTF_MIN_RR:
+                            logger.info(
+                                f"🛡️ [FILTER] Odrzucono setup Swap Zone {symbol} BUY: "
+                                f"Zbyt mała przestrzeń do strefy HTF ({room_r:.2f}R < {ROOM_TO_RUN_HTF_MIN_RR}R, {barrier_desc})."
+                            )
+                            continue
+                        elif barrier_p < tp1:
+                            logger.info(
+                                f"🎯 [TP CAPPING] Swap Zone {symbol} BUY: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f}."
+                            )
+                            tp1 = round(barrier_p, digits)
+                            actual_rr = round(room_r, 1)
+
+                total_score = 0
+                breakdown = []
+
+                total_score += 30
+                breakdown.append(ConfluenceItem(
+                    factor="Strefa Swap Zone (Supply ➔ Demand)",
+                    weight=30,
+                    achieved=True,
+                    detail=f"Przełamana baza Supply [{bottom:.{digits}f} - {top:.{digits}f}] stała się strefą Demand (+30%)",
+                ))
+
+                h4_match = (htf_trend == "BULLISH")
+                if h4_match:
+                    w_h4 = 25
+                    h4_desc = f"H4 zgodny ({htf_trend}) (+25%)"
+                elif htf_trend == "NEUTRAL":
+                    w_h4 = 10
+                    h4_desc = f"H4 neutralny (+10%)"
+                else:
+                    w_h4 = -15
+                    h4_desc = f"H4 przeciwny: {htf_trend} (-15% KARA)"
+                total_score += w_h4
+                breakdown.append(ConfluenceItem(
+                    factor="Zgodność z trendem H4",
+                    weight=25,
+                    achieved=h4_match,
+                    detail=h4_desc,
+                ))
+
+                total_score += 15
+                breakdown.append(ConfluenceItem(
+                    factor="Dynamika przełamania (Displacement)",
+                    weight=15,
+                    achieved=True,
+                    detail=f"Czyste odejście na {departure_dist / point_scale:.1f} pipsów ({bars_since_break} b. temu) (+15%)",
+                ))
+
+                is_killzone = session_info.get("is_killzone", False)
+                w_sess = 10 if is_killzone else 5
+                total_score += w_sess
+                breakdown.append(ConfluenceItem(
+                    factor="Timing Sesyjny",
+                    weight=10,
+                    achieved=is_killzone,
+                    detail=f"Sesja: {session_info.get('session_name', 'Standard')} (+{w_sess}%)",
+                ))
+
+                w_rej = 10 if has_rejection else 5
+                total_score += w_rej
+                breakdown.append(ConfluenceItem(
+                    factor="Odrzucenie w strefie Swap",
+                    weight=10,
+                    achieved=has_rejection,
+                    detail=f"{wick_msg if has_rejection else 'Świeca wzrostowa'} (+{w_rej}%)",
+                ))
+
+                w_room = 10 if htf_barrier_dist_r >= 2.0 else 5
+                total_score += w_room
+                breakdown.append(ConfluenceItem(
+                    factor="Czysta droga (Room to Run)",
+                    weight=10,
+                    achieved=True,
+                    detail=f"Przestrzeń do celu: {actual_rr:.1f}R (+{w_room}%)",
+                ))
+
+                total_score = max(0, min(100, total_score))
+                if total_score < self.min_confluence_score:
+                    continue
+
+                grade = "A+" if total_score >= 85 else ("A" if total_score >= 70 else "B")
+
+                setup = TradeSetup(
+                    symbol=symbol,
+                    direction="BUY",
+                    timeframe=LTF_TIMEFRAME,
+                    setup_type="M15 Swap Zone Retest (Supply ➔ Demand Flip)",
+                    entry_price=entry,
+                    sl_price=sl,
+                    tp1_price=tp1,
+                    tp2_price=tp2,
+                    rr_ratio=actual_rr,
+                    htf_trend=htf_trend,
+                    zone_top=round(top, digits),
+                    zone_bottom=round(bottom, digits),
+                    reason=f"M15 Swap Zone Retest [{grade} - {total_score}% Confluence]. Przełamanie bazy {bottom:.{digits}f}-{top:.{digits}f}.",
+                    timestamp=current_time,
+                    confluence_score=total_score,
+                    grade=grade,
+                    confluence_breakdown=breakdown,
+                    session_name=session_info.get("session_name", ""),
+                    is_killzone=is_killzone,
+                    news_warning=news_warn,
+                    is_optimal_rr=False,
+                    rr_source_info="Swap Zone Target",
+                    strategy_name="SMC",
+                    spread_used=spread if ADD_SPREAD_TO_SL else 0.0,
+                    sl_mode="SWAP_ZONE_BUFFER",
+                    htf_barrier_price=htf_barrier_price,
+                    htf_barrier_dist_r=htf_barrier_dist_r,
+                )
+                swap_setups.append(setup)
+                break
+
+        return swap_setups

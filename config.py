@@ -144,9 +144,12 @@ MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE", "70"))    # Minimum
 BLOCK_ON_HIGH_IMPACT_NEWS = os.getenv("BLOCK_ON_HIGH_IMPACT_NEWS", "False").lower() in ("true", "1")
 NEWS_WINDOW_MINUTES = int(os.getenv("NEWS_WINDOW_MINUTES", "45"))      # Check news +/- 45 mins
 
-# Strategy Toggles (Hybrid Mode: SMC + Zumiko KillMLM)
+# Strategy Toggles (Hybrid Mode: SMC + Zumiko KillMLM + Swap Zone)
 ENABLE_SMC_STRATEGY = os.getenv("ENABLE_SMC_STRATEGY", "True").lower() in ("true", "1")
 ENABLE_ZUMIKO_STRATEGY = os.getenv("ENABLE_ZUMIKO_STRATEGY", "True").lower() in ("true", "1")
+ENABLE_SWAP_ZONE_STRATEGY = os.getenv("ENABLE_SWAP_ZONE_STRATEGY", "True").lower() in ("true", "1")
+SWAP_ZONE_MAX_AGE_BARS = int(os.getenv("SWAP_ZONE_MAX_AGE_BARS", "40"))
+SWAP_ZONE_MIN_RR = float(os.getenv("SWAP_ZONE_MIN_RR", "2.0"))
 
 # Zumiko KillMLM Strategy Settings (Official PDF & Webinar)
 ZUMIKO_FAST_EMA = int(os.getenv("ZUMIKO_FAST_EMA", "9"))

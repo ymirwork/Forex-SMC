@@ -110,6 +110,8 @@ class ChartGenerator:
                     linewidth=1.2,
                 )
                 ax.add_patch(zone_rect)
+                lbl = "[SWAP ZONE]" if "SWAP" in getattr(setup, "setup_type", "").upper() else "Order Block"
+                ax.text(2, z_top, f" {lbl} [{z_bottom:.4f} - {z_top:.4f}]", color=zone_color, va="bottom", fontsize=8, fontweight="bold")
 
             # Draw CHoCH / BOS line if present
             if setup.choch_level > 0:
