@@ -1258,6 +1258,52 @@ class SMCDetector:
             htf_barrier_dist_r=htf_barrier_dist_r,
         )
 
+    def _evaluate_swap_htf_barrier(
+        self,
+        symbol: str,
+        direction: str,
+        entry: float,
+        risk_dist: float,
+        tp1: float,
+        actual_rr: float,
+        digits: int,
+        df_h1: Optional[pd.DataFrame],
+        df_htf: Optional[pd.DataFrame],
+    ) -> Tuple[bool, float, float, float, float]:
+        """
+        Checks opposing HTF Supply/Demand barrier room-to-run and caps TP1 if needed.
+        Returns: (allowed, tp1, actual_rr, htf_barrier_price, htf_barrier_dist_r)
+        """
+        if not ENABLE_ROOM_TO_RUN_HTF_FILTER or (df_h1 is None and df_htf is None):
+            return True, tp1, actual_rr, 0.0, 99.0
+
+        barrier_p, barrier_desc = self.find_nearest_htf_barrier(df_h1, direction, entry)
+        if barrier_p is None and df_htf is not None:
+            barrier_p, barrier_desc = self.find_nearest_htf_barrier(df_htf, direction, entry)
+
+        if barrier_p is None or barrier_p <= 0:
+            return True, tp1, actual_rr, 0.0, 99.0
+
+        is_buy = direction == "BUY"
+        room_dist = (barrier_p - entry) if is_buy else (entry - barrier_p)
+        room_r = (room_dist / risk_dist) if risk_dist > 0 else 0.0
+
+        if room_r < ROOM_TO_RUN_HTF_MIN_RR:
+            logger.info(
+                f"🛡️ [FILTER] Odrzucono setup Swap Zone {symbol} {direction}: "
+                f"Zbyt mała przestrzeń do strefy HTF ({room_r:.2f}R < {ROOM_TO_RUN_HTF_MIN_RR}R, {barrier_desc})."
+            )
+            return False, tp1, actual_rr, barrier_p, round(room_r, 2)
+
+        if (is_buy and barrier_p < tp1) or (not is_buy and barrier_p > tp1):
+            logger.info(
+                f"🎯 [TP CAPPING] Swap Zone {symbol} {direction}: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f}."
+            )
+            tp1 = round(barrier_p, digits)
+            actual_rr = round(room_r, 1)
+
+        return True, tp1, actual_rr, barrier_p, round(room_r, 2)
+
     def _detect_swap_zones(
         self,
         symbol: str,
@@ -1302,6 +1348,7 @@ class SMCDetector:
         curr_low = float(current_candle["low"])
         curr_close = float(current_candle["close"])
         min_sl_dist = get_min_sl_distance(symbol, point_scale)
+        spread_buffer = spread if ADD_SPREAD_TO_SL else 0.0
 
         swap_setups: List[TradeSetup] = []
 
@@ -1362,7 +1409,7 @@ class SMCDetector:
 
                 direction = "SELL"
                 entry = round(curr_close, digits)
-                sl = round(top + buffer + spread, digits)
+                sl = round(top + buffer + spread_buffer, digits)
                 risk_dist = abs(entry - sl)
                 if risk_dist < min_sl_dist:
                     sl = round(entry + min_sl_dist, digits)
@@ -1380,34 +1427,19 @@ class SMCDetector:
 
                 tp2 = round(entry - (risk_dist * (actual_rr + 1.0)), digits)
 
-                htf_barrier_price = 0.0
-                htf_barrier_dist_r = 99.0
-                if ENABLE_ROOM_TO_RUN_HTF_FILTER and (df_h1 is not None or df_htf is not None):
-                    barrier_p, barrier_desc = self._find_nearest_opposing_htf_barrier(
-                        df_ltf=df_ltf,
-                        df_h1=df_h1,
-                        df_htf=df_htf,
-                        entry_price=entry,
-                        direction=direction,
-                        current_bar=current_bar_idx,
-                    )
-                    if barrier_p is not None and barrier_p > 0:
-                        room_dist = abs(entry - barrier_p)
-                        room_r = (room_dist / risk_dist) if risk_dist > 0 else 0.0
-                        htf_barrier_price = barrier_p
-                        htf_barrier_dist_r = room_r
-                        if room_r < ROOM_TO_RUN_HTF_MIN_RR:
-                            logger.info(
-                                f"🛡️ [FILTER] Odrzucono setup Swap Zone {symbol} SELL: "
-                                f"Zbyt mała przestrzeń do strefy HTF ({room_r:.2f}R < {ROOM_TO_RUN_HTF_MIN_RR}R, {barrier_desc})."
-                            )
-                            continue
-                        elif barrier_p > tp1:
-                            logger.info(
-                                f"🎯 [TP CAPPING] Swap Zone {symbol} SELL: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f}."
-                            )
-                            tp1 = round(barrier_p, digits)
-                            actual_rr = round(room_r, 1)
+                htf_ok, tp1, actual_rr, htf_barrier_price, htf_barrier_dist_r = self._evaluate_swap_htf_barrier(
+                    symbol=symbol,
+                    direction=direction,
+                    entry=entry,
+                    risk_dist=risk_dist,
+                    tp1=tp1,
+                    actual_rr=actual_rr,
+                    digits=digits,
+                    df_h1=df_h1,
+                    df_htf=df_htf,
+                )
+                if not htf_ok:
+                    continue
 
                 total_score = 0
                 breakdown: List[ConfluenceItem] = []
@@ -1569,34 +1601,19 @@ class SMCDetector:
 
                 tp2 = round(entry + (risk_dist * (actual_rr + 1.0)), digits)
 
-                htf_barrier_price = 0.0
-                htf_barrier_dist_r = 99.0
-                if ENABLE_ROOM_TO_RUN_HTF_FILTER and (df_h1 is not None or df_htf is not None):
-                    barrier_p, barrier_desc = self._find_nearest_opposing_htf_barrier(
-                        df_ltf=df_ltf,
-                        df_h1=df_h1,
-                        df_htf=df_htf,
-                        entry_price=entry,
-                        direction=direction,
-                        current_bar=current_bar_idx,
-                    )
-                    if barrier_p is not None and barrier_p > 0:
-                        room_dist = abs(barrier_p - entry)
-                        room_r = (room_dist / risk_dist) if risk_dist > 0 else 0.0
-                        htf_barrier_price = barrier_p
-                        htf_barrier_dist_r = room_r
-                        if room_r < ROOM_TO_RUN_HTF_MIN_RR:
-                            logger.info(
-                                f"🛡️ [FILTER] Odrzucono setup Swap Zone {symbol} BUY: "
-                                f"Zbyt mała przestrzeń do strefy HTF ({room_r:.2f}R < {ROOM_TO_RUN_HTF_MIN_RR}R, {barrier_desc})."
-                            )
-                            continue
-                        elif barrier_p < tp1:
-                            logger.info(
-                                f"🎯 [TP CAPPING] Swap Zone {symbol} BUY: Skrócono TP1 z {tp1:.{digits}f} do bariery HTF {barrier_p:.{digits}f}."
-                            )
-                            tp1 = round(barrier_p, digits)
-                            actual_rr = round(room_r, 1)
+                htf_ok, tp1, actual_rr, htf_barrier_price, htf_barrier_dist_r = self._evaluate_swap_htf_barrier(
+                    symbol=symbol,
+                    direction=direction,
+                    entry=entry,
+                    risk_dist=risk_dist,
+                    tp1=tp1,
+                    actual_rr=actual_rr,
+                    digits=digits,
+                    df_h1=df_h1,
+                    df_htf=df_htf,
+                )
+                if not htf_ok:
+                    continue
 
                 total_score = 0
                 breakdown = []

@@ -276,6 +276,36 @@ class TestRiskAndFilters(unittest.TestCase):
         asyncio.run(TelegramBotManager._safe_answer_query(query, text="Test", show_alert=True))
         self.assertEqual(query.answer.call_count, 1)
 
+    def test_mt5_client_get_pip_size_gold_and_fx(self):
+        from mt5_client import MT5Client
+        self.assertEqual(MT5Client.get_pip_size("EURUSD.pro"), 0.0001)
+        self.assertEqual(MT5Client.get_pip_size("USDJPY.pro"), 0.01)
+        self.assertEqual(MT5Client.get_pip_size("XAUUSD.pro"), 0.10)
+
+    def test_news_filter_http_502_backoff(self):
+        """Verifies NewsFilter backs off on 502 Bad Gateway instead of hammering API every scan."""
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from news_filter import NewsFilter
+
+        nf = NewsFilter()
+        mock_response = MagicMock()
+        mock_response.status_code = 502
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        async def run_calls():
+            with patch("news_filter.httpx.AsyncClient", return_value=mock_client):
+                await nf.fetch_calendar_async()
+                await nf.fetch_calendar_async()
+
+        asyncio.run(run_calls())
+        # Second call within FAILURE_BACKOFF_SECONDS must not hit network again
+        self.assertEqual(mock_client.get.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

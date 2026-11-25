@@ -800,7 +800,9 @@ class MT5Client:
         Delegates to get_symbol_pip_size for a single source of truth.
         """
         from smc_detector import get_symbol_pip_size
-        return get_symbol_pip_size(symbol)
+        sym = (symbol or "").upper()
+        digits = 2 if ("XAU" in sym or "GOLD" in sym or "JPY" in sym) else 5
+        return get_symbol_pip_size(symbol, digits=digits)
 
     def get_symbol_spread(self, symbol: str) -> float:
         """

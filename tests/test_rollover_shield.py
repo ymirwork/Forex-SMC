@@ -166,8 +166,8 @@ class TestRolloverSLShieldAsync(unittest.IsolatedAsyncioTestCase):
             "profit": 15.0,
         }]
 
-        # Spread normalized to 1.2 pips (threshold is 3.0 pips)
-        self.mock_mt5_client.get_symbol_spread.return_value = 1.2
+        # Spread normalized to 1.2 pips (0.00012 price units <= 3.0 pips threshold)
+        self.mock_mt5_client.get_symbol_spread.return_value = 0.00012
         self.mock_mt5_client.modify_position_sl.return_value = (True, "SL restored")
 
         await self.scanner._handle_rollover_sl_shield(open_positions)
@@ -176,6 +176,61 @@ class TestRolloverSLShieldAsync(unittest.IsolatedAsyncioTestCase):
         self.mock_journal.unmark_trade_rollover_shielded.assert_called_once_with(888)
         self.assertNotIn(888, self.scanner._shielded_trades)
         self.mock_telegram.send_message.assert_called_once()
+
+    @patch("scanner.ENABLE_ROLLOVER_SL_SHIELD", True)
+    @patch("scanner.is_in_rollover_window", return_value=False)
+    async def test_wide_spread_delays_restoration(self, mock_window):
+        # Position is shielded, rollover ended, but spread is still 5.0 pips (0.0005 price units > 3.0 pips)
+        self.scanner._shielded_trades[889] = 1.0980
+
+        open_positions = [{
+            "ticket": 889,
+            "symbol": "EURUSD",
+            "type": "BUY",
+            "price_open": 1.1000,
+            "sl": 1.0950,
+            "tp": 1.1050,
+            "price_current": 1.1015,
+            "profit": 15.0,
+        }]
+
+        self.mock_mt5_client.get_symbol_spread.return_value = 0.00050
+        await self.scanner._handle_rollover_sl_shield(open_positions)
+
+        self.mock_mt5_client.modify_position_sl.assert_not_called()
+        self.assertIn(889, self.scanner._shielded_trades)
+
+    @patch("scanner.ENABLE_ROLLOVER_SL_SHIELD", True)
+    @patch("scanner.is_in_rollover_window", return_value=False)
+    async def test_post_rollover_mid_emergency_close_while_still_shielded(self, mock_window):
+        # Position remained shielded after rollover ended (e.g. SL couldn't be restored yet) and MID hits orig_sl
+        self.scanner._shielded_trades[890] = 0.95263
+
+        open_positions = [{
+            "ticket": 890,
+            "symbol": "AUDCAD.pro",
+            "type": "SELL",
+            "price_open": 0.95263,
+            "sl": 0.95527,
+            "tp": 0.94800,
+            "price_current": 0.95275,
+            "profit": -0.5,
+        }]
+
+        tick_mock = MagicMock()
+        tick_mock.bid = 0.95260
+        tick_mock.ask = 0.95276  # MID = 0.95268 >= 0.95263
+        self.mock_mt5_client.close_market_position.return_value = (True, "Position closed")
+
+        with patch("MetaTrader5.symbol_info_tick", return_value=tick_mock):
+            await self.scanner._handle_rollover_sl_shield(open_positions)
+
+        self.mock_mt5_client.close_market_position.assert_called_once_with(
+            890,
+            comment="Rollover Shield: Mid hit SL",
+        )
+        self.assertNotIn(890, self.scanner._shielded_trades)
+        self.mock_journal.unmark_trade_rollover_shielded.assert_called_once_with(890)
 
     @patch("scanner.ENABLE_ROLLOVER_SL_SHIELD", True)
     @patch("scanner.is_in_rollover_window", return_value=False)
@@ -195,8 +250,8 @@ class TestRolloverSLShieldAsync(unittest.IsolatedAsyncioTestCase):
             "profit": 50.0,
         }]
 
-        # Spread is 22 pips ($2.20) <= 25.0 pips allowed for Gold
-        self.mock_mt5_client.get_symbol_spread.return_value = 22.0
+        # Spread is $2.20 = 22.0 pips <= 25.0 pips allowed for Gold
+        self.mock_mt5_client.get_symbol_spread.return_value = 2.2
         self.mock_mt5_client.modify_position_sl.return_value = (True, "SL restored")
 
         await self.scanner._handle_rollover_sl_shield(open_positions)

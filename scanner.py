@@ -129,6 +129,7 @@ class SMCScanner:
         self._prop_warned: bool = False
         self._be_moved_tickets: Set[int] = set()
         self._shielded_trades: Dict[int, float] = {}
+        self._shield_restore_warned: Dict[int, float] = {}
         try:
             stored_shielded = self.journal.get_rollover_shielded_trades()
             for st in stored_shielded:
@@ -566,6 +567,55 @@ class SMCScanner:
         # 4. Rollover SL Shield (Protects tight SL and BE trades during rollover spread spike)
         await self._handle_rollover_sl_shield(open_positions)
 
+    async def _check_rollover_mid_emergency_close(
+        self,
+        ticket: int,
+        orig_sl: float,
+        p: Dict,
+        tick_cache: Dict[str, Any],
+    ) -> bool:
+        """
+        Checks if live MID price = (Bid + Ask) / 2 has breached the shielded trade's original SL.
+        Closes at market if breached and cleans up shield state. Returns True if closed.
+        """
+        sym = p["symbol"]
+        if sym not in tick_cache:
+            tick_cache[sym] = mt5.symbol_info_tick(sym)
+        tick = tick_cache[sym]
+        if not tick:
+            return False
+        bid = getattr(tick, "bid", None)
+        ask = getattr(tick, "ask", None)
+        if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)) or bid <= 0 or ask <= 0:
+            return False
+
+        mid_price = (bid + ask) / 2.0
+        is_buy = p["type"] == "BUY"
+        mid_hit_sl = (mid_price <= orig_sl) if is_buy else (mid_price >= orig_sl)
+        if not mid_hit_sl:
+            return False
+
+        logger.warning(
+            f"🚨 [ROLLOVER SHIELD] Cena MID ({mid_price}) przebiła oryginalny SL ({orig_sl}) na #{ticket}!"
+        )
+        close_ok, _ = self.mt5_client.close_market_position(
+            ticket,
+            comment="Rollover Shield: Mid hit SL",
+        )
+        if close_ok:
+            self._shielded_trades.pop(ticket, None)
+            self._shield_restore_warned.pop(ticket, None)
+            self.journal.unmark_trade_rollover_shielded(ticket)
+            if self.telegram:
+                await self.telegram.send_message(
+                    f"🚨 **AWARYJNE ZAMKNIĘCIE W TRAKCIE ROLLOVERU!**\n\n"
+                    f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
+                    f"📉 Rzeczywista cena MID: `{mid_price:.5f}` wybiła pierwotny SL: `{orig_sl}`\n"
+                    f"🛑 Pozycja została zamknięta rynkowo, aby zapobiec powiększeniu straty."
+                )
+            return True
+        return False
+
     async def _handle_rollover_sl_shield(self, open_positions: List[Dict]):
         """
         Rollover SL Shield:
@@ -590,7 +640,10 @@ class SMCScanner:
         for t_num in list(self._shielded_trades.keys()):
             if t_num not in open_by_ticket:
                 self._shielded_trades.pop(t_num, None)
+                self._shield_restore_warned.pop(t_num, None)
                 self.journal.unmark_trade_rollover_shielded(t_num)
+
+        tick_cache: Dict[str, Any] = {}
 
         if in_rollover:
             # 1. Activation Phase: Shield qualifying open positions not yet shielded
@@ -662,41 +715,11 @@ class SMCScanner:
                         )
 
             # 2. Monitoring Phase: Check if MID price legitimately crossed original SL (Cached per symbol)
-            tick_cache: Dict[str, Any] = {}
             for ticket, orig_sl in list(self._shielded_trades.items()):
                 p = open_by_ticket.get(ticket)
                 if not p:
                     continue
-
-                sym = p["symbol"]
-                if sym not in tick_cache:
-                    tick_cache[sym] = mt5.symbol_info_tick(sym)
-                tick = tick_cache[sym]
-                if not tick or tick.bid <= 0 or tick.ask <= 0:
-                    continue
-
-                mid_price = (tick.bid + tick.ask) / 2.0
-                is_buy = p["type"] == "BUY"
-
-                mid_hit_sl = (mid_price <= orig_sl) if is_buy else (mid_price >= orig_sl)
-                if mid_hit_sl:
-                    logger.warning(
-                        f"🚨 [ROLLOVER SHIELD] Cena MID ({mid_price}) przebiła oryginalny SL ({orig_sl}) na #{ticket}!"
-                    )
-                    close_ok, close_msg = self.mt5_client.close_market_position(
-                        ticket,
-                        comment="Rollover Shield: Mid hit SL",
-                    )
-                    if close_ok:
-                        self._shielded_trades.pop(ticket, None)
-                        self.journal.unmark_trade_rollover_shielded(ticket)
-                        if self.telegram:
-                            await self.telegram.send_message(
-                                f"🚨 **AWARYJNE ZAMKNIĘCIE W TRAKCIE ROLLOVERU!**\n\n"
-                                f"🎯 Pozycja: `{p['symbol']}` [{p['type']}] `#{ticket}`\n"
-                                f"📉 Rzeczywista cena MID: `{mid_price:.5f}` wybiła pierwotny SL: `{orig_sl}`\n"
-                                f"🛑 Pozycja została zamknięta rynkowo, aby zapobiec powiększeniu straty."
-                            )
+                await self._check_rollover_mid_emergency_close(ticket, orig_sl, p, tick_cache)
 
         else:
             # 3. Restoration Phase: After rollover, check spread normalization and restore SL (Cached per symbol)
@@ -704,16 +727,24 @@ class SMCScanner:
                 return
 
             spread_cache: Dict[str, float] = {}
+            now = time.time()
             for ticket, orig_sl in list(self._shielded_trades.items()):
                 p = open_by_ticket.get(ticket)
                 if not p:
                     self._shielded_trades.pop(ticket, None)
+                    self._shield_restore_warned.pop(ticket, None)
                     self.journal.unmark_trade_rollover_shielded(ticket)
+                    continue
+
+                # Keep protecting the position with MID price monitoring until orig_sl is restored
+                if await self._check_rollover_mid_emergency_close(ticket, orig_sl, p, tick_cache):
                     continue
 
                 sym = p["symbol"]
                 if sym not in spread_cache:
-                    spread_cache[sym] = self.mt5_client.get_symbol_spread(sym)
+                    spread_price = self.mt5_client.get_symbol_spread(sym)
+                    pip_size = MT5Client.get_pip_size(sym)
+                    spread_cache[sym] = (spread_price / pip_size) if pip_size > 0 else spread_price
                 spread_pips = spread_cache[sym]
 
                 is_gold = "XAU" in clean_symbol(sym)
@@ -723,6 +754,7 @@ class SMCScanner:
                     ok, msg = self.mt5_client.modify_position_sl(ticket, orig_sl)
                     if ok:
                         self._shielded_trades.pop(ticket, None)
+                        self._shield_restore_warned.pop(ticket, None)
                         self.journal.unmark_trade_rollover_shielded(ticket)
                         logger.info(
                             f"✅ [ROLLOVER SHIELD] Spread unormowany ({spread_pips:.1f} pips). "
@@ -737,7 +769,12 @@ class SMCScanner:
                                 f"Pozycja kontynuuje standardowe monitorowanie."
                             )
                     else:
-                        logger.warning(f"Could not restore SL for #{ticket}: {msg}")
+                        last_warn = self._shield_restore_warned.get(ticket, 0.0)
+                        if (now - last_warn) >= 300.0:
+                            self._shield_restore_warned[ticket] = now
+                            logger.warning(f"Could not restore SL for #{ticket}: {msg}")
+                        else:
+                            logger.debug(f"Could not restore SL for #{ticket}: {msg}")
                 else:
                     logger.debug(
                         f"Rollover Shield waiting for spread normalization on {p['symbol']}: "

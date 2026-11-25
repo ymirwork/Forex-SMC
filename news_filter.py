@@ -18,11 +18,13 @@ class NewsFilter:
 
     API_URL = "https://biquote.io/api/calendar?importance=high"
     CACHE_DURATION_SECONDS = 3600  # Refresh every hour
+    FAILURE_BACKOFF_SECONDS = 300  # Wait 5 minutes before retrying after HTTP/network errors
 
     def __init__(self, window_minutes: Optional[int] = None):
         self.window_minutes = window_minutes if window_minutes is not None else NEWS_WINDOW_MINUTES
         self._cached_events: List[Dict] = []
         self._last_fetch_time: float = 0.0
+        self._last_failed_fetch_time: float = 0.0
 
     def _extract_currencies(self, symbol: str) -> List[str]:
         """Extracts relevant currency codes from symbol (e.g. EURUSD -> ['EUR', 'USD'], XAUUSD -> ['USD'])."""
@@ -56,9 +58,11 @@ class NewsFilter:
         logger.info(f"Economic calendar refreshed ({len(self._cached_events)} high impact events loaded).")
 
     async def fetch_calendar_async(self, force: bool = False) -> List[Dict]:
-        """Asynchronously fetches high impact events with local caching to avoid blocking event loop."""
+        """Asynchronously fetches high impact events with local caching and error backoff."""
         now = time.time()
         if not force and self._cached_events and (now - self._last_fetch_time < self.CACHE_DURATION_SECONDS):
+            return self._cached_events
+        if not force and self._last_failed_fetch_time > 0 and (now - self._last_failed_fetch_time < self.FAILURE_BACKOFF_SECONDS):
             return self._cached_events
 
         try:
@@ -68,7 +72,12 @@ class NewsFilter:
                 if res.status_code == 200:
                     raw_data = res.json()
                     self._parse_and_cache(raw_data, now)
+                    self._last_failed_fetch_time = 0.0
+                else:
+                    self._last_failed_fetch_time = now
+                    logger.warning(f"Failed to fetch economic calendar (async): HTTP {res.status_code}")
         except Exception as e:
+            self._last_failed_fetch_time = now
             logger.warning(f"Failed to fetch economic calendar (async): {e}")
 
         return self._cached_events
@@ -82,6 +91,8 @@ class NewsFilter:
         # If cache exists but expired, return stale cache immediately to avoid blocking event loop
         if self._cached_events and not force:
             return self._cached_events
+        if not force and self._last_failed_fetch_time > 0 and (now - self._last_failed_fetch_time < self.FAILURE_BACKOFF_SECONDS):
+            return self._cached_events
 
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -90,7 +101,12 @@ class NewsFilter:
                 if res.status_code == 200:
                     raw_data = res.json()
                     self._parse_and_cache(raw_data, now)
+                    self._last_failed_fetch_time = 0.0
+                else:
+                    self._last_failed_fetch_time = now
+                    logger.warning(f"Failed to fetch economic calendar (sync): HTTP {res.status_code}")
         except Exception as e:
+            self._last_failed_fetch_time = now
             logger.warning(f"Failed to fetch economic calendar (sync): {e}")
 
         return self._cached_events

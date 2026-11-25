@@ -281,25 +281,26 @@ class TestSwapZone(unittest.TestCase):
         mock_ob.return_value = ob_data
 
         # Mock opposing HTF barrier at 1.0845 (only 0.0007 below entry 1.0852, when risk is 0.0023 -> 0.3R < 1.5R)
-        self.detector._find_nearest_opposing_htf_barrier = MagicMock(
-            return_value=(1.0845, "HTF Demand OB [1.0835 - 1.0845]")
-        )
-
-        setups = self.detector._detect_swap_zones(
-            symbol="EURUSD",
-            df_ltf=df,
-            swings_ltf=pd.DataFrame(index=df.index),
-            current_candle=df.iloc[-1],
-            current_time=df.iloc[-1]["time"],
-            digits=4,
-            point_scale=0.0001,
-            buffer=0.0005,
-            spread=0.0001,
-            htf_trend="BEARISH",
-            session_info={"session_name": "London", "is_killzone": True},
-            news_warn=None,
-            df_h1=df,
-        )
+        with patch.object(
+            self.detector,
+            "find_nearest_htf_barrier",
+            return_value=(1.0845, "HTF Demand OB [1.0835 - 1.0845]"),
+        ):
+            setups = self.detector._detect_swap_zones(
+                symbol="EURUSD",
+                df_ltf=df,
+                swings_ltf=pd.DataFrame(index=df.index),
+                current_candle=df.iloc[-1],
+                current_time=df.iloc[-1]["time"],
+                digits=4,
+                point_scale=0.0001,
+                buffer=0.0005,
+                spread=0.0001,
+                htf_trend="BEARISH",
+                session_info={"session_name": "London", "is_killzone": True},
+                news_warn=None,
+                df_h1=df,
+            )
 
         self.assertEqual(len(setups), 0)
 
@@ -326,9 +327,58 @@ class TestSwapZone(unittest.TestCase):
         mock_ob.return_value = ob_data
 
         # Mock opposing HTF barrier at 1.0805 (1.0852 - 1.0805 = 0.0047, risk is ~0.0023 -> 2.0R, but above 1.0750)
-        self.detector._find_nearest_opposing_htf_barrier = MagicMock(
-            return_value=(1.0805, "HTF Demand OB [1.0795 - 1.0805]")
-        )
+        with patch.object(
+            self.detector,
+            "find_nearest_htf_barrier",
+            return_value=(1.0805, "HTF Demand OB [1.0795 - 1.0805]"),
+        ):
+            setups = self.detector._detect_swap_zones(
+                symbol="EURUSD",
+                df_ltf=df,
+                swings_ltf=pd.DataFrame(index=df.index),
+                current_candle=df.iloc[-1],
+                current_time=df.iloc[-1]["time"],
+                digits=4,
+                point_scale=0.0001,
+                buffer=0.0005,
+                spread=0.0001,
+                htf_trend="BEARISH",
+                session_info={"session_name": "London", "is_killzone": True},
+                news_warn=None,
+                df_h1=df,
+            )
+
+        self.assertEqual(len(setups), 1)
+        setup = setups[0]
+        self.assertEqual(setup.tp1_price, 1.0805)  # Capped at barrier
+
+    @patch("smc_detector.smc.fvg")
+    @patch("smc_detector.smc.swing_highs_lows")
+    @patch("smc_detector.smc.ob")
+    def test_swap_zone_real_htf_barrier_lookup_no_attribute_error(self, mock_ob, mock_swings, mock_fvg):
+        """
+        Regression test for AttributeError: _find_nearest_opposing_htf_barrier.
+        Executes _detect_swap_zones with df_h1 and df_htf WITHOUT mocking find_nearest_htf_barrier.
+        """
+        df = self._create_base_df(45)
+        df.loc[20, "close"] = 1.0855
+        df.loc[25, "high"] = 1.0890
+        df.loc[44, "open"] = 1.0835
+        df.loc[44, "high"] = 1.0845
+        df.loc[44, "low"] = 1.0825
+        df.loc[44, "close"] = 1.0838
+
+        ob_data = pd.DataFrame(index=df.index)
+        ob_data["OB"] = np.nan
+        ob_data.loc[10, "OB"] = -1.0
+        ob_data.loc[10, "Top"] = 1.0840
+        ob_data.loc[10, "Bottom"] = 1.0820
+        mock_ob.return_value = ob_data
+        mock_swings.return_value = pd.DataFrame({"HighLow": [np.nan] * len(df)}, index=df.index)
+        mock_fvg.return_value = pd.DataFrame({"FVG": [np.nan] * len(df)}, index=df.index)
+
+        df_h1 = self._create_base_df(45)
+        df_htf = self._create_base_df(45)
 
         setups = self.detector._detect_swap_zones(
             symbol="EURUSD",
@@ -340,15 +390,15 @@ class TestSwapZone(unittest.TestCase):
             point_scale=0.0001,
             buffer=0.0005,
             spread=0.0001,
-            htf_trend="BEARISH",
-            session_info={"session_name": "London", "is_killzone": True},
+            htf_trend="BULLISH",
+            session_info={"session_name": "New York", "is_killzone": True},
             news_warn=None,
-            df_h1=df,
+            df_h1=df_h1,
+            df_htf=df_htf,
         )
 
         self.assertEqual(len(setups), 1)
-        setup = setups[0]
-        self.assertEqual(setup.tp1_price, 1.0805)  # Capped at barrier
+        self.assertEqual(setups[0].direction, "BUY")
 
 
 if __name__ == "__main__":
