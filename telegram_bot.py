@@ -835,21 +835,24 @@ class TelegramBotManager:
                 return
 
             try:
-                from ai_auditor import apply_recommendations
+                from ai_auditor import ALLOWED_CONFIG_KEYS, apply_recommendations
+                from config import reload_runtime_config
+
                 ok, msgs = await asyncio.to_thread(apply_recommendations)
                 details = "\n".join(msgs)
                 if ok:
-                    await self._safe_answer_query(query, text="✅ Zmiany wdrożone w pliku .env!")
+                    reload_runtime_config(ALLOWED_CONFIG_KEYS.keys())
+                    await self._safe_answer_query(query, text="✅ Zmiany wdrożone i przeładowane!")
                     await self._safe_edit_message(
                         query,
-                        f"{orig_text}\n\n✅ **Zmiany zostały automatycznie wdrożone na serwerze (.env):**\n{details}\n\n"
-                        "ℹ️ _Zrestartuj bota, jeśli chcesz aby nowe parametry weszły w życie od razu._",
+                        f"{orig_text}\n\n✅ **Zmiany zostały automatycznie wdrożone na serwerze (.env) i przeładowane w pamięci bota:**\n{details}",
                     )
                 else:
                     await self._safe_answer_query(query, text="❌ Nie udało się wdrożyć zmian.", show_alert=True)
                     await self._safe_edit_message(
                         query,
-                        f"{orig_text}\n\n❌ **Nie udało się wdrożyć zmian:**\n{details}",
+                        f"{orig_text}\n\n❌ **Nie udało się wdrożyć zmian:**\n{details}\n\n"
+                        "ℹ️ _Jeśli plik rekomendacji wygasł lub nie istnieje, uruchom ponownie `/ai_audit`._",
                     )
             except Exception as e:
                 logger.error(f"Error applying AI audit recommendations: {e}", exc_info=True)

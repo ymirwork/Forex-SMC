@@ -295,8 +295,30 @@ ENABLE_SUNDAY_AUDIT_REPORT = os.getenv("ENABLE_SUNDAY_AUDIT_REPORT", "True").low
 SUNDAY_AUDIT_HOUR_UTC = int(os.getenv("SUNDAY_AUDIT_HOUR_UTC", "19")) # 19:00 UTC = 20:00 CET
 
 
+def reload_runtime_config(keys=None, dotenv_path=None):
+    """Reloads .env into os.environ, reloads config, and syncs imported constants in loaded project modules."""
+    import importlib
+    import sys
 
+    load_dotenv(dotenv_path=dotenv_path, override=True)
+    this_module = sys.modules[__name__]
+    reloaded = importlib.reload(this_module)
 
+    target_keys = list(keys) if keys is not None else [
+        k for k in vars(reloaded) if k.isupper() and not k.startswith("_")
+    ]
+    project_root = os.path.dirname(os.path.abspath(__file__))
+
+    for mod in list(sys.modules.values()):
+        mod_file = getattr(mod, "__file__", None)
+        if not mod or mod is reloaded or not mod_file:
+            continue
+        if not os.path.abspath(mod_file).startswith(project_root):
+            continue
+        mod_vars = vars(mod)
+        for key in target_keys:
+            if key in mod_vars and hasattr(reloaded, key):
+                setattr(mod, key, getattr(reloaded, key))
 
 
 

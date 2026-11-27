@@ -320,8 +320,9 @@ class TestTelegramAIAuditIntegration(unittest.IsolatedAsyncioTestCase):
         callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
         self.assertEqual(callbacks, ["audit_apply", "audit_reject"])
 
+    @patch("config.reload_runtime_config")
     @patch("ai_auditor.apply_recommendations")
-    async def test_handle_callback_audit_apply_success(self, mock_apply):
+    async def test_handle_callback_audit_apply_success(self, mock_apply, mock_reload):
         from telegram_bot import TelegramBotManager
 
         mock_apply.return_value = (
@@ -346,11 +347,60 @@ class TestTelegramAIAuditIntegration(unittest.IsolatedAsyncioTestCase):
         await manager.handle_callback(update, MagicMock())
 
         mock_apply.assert_called_once_with()
+        mock_reload.assert_called_once()
         update.callback_query.answer.assert_awaited_once()
         edited_text = update.callback_query.edit_message_text.call_args[1]["text"]
         self.assertIn("Zmiany zostały automatycznie wdrożone na serwerze", edited_text)
+        self.assertIn("przeładowane w pamięci bota", edited_text)
         self.assertIn("AUTO_BE_R_TRIGGER = 2.0", edited_text)
         self.assertIsNone(update.callback_query.edit_message_text.call_args[1]["reply_markup"])
+
+    @patch("ai_auditor.apply_recommendations")
+    async def test_handle_callback_audit_apply_failure_shows_hint(self, mock_apply):
+        from telegram_bot import TelegramBotManager
+
+        mock_apply.return_value = (False, ["Plik rekomendacji 'docs/audits/recommendations.json' nie istnieje."])
+
+        manager = TelegramBotManager(mt5_client=MagicMock())
+        manager.allowed_chat_ids = [12345]
+
+        update = MagicMock()
+        update.effective_user.id = 12345
+        update.callback_query.data = "audit_apply"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.message.caption = None
+        update.callback_query.message.text = "💡 ZAPROPONOWANE PARAMETRY DO WDROŻENIA:"
+        update.callback_query.edit_message_text = AsyncMock()
+
+        await manager.handle_callback(update, MagicMock())
+
+        edited_text = update.callback_query.edit_message_text.call_args[1]["text"]
+        self.assertIn("Nie udało się wdrożyć zmian", edited_text)
+        self.assertIn("/ai_audit", edited_text)
+        self.assertIsNone(update.callback_query.edit_message_text.call_args[1]["reply_markup"])
+
+    def test_reload_runtime_config_updates_imported_constants(self):
+        import config
+        import ai_auditor
+
+        orig_env = os.environ.get("AUTO_BE_R_TRIGGER")
+        orig_val = config.AUTO_BE_R_TRIGGER
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                env_file = os.path.join(tmpdir, ".env")
+                with open(env_file, "w", encoding="utf-8") as f:
+                    f.write("AUTO_BE_R_TRIGGER=3.25\n")
+
+                config.reload_runtime_config(keys=["AUTO_BE_R_TRIGGER"], dotenv_path=env_file)
+                self.assertEqual(config.AUTO_BE_R_TRIGGER, 3.25)
+                self.assertEqual(ai_auditor.AUTO_BE_R_TRIGGER, 3.25)
+        finally:
+            if orig_env is None:
+                os.environ.pop("AUTO_BE_R_TRIGGER", None)
+            else:
+                os.environ["AUTO_BE_R_TRIGGER"] = orig_env
+            config.AUTO_BE_R_TRIGGER = orig_val
+            ai_auditor.AUTO_BE_R_TRIGGER = orig_val
 
     async def test_handle_callback_audit_reject(self):
         from telegram_bot import TelegramBotManager
