@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -689,6 +689,23 @@ class TelegramBotManager:
             elif self.app:
                 await self.app.bot.send_message(chat_id=target, text=chunk_html, parse_mode="HTML")
 
+    @staticmethod
+    def _format_audit_recommendations(cfg: Dict[str, Any], header: str) -> Tuple[str, InlineKeyboardMarkup]:
+        """Formats AI audit parameter recommendations with inline Apply/Reject buttons."""
+        rec_lines = [f"• <code>{k}</code>: <code>{v}</code>" for k, v in cfg.items()]
+        rec_msg = (
+            f"{header}\n"
+            + "\n".join(rec_lines) + "\n\n"
+            + "<i>Czy wprowadzić te zmiany automatycznie na serwerze?</i>"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Tak, wdróż zmiany", callback_data="audit_apply"),
+                InlineKeyboardButton("❌ Nie", callback_data="audit_reject"),
+            ]
+        ]
+        return rec_msg, InlineKeyboardMarkup(keyboard)
+
     async def ai_audit_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Generates and dispatches deep AI Strategy & Trade Audit report."""
         if not self._is_authorized(update):
@@ -707,15 +724,11 @@ class TelegramBotManager:
             await self._send_chunked_html(update.message, report)
 
             if rec_data and rec_data.get("recommended_config"):
-                cfg = rec_data["recommended_config"]
-                rec_lines = [f"• <code>{k}</code>: <code>{v}</code>" for k, v in cfg.items()]
-                rec_msg = (
-                    "💡 <b>ZAPROPONOWANE PARAMETRY DO WDROŻENIA:</b>\n"
-                    + "\n".join(rec_lines) + "\n\n"
-                    + "<i>Aby wdrożyć zmiany na serwerze, wpisz w konsoli:</i>\n"
-                    + "<code>python ai_auditor.py --apply</code>"
+                rec_msg, reply_markup = self._format_audit_recommendations(
+                    rec_data["recommended_config"],
+                    "💡 <b>ZAPROPONOWANE PARAMETRY DO WDROŻENIA:</b>",
                 )
-                await update.message.reply_text(rec_msg, parse_mode="HTML")
+                await update.message.reply_text(rec_msg, parse_mode="HTML", reply_markup=reply_markup)
         except Exception as e:
             logger.error(f"Error during AI audit command: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Wystąpił błąd podczas audytu AI: {e}")
@@ -733,14 +746,16 @@ class TelegramBotManager:
             await self._send_chunked_html(self.alert_channel, header + report)
 
             if rec_data and rec_data.get("recommended_config"):
-                cfg = rec_data["recommended_config"]
-                rec_lines = [f"• <code>{k}</code>: <code>{v}</code>" for k, v in cfg.items()]
-                rec_msg = (
-                    "🎯 <b>REKOMENDACJE NA NADCHODZĄCY TYDZIEŃ:</b>\n"
-                    + "\n".join(rec_lines) + "\n\n"
-                    + "<i>Zatwierdź zmiany w konsoli:</i> <code>python ai_auditor.py --apply</code>"
+                rec_msg, reply_markup = self._format_audit_recommendations(
+                    rec_data["recommended_config"],
+                    "🎯 <b>REKOMENDACJE NA NADCHODZĄCY TYDZIEŃ:</b>",
                 )
-                await self.app.bot.send_message(chat_id=self.alert_channel, text=rec_msg, parse_mode="HTML")
+                await self.app.bot.send_message(
+                    chat_id=self.alert_channel,
+                    text=rec_msg,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
         except Exception as e:
             logger.error(f"Failed to dispatch Sunday AI audit: {e}", exc_info=True)
 
@@ -807,6 +822,38 @@ class TelegramBotManager:
                     await query.message.reply_text(md_to_telegram_html(msg), parse_mode="HTML")
             except Exception as e:
                 await self._safe_answer_query(query, text=f"Błąd BE: {e}", show_alert=True)
+            return
+
+        if action in ("audit_apply", "audit_reject"):
+            orig_text = query.message.text if query.message else ""
+            if action == "audit_reject":
+                await self._safe_answer_query(query, text="Zmiany odrzucone.")
+                await self._safe_edit_message(
+                    query,
+                    f"{orig_text}\n\n❌ **Zmiany odrzucone przez użytkownika.**",
+                )
+                return
+
+            try:
+                from ai_auditor import apply_recommendations
+                ok, msgs = await asyncio.to_thread(apply_recommendations)
+                details = "\n".join(msgs)
+                if ok:
+                    await self._safe_answer_query(query, text="✅ Zmiany wdrożone w pliku .env!")
+                    await self._safe_edit_message(
+                        query,
+                        f"{orig_text}\n\n✅ **Zmiany zostały automatycznie wdrożone na serwerze (.env):**\n{details}\n\n"
+                        "ℹ️ _Zrestartuj bota, jeśli chcesz aby nowe parametry weszły w życie od razu._",
+                    )
+                else:
+                    await self._safe_answer_query(query, text="❌ Nie udało się wdrożyć zmian.", show_alert=True)
+                    await self._safe_edit_message(
+                        query,
+                        f"{orig_text}\n\n❌ **Nie udało się wdrożyć zmian:**\n{details}",
+                    )
+            except Exception as e:
+                logger.error(f"Error applying AI audit recommendations: {e}", exc_info=True)
+                await self._safe_answer_query(query, text=f"Błąd wdrażania zmian: {e}", show_alert=True)
             return
 
         setup = self.pending_setups.pop(setup_id, None)

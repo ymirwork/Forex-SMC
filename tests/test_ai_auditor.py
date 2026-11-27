@@ -310,10 +310,68 @@ class TestTelegramAIAuditIntegration(unittest.IsolatedAsyncioTestCase):
         report_call = update.message.reply_text.call_args_list[1][0][0]
         self.assertIn("Raport z audytu AI", report_call)
 
-        # Assert recommendation call was sent
-        rec_call = update.message.reply_text.call_args_list[2][0][0]
-        self.assertIn("ZAPROPONOWANE PARAMETRY DO WDROŻENIA", rec_call)
-        self.assertIn("AUTO_BE_R_TRIGGER", rec_call)
+        # Assert recommendation call was sent with inline Apply/Reject buttons
+        rec_call = update.message.reply_text.call_args_list[2]
+        rec_text = rec_call[0][0]
+        self.assertIn("ZAPROPONOWANE PARAMETRY DO WDROŻENIA", rec_text)
+        self.assertIn("AUTO_BE_R_TRIGGER", rec_text)
+        markup = rec_call[1].get("reply_markup")
+        self.assertIsNotNone(markup)
+        callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        self.assertEqual(callbacks, ["audit_apply", "audit_reject"])
+
+    @patch("ai_auditor.apply_recommendations")
+    async def test_handle_callback_audit_apply_success(self, mock_apply):
+        from telegram_bot import TelegramBotManager
+
+        mock_apply.return_value = (
+            True,
+            [
+                "📦 Utworzono kopię zapasową: .env.backup_20261127",
+                "✅ Zaktualizowano: AUTO_BE_R_TRIGGER = 2.0",
+            ],
+        )
+
+        manager = TelegramBotManager(mt5_client=MagicMock())
+        manager.allowed_chat_ids = [12345]
+
+        update = MagicMock()
+        update.effective_user.id = 12345
+        update.callback_query.data = "audit_apply"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.message.caption = None
+        update.callback_query.message.text = "💡 ZAPROPONOWANE PARAMETRY DO WDROŻENIA:\n• AUTO_BE_R_TRIGGER: 2.0"
+        update.callback_query.edit_message_text = AsyncMock()
+
+        await manager.handle_callback(update, MagicMock())
+
+        mock_apply.assert_called_once_with()
+        update.callback_query.answer.assert_awaited_once()
+        edited_text = update.callback_query.edit_message_text.call_args[1]["text"]
+        self.assertIn("Zmiany zostały automatycznie wdrożone na serwerze", edited_text)
+        self.assertIn("AUTO_BE_R_TRIGGER = 2.0", edited_text)
+        self.assertIsNone(update.callback_query.edit_message_text.call_args[1]["reply_markup"])
+
+    async def test_handle_callback_audit_reject(self):
+        from telegram_bot import TelegramBotManager
+
+        manager = TelegramBotManager(mt5_client=MagicMock())
+        manager.allowed_chat_ids = [12345]
+
+        update = MagicMock()
+        update.effective_user.id = 12345
+        update.callback_query.data = "audit_reject"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.message.caption = None
+        update.callback_query.message.text = "💡 ZAPROPONOWANE PARAMETRY DO WDROŻENIA:"
+        update.callback_query.edit_message_text = AsyncMock()
+
+        await manager.handle_callback(update, MagicMock())
+
+        update.callback_query.answer.assert_awaited_once()
+        edited_text = update.callback_query.edit_message_text.call_args[1]["text"]
+        self.assertIn("Zmiany odrzucone przez użytkownika", edited_text)
+        self.assertIsNone(update.callback_query.edit_message_text.call_args[1]["reply_markup"])
 
     async def test_send_chunked_html_handles_large_unbroken_text(self):
         from telegram_bot import TelegramBotManager
